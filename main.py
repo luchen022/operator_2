@@ -1,25 +1,20 @@
+# XPUOJ_MAGIATTENTION_V3_DIRECT_KERNEL
+# Sandbox-minimal correctness/performance baseline. No host-side metadata preprocessing.
+
 import torch
 import triton
 import triton.language as tl
 
 
-# Static per-test-point cache. The judge guarantees that K/V, sink and slice
-# metadata stay unchanged from warmup through timed iterations; only Q changes.
-_CACHE = {
-    "q_ranges": None,
-}
-
-
 @triton.jit
 def _ffa_fwd_kernel(
     Q,
-    KPACK,
-    VPACK,
-    SINK_LSE,
-    BLOCK_START,
-    BLOCK_END,
-    BLOCK_SEG,
-    SEG_META,
+    K,
+    V,
+    Q_RANGES,
+    K_RANGES,
+    ATTN_TYPE,
+    SINK,
     OUT,
     softmax_scale,
     S: tl.constexpr,
@@ -27,235 +22,95 @@ def _ffa_fwd_kernel(
     HKV: tl.constexpr,
     D: tl.constexpr,
     GROUP: tl.constexpr,
+    NSLICES: tl.constexpr,
+    NSINK: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    MAX_SLICES: tl.constexpr,
 ):
-    block_id = tl.program_id(0)
+    pid_m = tl.program_id(0)
     h = tl.program_id(1)
 
-    q0 = tl.load(BLOCK_START + block_id).to(tl.int32)
-    q1 = tl.load(BLOCK_END + block_id).to(tl.int32)
-    seg = tl.load(BLOCK_SEG + block_id).to(tl.int32)
-
-    offs_m = q0 + tl.arange(0, BLOCK_M)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, D)
-    qmask = offs_m < q1
+    q_valid = offs_m < S
 
     q_ptrs = Q + (offs_m[:, None] * HQ + h) * D + offs_d[None, :]
-    q = tl.load(q_ptrs, mask=qmask[:, None], other=0.0)
+    q = tl.load(q_ptrs, mask=q_valid[:, None], other=0.0)
 
     kv_h = h // GROUP
 
-    # All sink logits can be represented by one aggregate logit with value 0.
+    # Online-softmax state. First fold in Attention Sink logits.
+    # Sink contributes to the denominator only, so acc remains zero.
     m_i = tl.full((BLOCK_M,), -float("inf"), tl.float32)
     l_i = tl.zeros((BLOCK_M,), tl.float32)
-    sink_lse = tl.load(SINK_LSE + h).to(tl.float32)
-    m_i = tl.where(qmask, sink_lse, m_i)
-    l_i = tl.where(qmask, 1.0, l_i)
     acc = tl.zeros((BLOCK_M, D), tl.float32)
 
-    # Every segment has at most 10 active slices. Inactive rows have ks == ke.
-    for si in tl.static_range(0, MAX_SLICES):
-        base = (seg * MAX_SLICES + si) * 5
-        qs = tl.load(SEG_META + base + 0).to(tl.int32)
-        qe = tl.load(SEG_META + base + 1).to(tl.int32)
-        ks = tl.load(SEG_META + base + 2).to(tl.int32)
-        ke = tl.load(SEG_META + base + 3).to(tl.int32)
-        typ = tl.load(SEG_META + base + 4).to(tl.int32)
+    for sn in tl.static_range(0, NSINK):
+        x = tl.load(SINK + sn * HQ + h).to(tl.float32)
+        m_new = tl.maximum(m_i, x)
+        alpha = tl.exp2((m_i - m_new) * 1.4426950408889634)
+        beta = tl.exp2((x - m_new) * 1.4426950408889634)
+        l_i = l_i * alpha + beta
+        m_i = m_new
 
-        for start_n in tl.range(ks, ke, BLOCK_N, num_stages=2):
-            offs_n = start_n + tl.arange(0, BLOCK_N)
-            nmask = offs_n < ke
+    # Merge all attention slices directly into the same online-softmax state.
+    # The problem guarantees that, for a fixed Q position, visible K sets from
+    # overlapping slices are disjoint.
+    for si in tl.static_range(0, NSLICES):
+        qs = tl.load(Q_RANGES + si * 2 + 0).to(tl.int32)
+        qe = tl.load(Q_RANGES + si * 2 + 1).to(tl.int32)
+        ks = tl.load(K_RANGES + si * 2 + 0).to(tl.int32)
+        ke = tl.load(K_RANGES + si * 2 + 1).to(tl.int32)
+        typ = tl.load(ATTN_TYPE + si).to(tl.int32)
 
-            k_ptrs = KPACK + (kv_h * S + offs_n[:, None]) * D + offs_d[None, :]
-            k = tl.load(k_ptrs, mask=nmask[:, None], other=0.0)
+        q_in_slice = q_valid & (offs_m >= qs) & (offs_m < qe)
+        k_len = ke - ks
+
+        for rel_n in tl.range(0, k_len, BLOCK_N, num_stages=2):
+            offs_n = ks + rel_n + tl.arange(0, BLOCK_N)
+            k_valid = offs_n < ke
+
+            k_ptrs = K + (offs_n[:, None] * HKV + kv_h) * D + offs_d[None, :]
+            k = tl.load(k_ptrs, mask=k_valid[:, None], other=0.0)
 
             qk = tl.dot(q, tl.trans(k)) * softmax_scale
 
-            # Global-coordinate forms of FULL / CAUSAL / INVCAUSAL / BICAUSAL.
             p = offs_m[:, None]
             j = offs_n[None, :]
+
+            # Equivalent global-coordinate forms of the four local masks.
             causal_ok = j <= (p + ke - qe)
             inv_ok = j >= (p + ks - qs)
-            full = typ == 0
-            causal = typ == 1
-            invcausal = typ == 2
-            bicausal = typ == 3
+
             visible = (
-                full
-                | (causal & causal_ok)
-                | (invcausal & inv_ok)
-                | (bicausal & causal_ok & inv_ok)
+                (typ == 0)
+                | ((typ == 1) & causal_ok)
+                | ((typ == 2) & inv_ok)
+                | ((typ == 3) & causal_ok & inv_ok)
             )
-            visible = visible & qmask[:, None] & nmask[None, :]
+            visible = visible & q_in_slice[:, None] & k_valid[None, :]
             qk = tl.where(visible, qk, -float("inf"))
 
-            # FlashAttention-style online softmax.
-            m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-            alpha = tl.exp2((m_i - m_ij) * 1.4426950408889634)
-            p_ij = tl.exp2((qk - m_ij[:, None]) * 1.4426950408889634)
+            block_max = tl.max(qk, axis=1)
+            m_new = tl.maximum(m_i, block_max)
+            alpha = tl.exp2((m_i - m_new) * 1.4426950408889634)
+            p_ij = tl.exp2((qk - m_new[:, None]) * 1.4426950408889634)
 
             l_i = l_i * alpha + tl.sum(p_ij, axis=1)
             acc = acc * alpha[:, None]
 
-            v_ptrs = VPACK + (kv_h * S + offs_n[:, None]) * D + offs_d[None, :]
-            v = tl.load(v_ptrs, mask=nmask[:, None], other=0.0)
-            acc += tl.dot(p_ij.to(tl.bfloat16), v)
-            m_i = m_ij
+            v_ptrs = V + (offs_n[:, None] * HKV + kv_h) * D + offs_d[None, :]
+            vv = tl.load(v_ptrs, mask=k_valid[:, None], other=0.0)
+
+            # Match the reference precision path: probabilities are rounded to
+            # BF16 before P@V; the dot product accumulates in FP32.
+            acc += tl.dot(p_ij.to(tl.bfloat16), vv)
+            m_i = m_new
 
     out = acc / l_i[:, None]
     o_ptrs = OUT + (offs_m[:, None] * HQ + h) * D + offs_d[None, :]
-    tl.store(o_ptrs, out.to(tl.bfloat16), mask=qmask[:, None])
+    tl.store(o_ptrs, out.to(tl.bfloat16), mask=q_valid[:, None])
 
-
-def _prepare_static(
-    q,
-    k,
-    v,
-    q_ranges,
-    k_ranges,
-    attn_type_map,
-    sink,
-    seqlen,
-    num_q_heads,
-    num_kv_heads,
-    head_dim,
-    num_slices,
-    num_sink,
-    block_m,
-):
-    # Keep this host-side preprocessing deliberately simple: XPU-OJ's Triton
-    # sandbox exposes only a restricted subset of Python builtins.
-    qr = q_ranges.tolist()
-    kr = k_ranges.tolist()
-    at = attn_type_map.tolist()
-    n = int(num_slices)
-    s = int(seqlen)
-
-    # Collect q-range endpoints without set()/sorted()/enumerate().
-    bounds = [0, s]
-    i = 0
-    while i < n:
-        bounds.append(int(qr[i][0]))
-        bounds.append(int(qr[i][1]))
-        i += 1
-
-    # Tiny insertion sort: at most 2 * num_slices + 2 <= 22 elements.
-    i = 1
-    while i < len(bounds):
-        x = bounds[i]
-        j = i - 1
-        while j >= 0 and bounds[j] > x:
-            bounds[j + 1] = bounds[j]
-            j -= 1
-        bounds[j + 1] = x
-        i += 1
-
-    # Deduplicate in-place into a new list.
-    uniq = []
-    i = 0
-    while i < len(bounds):
-        x = bounds[i]
-        if len(uniq) == 0 or uniq[len(uniq) - 1] != x:
-            uniq.append(x)
-        i += 1
-    bounds = uniq
-
-    # Store active slices as a bitmask rather than a Python tuple.
-    seg_a = []
-    seg_b = []
-    seg_mask = []
-    i = 0
-    while i + 1 < len(bounds):
-        a = bounds[i]
-        b = bounds[i + 1]
-        if a < b:
-            mask = 0
-            j = 0
-            while j < n:
-                qs = int(qr[j][0])
-                qe = int(qr[j][1])
-                if qs <= a and b <= qe:
-                    mask = mask | (1 << j)
-                j += 1
-
-            if mask != 0:
-                last = len(seg_a) - 1
-                if last >= 0 and seg_b[last] == a and seg_mask[last] == mask:
-                    seg_b[last] = b
-                else:
-                    seg_a.append(a)
-                    seg_b.append(b)
-                    seg_mask.append(mask)
-        i += 1
-
-    max_slices = 10
-    seg_meta = []
-    block_start = []
-    block_end = []
-    block_seg = []
-
-    seg_id = 0
-    while seg_id < len(seg_a):
-        mask = seg_mask[seg_id]
-        used = 0
-        j = 0
-        while j < n:
-            if (mask & (1 << j)) != 0:
-                seg_meta.append([
-                    int(qr[j][0]),
-                    int(qr[j][1]),
-                    int(kr[j][0]),
-                    int(kr[j][1]),
-                    int(at[j]),
-                ])
-                used += 1
-            j += 1
-
-        while used < max_slices:
-            seg_meta.append([0, 0, 0, 0, 0])
-            used += 1
-
-        x = seg_a[seg_id]
-        b = seg_b[seg_id]
-        while x < b:
-            y = x + block_m
-            if y > b:
-                y = b
-            block_start.append(x)
-            block_end.append(y)
-            block_seg.append(seg_id)
-            x += block_m
-        seg_id += 1
-
-    device = q.device
-    kpack = k.permute(1, 0, 2).contiguous()
-    vpack = v.permute(1, 0, 2).contiguous()
-    sink_lse = torch.logsumexp(sink[: int(num_sink)].float(), dim=0).contiguous()
-
-    block_start_t = torch.tensor(block_start, dtype=torch.int32, device=device)
-    block_end_t = torch.tensor(block_end, dtype=torch.int32, device=device)
-    block_seg_t = torch.tensor(block_seg, dtype=torch.int32, device=device)
-    seg_meta_t = torch.tensor(seg_meta, dtype=torch.int32, device=device)
-
-    return {
-        "q_ranges": q_ranges,
-        "k_ranges": k_ranges,
-        "attn_type_map": attn_type_map,
-        "k": k,
-        "v": v,
-        "sink": sink,
-        "kpack": kpack,
-        "vpack": vpack,
-        "sink_lse": sink_lse,
-        "block_start": block_start_t,
-        "block_end": block_end_t,
-        "block_seg": block_seg_t,
-        "seg_meta": seg_meta_t,
-        "num_blocks": len(block_start),
-        "block_m": block_m,
-    }
 
 def run_kernel(
     q,
@@ -278,49 +133,28 @@ def run_kernel(
     hq = int(num_q_heads)
     hkv = int(num_kv_heads)
     d = int(head_dim)
+    nslices = int(num_slices)
+    nsink = int(num_sink)
 
-    block_m = 64 if d == 128 else 128
-    block_n = 64
+    if d == 128:
+        block_m = 64
+        block_n = 64
+        num_warps = 8
+    else:
+        block_m = 128
+        block_n = 64
+        num_warps = 4
 
-    global _CACHE
-    if not (
-        _CACHE.get("q_ranges") is q_ranges
-        and _CACHE.get("k_ranges") is k_ranges
-        and _CACHE.get("attn_type_map") is attn_type_map
-        and _CACHE.get("k") is k
-        and _CACHE.get("v") is v
-        and _CACHE.get("sink") is sink
-        and _CACHE.get("block_m") == block_m
-    ):
-        _CACHE = _prepare_static(
-            q,
-            k,
-            v,
-            q_ranges,
-            k_ranges,
-            attn_type_map,
-            sink,
-            s,
-            hq,
-            hkv,
-            d,
-            int(num_slices),
-            int(num_sink),
-            block_m,
-        )
+    grid_m = (s + block_m - 1) // block_m
 
-    grid = (_CACHE["num_blocks"], hq)
-    num_warps = 8 if d == 128 else 4
-
-    _ffa_fwd_kernel[grid](
+    _ffa_fwd_kernel[(grid_m, hq)](
         q,
-        _CACHE["kpack"],
-        _CACHE["vpack"],
-        _CACHE["sink_lse"],
-        _CACHE["block_start"],
-        _CACHE["block_end"],
-        _CACHE["block_seg"],
-        _CACHE["seg_meta"],
+        k,
+        v,
+        q_ranges,
+        k_ranges,
+        attn_type_map,
+        sink,
         output,
         softmax_scale,
         S=s,
@@ -328,9 +162,10 @@ def run_kernel(
         HKV=hkv,
         D=d,
         GROUP=hq // hkv,
+        NSLICES=nslices,
+        NSINK=nsink,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
-        MAX_SLICES=10,
         num_warps=num_warps,
         num_stages=2,
     )
