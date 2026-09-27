@@ -4,6 +4,9 @@ import triton
 import triton.language as tl
 
 
+_LAST_Q_RANGES = None
+
+
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=4),
@@ -184,6 +187,16 @@ def run_kernel(
     Ns = int(num_sink)
     N = int(num_slices)
     scale = float(softmax_scale)
+
+    # One compact diagnostic per test point. q_ranges is static from warmup
+    # through timed iterations, and a new test point receives a new tensor.
+    global _LAST_Q_RANGES
+    if q_ranges is not _LAST_Q_RANGES:
+        _LAST_Q_RANGES = q_ranges
+        print("XPUCFG", "S", S, "Hq", Hq, "Hkv", Hkv, "D", D, "G", Hq // Hkv, "N", N, "Ns", Ns)
+        print("XPUQ", q_ranges.tolist())
+        print("XPUK", k_ranges.tolist())
+        print("XPUT", attn_type_map.tolist())
 
     grid = lambda META: (triton.cdiv(S, META["BLOCK_M"]), Hq)
 
