@@ -125,36 +125,70 @@ def _prepare_static(
     num_sink,
     block_m,
 ):
+    # Keep this host-side preprocessing deliberately simple: XPU-OJ's Triton
+    # sandbox exposes only a restricted subset of Python builtins.
     qr = q_ranges.tolist()
     kr = k_ranges.tolist()
     at = attn_type_map.tolist()
     n = int(num_slices)
     s = int(seqlen)
 
-    qr = [(int(a), int(b)) for a, b in qr[:n]]
-    kr = [(int(a), int(b)) for a, b in kr[:n]]
-    at = [int(x) for x in at[:n]]
+    # Collect q-range endpoints without set()/sorted()/enumerate().
+    bounds = [0, s]
+    i = 0
+    while i < n:
+        bounds.append(int(qr[i][0]))
+        bounds.append(int(qr[i][1]))
+        i += 1
 
-    # Partition Q at q-range endpoints. Within one segment the active slice set
-    # is constant. Merge adjacent segments with the same active set.
-    bounds = {0, s}
-    for a, b in qr:
-        bounds.add(a)
-        bounds.add(b)
-    bounds = sorted(bounds)
+    # Tiny insertion sort: at most 2 * num_slices + 2 <= 22 elements.
+    i = 1
+    while i < len(bounds):
+        x = bounds[i]
+        j = i - 1
+        while j >= 0 and bounds[j] > x:
+            bounds[j + 1] = bounds[j]
+            j -= 1
+        bounds[j + 1] = x
+        i += 1
 
-    segments = []
-    for i in range(len(bounds) - 1):
-        a, b = bounds[i], bounds[i + 1]
-        if a >= b:
-            continue
-        active = tuple(j for j, (qs, qe) in enumerate(qr) if qs <= a and b <= qe)
-        if not active:
-            continue
-        if segments and segments[-1][1] == a and segments[-1][2] == active:
-            segments[-1] = (segments[-1][0], b, active)
-        else:
-            segments.append((a, b, active))
+    # Deduplicate in-place into a new list.
+    uniq = []
+    i = 0
+    while i < len(bounds):
+        x = bounds[i]
+        if len(uniq) == 0 or uniq[len(uniq) - 1] != x:
+            uniq.append(x)
+        i += 1
+    bounds = uniq
+
+    # Store active slices as a bitmask rather than a Python tuple.
+    seg_a = []
+    seg_b = []
+    seg_mask = []
+    i = 0
+    while i + 1 < len(bounds):
+        a = bounds[i]
+        b = bounds[i + 1]
+        if a < b:
+            mask = 0
+            j = 0
+            while j < n:
+                qs = int(qr[j][0])
+                qe = int(qr[j][1])
+                if qs <= a and b <= qe:
+                    mask = mask | (1 << j)
+                j += 1
+
+            if mask != 0:
+                last = len(seg_a) - 1
+                if last >= 0 and seg_b[last] == a and seg_mask[last] == mask:
+                    seg_b[last] = b
+                else:
+                    seg_a.append(a)
+                    seg_b.append(b)
+                    seg_mask.append(mask)
+        i += 1
 
     max_slices = 10
     seg_meta = []
@@ -162,22 +196,38 @@ def _prepare_static(
     block_end = []
     block_seg = []
 
-    for seg_id, (a, b, active) in enumerate(segments):
-        rows = []
-        for j in active:
-            qs, qe = qr[j]
-            ks, ke = kr[j]
-            rows.append([qs, qe, ks, ke, at[j]])
-        while len(rows) < max_slices:
-            rows.append([0, 0, 0, 0, 0])
-        seg_meta.extend(rows[:max_slices])
+    seg_id = 0
+    while seg_id < len(seg_a):
+        mask = seg_mask[seg_id]
+        used = 0
+        j = 0
+        while j < n:
+            if (mask & (1 << j)) != 0:
+                seg_meta.append([
+                    int(qr[j][0]),
+                    int(qr[j][1]),
+                    int(kr[j][0]),
+                    int(kr[j][1]),
+                    int(at[j]),
+                ])
+                used += 1
+            j += 1
 
-        x = a
+        while used < max_slices:
+            seg_meta.append([0, 0, 0, 0, 0])
+            used += 1
+
+        x = seg_a[seg_id]
+        b = seg_b[seg_id]
         while x < b:
+            y = x + block_m
+            if y > b:
+                y = b
             block_start.append(x)
-            block_end.append(min(x + block_m, b))
+            block_end.append(y)
             block_seg.append(seg_id)
             x += block_m
+        seg_id += 1
 
     device = q.device
     kpack = k.permute(1, 0, 2).contiguous()
@@ -206,7 +256,6 @@ def _prepare_static(
         "num_blocks": len(block_start),
         "block_m": block_m,
     }
-
 
 def run_kernel(
     q,
