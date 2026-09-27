@@ -9,6 +9,9 @@ _META_Q = None
 _META_K = None
 _META_T = None
 _META_PARTITION = False
+_META_BLOCKS32 = 0
+_META_BLOCKS64 = 0
+_META_BLOCKS128 = 0
 
 
 @triton.autotune(
@@ -112,6 +115,172 @@ def single_slice_fwd_kernel(
         m_ij = tl.max(qk, 1)
         m_new = tl.maximum(m_i, m_ij)
 
+        m_i_clamped = tl.maximum(m_i, -1e9)
+        m_new_clamped = tl.maximum(m_new, -1e9)
+        alpha = tl.where(
+            m_i > -float("inf"),
+            tl.math.exp(m_i_clamped - m_new_clamped),
+            0.0,
+        )
+
+        qk_clamped = tl.where(vis, qk, -1e9)
+        p = tl.where(
+            vis,
+            tl.math.exp(qk_clamped - m_new_clamped[:, None]),
+            0.0,
+        )
+        p_bf16 = p.to(tl.bfloat16)
+
+        v_ptrs = V + offs_n[:, None] * stride_vz + pid_kv * stride_vh + offs_d[None, :] * stride_vd
+        v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
+
+        acc = acc * alpha[:, None]
+        acc = tl.dot(p_bf16, v, acc)
+        l_i = l_i * alpha + tl.sum(p, 1)
+        m_i = m_new
+
+    has_keys = l_i > 0.0
+    acc = acc / tl.where(has_keys[:, None], l_i[:, None], 1.0)
+    acc = tl.where(has_keys[:, None], acc, 0.0)
+
+    if num_sink > 0:
+        offs_sink = tl.arange(0, 16)
+        mask_sink = offs_sink < num_sink
+        sink_vals = tl.load(
+            sink_ptr + offs_sink * stride_sink_s + pid_h * stride_sink_h,
+            mask=mask_sink,
+            other=-float("inf"),
+        )
+        sink_max = tl.max(sink_vals, 0)
+        sink_sum = tl.sum(tl.math.exp(sink_vals - sink_max), 0)
+        sink_lse = sink_max + tl.math.log(sink_sum)
+
+        token_lse = m_i + tl.math.log(tl.maximum(l_i, 1e-20))
+        m_final = tl.maximum(token_lse, sink_lse)
+        num = tl.math.exp(token_lse - m_final)
+        den = num + tl.math.exp(sink_lse - m_final)
+        sink_scale = num / den
+        acc = acc * tl.where(has_keys[:, None], sink_scale[:, None], 0.0)
+
+    out_ptrs = Out + offs_m[:, None] * stride_oz + pid_h * stride_oh + offs_d[None, :] * stride_od
+    tl.store(out_ptrs, acc.to(tl.bfloat16), mask=mask_m[:, None])
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=3),
+    ],
+    key=["seqlen", "head_dim", "NUM_SLICES"],
+)
+@triton.jit
+def partition_fwd_kernel(
+    Q, K, V, Out,
+    q_ranges_ptr, k_ranges_ptr, attn_type_map_ptr, sink_ptr,
+    softmax_scale,
+    seqlen, num_q_heads, num_kv_heads, head_dim, num_sink,
+    stride_qz, stride_qh, stride_qd,
+    stride_kz, stride_kh, stride_kd,
+    stride_vz, stride_vh, stride_vd,
+    stride_oz, stride_oh, stride_od,
+    stride_sink_s, stride_sink_h,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    NUM_SLICES: tl.constexpr,
+):
+    pid_tile = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    # Map the global tile id to exactly one Q slice. This tiny metadata loop
+    # happens once per CTA; attention work is performed for only that slice.
+    prefix = 0
+    qs_sel = 0
+    qe_sel = 0
+    ks_sel = 0
+    ke_sel = 0
+    typ_sel = 0
+    local_block = 0
+
+    for s in tl.static_range(0, NUM_SLICES):
+        qs = tl.load(q_ranges_ptr + s * 2)
+        qe = tl.load(q_ranges_ptr + s * 2 + 1)
+        ks = tl.load(k_ranges_ptr + s * 2)
+        ke = tl.load(k_ranges_ptr + s * 2 + 1)
+        typ = tl.load(attn_type_map_ptr + s)
+        qlen = qe - qs
+        nblocks = tl.cdiv(qlen, BLOCK_M)
+        hit = (pid_tile >= prefix) & (pid_tile < prefix + nblocks)
+
+        qs_sel = tl.where(hit, qs, qs_sel)
+        qe_sel = tl.where(hit, qe, qe_sel)
+        ks_sel = tl.where(hit, ks, ks_sel)
+        ke_sel = tl.where(hit, ke, ke_sel)
+        typ_sel = tl.where(hit, typ, typ_sel)
+        local_block = tl.where(hit, pid_tile - prefix, local_block)
+        prefix += nblocks
+
+    group_size = num_q_heads // num_kv_heads
+    pid_kv = pid_h // group_size
+
+    q_len = qe_sel - qs_sel
+    k_len = ke_sel - ks_sel
+
+    block_r_start = local_block * BLOCK_M
+    offs_r = block_r_start + tl.arange(0, BLOCK_M)
+    offs_m = qs_sel + offs_r
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_m = offs_r < q_len
+
+    q_ptrs = Q + offs_m[:, None] * stride_qz + pid_h * stride_qh + offs_d[None, :] * stride_qd
+    q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
+
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
+
+    num_k_blocks = tl.cdiv(k_len, BLOCK_N)
+    block_r_end = tl.minimum(block_r_start + BLOCK_M, q_len)
+    r_first = block_r_start
+    r_last = block_r_end - 1
+
+    causal_limit = r_last + (k_len - q_len)
+    b_end_causal = tl.cdiv(causal_limit + 1, BLOCK_N)
+    b_end_causal = tl.maximum(0, tl.minimum(b_end_causal, num_k_blocks))
+
+    b_start_inv = r_first // BLOCK_N
+    b_start_inv = tl.maximum(0, tl.minimum(b_start_inv, num_k_blocks))
+
+    is_causal = (typ_sel == 1) | (typ_sel == 3)
+    is_inv = (typ_sel == 2) | (typ_sel == 3)
+    b_start = tl.where(is_inv, b_start_inv, 0)
+    b_end = tl.where(is_causal, b_end_causal, num_k_blocks)
+
+    for b in range(b_start, b_end):
+        offs_u = b * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_n = ks_sel + offs_u
+        mask_n = offs_u < k_len
+
+        k_ptrs = K + offs_n[:, None] * stride_kz + pid_kv * stride_kh + offs_d[None, :] * stride_kd
+        k = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
+        qk = tl.dot(q, tl.trans(k)) * softmax_scale
+
+        causal_ok = offs_u[None, :] <= (offs_r[:, None] + (k_len - q_len))
+        inv_ok = offs_u[None, :] >= offs_r[:, None]
+        type_ok = (
+            (typ_sel == 0)
+            | ((typ_sel == 1) & causal_ok)
+            | ((typ_sel == 2) & inv_ok)
+            | ((typ_sel == 3) & causal_ok & inv_ok)
+        )
+        vis = mask_m[:, None] & mask_n[None, :] & type_ok
+        qk = tl.where(vis, qk, -float("inf"))
+
+        m_ij = tl.max(qk, 1)
+        m_new = tl.maximum(m_i, m_ij)
         m_i_clamped = tl.maximum(m_i, -1e9)
         m_new_clamped = tl.maximum(m_new, -1e9)
         alpha = tl.where(
@@ -353,6 +522,7 @@ def run_kernel(
     scale = float(softmax_scale)
 
     global _META_Q_RANGES, _META_Q, _META_K, _META_T, _META_PARTITION
+    global _META_BLOCKS32, _META_BLOCKS64, _META_BLOCKS128
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
         _META_Q = q_ranges.tolist()
@@ -371,19 +541,30 @@ def run_kernel(
             ok = False
         _META_PARTITION = ok
 
-    if _META_PARTITION:
+        b32 = 0
+        b64 = 0
+        b128 = 0
         i = 0
         while i < N:
-            qs = int(_META_Q[i][0])
-            qe = int(_META_Q[i][1])
-            ks = int(_META_K[i][0])
-            ke = int(_META_K[i][1])
-            typ = int(_META_T[i])
+            qlen = int(_META_Q[i][1]) - int(_META_Q[i][0])
+            b32 += (qlen + 31) // 32
+            b64 += (qlen + 63) // 64
+            b128 += (qlen + 127) // 128
+            i += 1
+        _META_BLOCKS32 = b32
+        _META_BLOCKS64 = b64
+        _META_BLOCKS128 = b128
+
+    if _META_PARTITION:
+        if N == 1:
+            qs = int(_META_Q[0][0])
+            qe = int(_META_Q[0][1])
+            ks = int(_META_K[0][0])
+            ke = int(_META_K[0][1])
+            typ = int(_META_T[0])
             q_len = qe - qs
             k_len = ke - ks
-
             grid = lambda META: (triton.cdiv(q_len, META["BLOCK_M"]), Hq)
-
             single_slice_fwd_kernel[grid](
                 q, k, v, output, sink,
                 scale,
@@ -397,7 +578,27 @@ def run_kernel(
                 BLOCK_D=D,
                 ATTN_TYPE=typ,
             )
-            i += 1
+            return
+
+        grid = lambda META: (
+            _META_BLOCKS128 if META["BLOCK_M"] == 128 else (
+                _META_BLOCKS64 if META["BLOCK_M"] == 64 else _META_BLOCKS32
+            ),
+            Hq,
+        )
+        partition_fwd_kernel[grid](
+            q, k, v, output,
+            q_ranges, k_ranges, attn_type_map, sink,
+            scale,
+            S, Hq, Hkv, D, Ns,
+            Hq * D, D, 1,
+            Hkv * D, D, 1,
+            Hkv * D, D, 1,
+            Hq * D, D, 1,
+            Hq, 1,
+            BLOCK_D=D,
+            NUM_SLICES=N,
+        )
         return
 
     grid = lambda META: (triton.cdiv(S, META["BLOCK_M"]), Hq)
