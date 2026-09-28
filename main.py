@@ -1331,7 +1331,7 @@ def run_kernel(
     global _PREFIX_META_SRC, _PREFIX_Q0, _PREFIX_Q1, _PREFIX_KE, _PREFIX_BM, _PREFIX_TILES
     global _PREFIX_SINK_SRC, _PREFIX_SINK_LSE
     if not _PRINTED_BUILD:
-        print("BUILD PREFIX_PACKGQA_V15")
+        print("BUILD PACKGQA_G4_N1_V16")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
@@ -1388,6 +1388,26 @@ def run_kernel(
                     Hq, 1,
                     GROUP_SIZE=G,
                     BLOCK_D=D,
+                    num_warps=8,
+                    num_stages=4,
+                )
+                return
+
+            # G=4 single-slice path (#1/#7): reuse the generic PackGQA
+            # mask-capable kernel. One CTA covers 32 tokens x 4 Q heads.
+            if D == 128 and G == 4:
+                packgqa_g8_kernel[(triton.cdiv(q_len * G, 128), Hkv)](
+                    q, k, v, output, sink,
+                    scale,
+                    qs, q_len, ks, k_len, Ns,
+                    Hq * D, D,
+                    Hkv * D, D,
+                    Hkv * D, D,
+                    Hq * D, D,
+                    Hq, 1,
+                    GROUP_SIZE=G,
+                    BLOCK_D=D,
+                    ATTN_TYPE=typ,
                     num_warps=8,
                     num_stages=4,
                 )
