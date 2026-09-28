@@ -1890,9 +1890,6 @@ def prefix_packgqa_full_kernel(
         if K_PRESCALED:
             qk = tl.dot(q, tl.trans(kk))
         else:
-            if K_PRESCALED:
-            qk = tl.dot(q, tl.trans(kk))
-        else:
             qk = tl.dot(q, tl.trans(kk)) * (softmax_scale * 1.4426950408889634)
 
         m_new = tl.maximum(m_i, tl.max(qk, axis=1))
@@ -1924,7 +1921,10 @@ def prefix_packgqa_full_kernel(
             mask=mask_n[:, None],
             other=0.0,
         )
-        qk = tl.dot(q, tl.trans(kk)) * (softmax_scale * 1.4426950408889634)
+        if K_PRESCALED:
+            qk = tl.dot(q, tl.trans(kk))
+        else:
+            qk = tl.dot(q, tl.trans(kk)) * (softmax_scale * 1.4426950408889634)
         qk = tl.where(mask_n[None, :], qk, -float("inf"))
 
         m_new = tl.maximum(m_i, tl.max(qk, axis=1))
@@ -2697,7 +2697,7 @@ def run_kernel(
     global _G8M_META_SRC, _G8M_Q0, _G8M_QE, _G8M_KS, _G8M_KLEN, _G8M_R0, _G8M_LO, _G8M_HI, _G8M_BSTART, _G8M_BEND, _G8M_FSTART, _G8M_FEND, _G8M_TILES
     global _OV8_META_SRC, _OV8_Q0, _OV8_QE, _OV8_KS, _OV8_KLEN, _OV8_R0, _OV8_DELTA, _OV8_BEND, _OV8_FULL
     if not _PRINTED_BUILD:
-        print("BUILD PREFIX_G4_KPRESCALE_V69")
+        print("BUILD PREFIX_G4_KPRESCALE_FIX_V70")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
