@@ -77,13 +77,13 @@ void case9_wmma_two_pass(
 
     using AFrag = wmma::fragment<
         wmma::matrix_a, WM, WN, WK,
-        wmma::precision::bfloat16, wmma::row_major>;
+        __nv_bfloat16, wmma::row_major>;
     using BColFrag = wmma::fragment<
         wmma::matrix_b, WM, WN, WK,
-        wmma::precision::bfloat16, wmma::col_major>;
+        __nv_bfloat16, wmma::col_major>;
     using BRowFrag = wmma::fragment<
         wmma::matrix_b, WM, WN, WK,
-        wmma::precision::bfloat16, wmma::row_major>;
+        __nv_bfloat16, wmma::row_major>;
     using CFrag = wmma::fragment<
         wmma::accumulator, WM, WN, WK, float>;
 
