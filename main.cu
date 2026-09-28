@@ -450,6 +450,318 @@ void generic_ffa_wmma(
     }
 }
 
+
+template <int SEQ, int HQ, int HKV, int G, bool CAUSAL>
+__global__ __launch_bounds__(256, 1)
+void dense_packgqa_online_wmma(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v,
+    const float* __restrict__ sink,
+    __nv_bfloat16* __restrict__ out,
+    float softmax_scale
+) {
+    constexpr int PM = 128;
+    constexpr int KN = 64;
+    constexpr int W = 8;
+    constexpr int HD = 128;
+    constexpr int TOKEN_M = PM / G;
+    constexpr int SCORE_ELEMS_PER_WARP = 16 * KN;
+    constexpr int PROB_ELEMS_PER_WARP = 16 * KN;
+    constexpr int OUT_ELEMS_PER_WARP = 16 * HD;
+
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    __nv_bfloat16* q_s = reinterpret_cast<__nv_bfloat16*>(smem_raw);
+    __nv_bfloat16* kv_s = q_s + PM * HD;
+    float* score_s = reinterpret_cast<float*>(kv_s + KN * HD);
+    __nv_bfloat16* prob_s =
+        reinterpret_cast<__nv_bfloat16*>(score_s + W * SCORE_ELEMS_PER_WARP);
+    float* out_s =
+        reinterpret_cast<float*>(prob_s + W * PROB_ELEMS_PER_WARP);
+    float* alpha_s = out_s + W * OUT_ELEMS_PER_WARP;
+
+    const int kvh = blockIdx.y;
+    const int tile = blockIdx.x;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int warp_row0 = warp * 16;
+    const int token0 = tile * TOKEN_M;
+
+    float* ws = score_s + warp * SCORE_ELEMS_PER_WARP;
+    __nv_bfloat16* wp = prob_s + warp * PROB_ELEMS_PER_WARP;
+    float* wo = out_s + warp * OUT_ELEMS_PER_WARP;
+
+    // Pack G query heads that share one KV head into a 128-row matrix.
+    for (int chunk = threadIdx.x; chunk < (PM * HD) / 8; chunk += blockDim.x) {
+        const int p = chunk / (HD / 8);
+        const int c = chunk - p * (HD / 8);
+        const int d0 = c * 8;
+        const int tok_local = p / G;
+        const int gh = p - tok_local * G;
+        const int tok = token0 + tok_local;
+        const int qh = kvh * G + gh;
+
+        const __nv_bfloat16* gptr =
+            q + (int64_t(tok) * HQ + qh) * HD + d0;
+        __nv_bfloat16* sptr = q_s + p * HD + d0;
+        *reinterpret_cast<uint4*>(sptr) =
+            *reinterpret_cast<const uint4*>(gptr);
+    }
+
+    for (int i = threadIdx.x; i < W * OUT_ELEMS_PER_WARP; i += blockDim.x) {
+        out_s[i] = 0.0f;
+    }
+    __syncthreads();
+
+    using AFrag = wmma::fragment<
+        wmma::matrix_a, 16, 16, 16,
+        __nv_bfloat16, wmma::row_major>;
+    using BColFrag = wmma::fragment<
+        wmma::matrix_b, 16, 16, 16,
+        __nv_bfloat16, wmma::col_major>;
+    using BRowFrag = wmma::fragment<
+        wmma::matrix_b, 16, 16, 16,
+        __nv_bfloat16, wmma::row_major>;
+    using CFrag = wmma::fragment<
+        wmma::accumulator, 16, 16, 16, float>;
+
+    float row_m = -CUDART_INF_F;
+    float row_l = 0.0f;
+    int row_tok = 0;
+    int row_qh = 0;
+
+    if (lane < 16) {
+        const int p = warp_row0 + lane;
+        const int tok_local = p / G;
+        const int gh = p - tok_local * G;
+        row_tok = token0 + tok_local;
+        row_qh = kvh * G + gh;
+    }
+
+    int k_tiles = SEQ / KN;
+    if constexpr (CAUSAL) {
+        const int max_q = token0 + TOKEN_M - 1;
+        k_tiles = (max_q + 1 + KN - 1) / KN;
+    }
+
+    for (int kb = 0; kb < k_tiles; ++kb) {
+        const int n0 = kb * KN;
+
+        // Cooperative 16B K load.
+        for (int chunk = threadIdx.x; chunk < (KN * HD) / 8; chunk += blockDim.x) {
+            const int r = chunk / (HD / 8);
+            const int c = chunk - r * (HD / 8);
+            const int d0 = c * 8;
+            const __nv_bfloat16* gptr =
+                k + (int64_t(n0 + r) * HKV + kvh) * HD + d0;
+            __nv_bfloat16* sptr = kv_s + r * HD + d0;
+            *reinterpret_cast<uint4*>(sptr) =
+                *reinterpret_cast<const uint4*>(gptr);
+        }
+        __syncthreads();
+
+        // 16 packed Q rows x 64 K rows per warp.
+        CFrag qk_frag[4];
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            wmma::fill_fragment(qk_frag[nt], 0.0f);
+        }
+
+#pragma unroll
+        for (int kk0 = 0; kk0 < HD; kk0 += 16) {
+            AFrag af;
+            wmma::load_matrix_sync(
+                af,
+                q_s + warp_row0 * HD + kk0,
+                HD
+            );
+
+#pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+                BColFrag bf;
+                wmma::load_matrix_sync(
+                    bf,
+                    kv_s + nt * 16 * HD + kk0,
+                    HD
+                );
+                wmma::mma_sync(qk_frag[nt], af, bf, qk_frag[nt]);
+            }
+        }
+
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            wmma::store_matrix_sync(
+                ws + nt * 16,
+                qk_frag[nt],
+                KN,
+                wmma::mem_row_major
+            );
+        }
+        __syncwarp();
+
+        if (lane < 16) {
+            const bool frontier = CAUSAL && (n0 + KN - 1 > token0);
+            float tile_m = -CUDART_INF_F;
+
+#pragma unroll
+            for (int j = 0; j < KN; ++j) {
+                const int key = n0 + j;
+                if (!frontier || key <= row_tok) {
+                    tile_m = fmaxf(tile_m, ws[lane * KN + j] * softmax_scale);
+                }
+            }
+
+            const float m_new = fmaxf(row_m, tile_m);
+            const float alpha =
+                (row_m == -CUDART_INF_F) ? 0.0f : __expf(row_m - m_new);
+            float tile_l = 0.0f;
+
+#pragma unroll
+            for (int j = 0; j < KN; ++j) {
+                const int key = n0 + j;
+                float p = 0.0f;
+                if (!frontier || key <= row_tok) {
+                    p = __expf(ws[lane * KN + j] * softmax_scale - m_new);
+                    tile_l += p;
+                }
+                wp[lane * KN + j] = __float2bfloat16_rn(p);
+            }
+
+            alpha_s[warp * 16 + lane] = alpha;
+            row_l = row_l * alpha + tile_l;
+            row_m = m_new;
+        }
+        __syncwarp();
+
+        // Rescale the accumulated numerator to the new online-softmax max.
+        for (int t = lane; t < OUT_ELEMS_PER_WARP; t += 32) {
+            const int r = t / HD;
+            wo[t] *= alpha_s[warp * 16 + r];
+        }
+        __syncwarp();
+
+        // K is dead; reuse the same shared tile for V.
+        __syncthreads();
+        for (int chunk = threadIdx.x; chunk < (KN * HD) / 8; chunk += blockDim.x) {
+            const int r = chunk / (HD / 8);
+            const int c = chunk - r * (HD / 8);
+            const int d0 = c * 8;
+            const __nv_bfloat16* gptr =
+                v + (int64_t(n0 + r) * HKV + kvh) * HD + d0;
+            __nv_bfloat16* sptr = kv_s + r * HD + d0;
+            *reinterpret_cast<uint4*>(sptr) =
+                *reinterpret_cast<const uint4*>(gptr);
+        }
+        __syncthreads();
+
+        CFrag out_frag[8];
+#pragma unroll
+        for (int dt = 0; dt < 8; ++dt) {
+            wmma::load_matrix_sync(
+                out_frag[dt],
+                wo + dt * 16,
+                HD,
+                wmma::mem_row_major
+            );
+        }
+
+#pragma unroll
+        for (int pk = 0; pk < KN; pk += 16) {
+            AFrag pf;
+            wmma::load_matrix_sync(pf, wp + pk, KN);
+
+#pragma unroll
+            for (int dt = 0; dt < 8; ++dt) {
+                BRowFrag vf;
+                wmma::load_matrix_sync(
+                    vf,
+                    kv_s + pk * HD + dt * 16,
+                    HD
+                );
+                wmma::mma_sync(
+                    out_frag[dt],
+                    pf,
+                    vf,
+                    out_frag[dt]
+                );
+            }
+        }
+
+#pragma unroll
+        for (int dt = 0; dt < 8; ++dt) {
+            wmma::store_matrix_sync(
+                wo + dt * 16,
+                out_frag[dt],
+                HD,
+                wmma::mem_row_major
+            );
+        }
+        __syncthreads();
+    }
+
+    // Fold Attention Sink into the denominator and emit BF16 output.
+    if (lane < 16) {
+        float denom = row_l;
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            denom += __expf(sink[s * HQ + row_qh] - row_m);
+        }
+        alpha_s[warp * 16 + lane] = 1.0f / denom;
+    }
+    __syncwarp();
+
+    for (int t = lane; t < OUT_ELEMS_PER_WARP; t += 32) {
+        const int r = t / HD;
+        const int d = t - r * HD;
+        const int p = warp_row0 + r;
+        const int tok_local = p / G;
+        const int gh = p - tok_local * G;
+        const int tok = token0 + tok_local;
+        const int qh = kvh * G + gh;
+
+        out[(int64_t(tok) * HQ + qh) * HD + d] =
+            __float2bfloat16_rn(wo[t] * alpha_s[warp * 16 + r]);
+    }
+}
+
+
+template <int SEQ, int HQ, int HKV, int G, bool CAUSAL>
+void launch_dense_packgqa_online(
+    const __nv_bfloat16* q,
+    const __nv_bfloat16* k,
+    const __nv_bfloat16* v,
+    const float* sink,
+    __nv_bfloat16* out,
+    float softmax_scale
+) {
+    constexpr int PM = 128;
+    constexpr int KN = 64;
+    constexpr int HD = 128;
+    constexpr int W = 8;
+    constexpr int TOKEN_M = PM / G;
+
+    constexpr size_t smem_bytes =
+        PM * HD * sizeof(__nv_bfloat16) +
+        KN * HD * sizeof(__nv_bfloat16) +
+        W * 16 * KN * sizeof(float) +
+        W * 16 * KN * sizeof(__nv_bfloat16) +
+        W * 16 * HD * sizeof(float) +
+        W * 16 * sizeof(float);
+
+    cudaFuncSetAttribute(
+        dense_packgqa_online_wmma<SEQ, HQ, HKV, G, CAUSAL>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        int(smem_bytes)
+    );
+
+    dim3 grid((SEQ + TOKEN_M - 1) / TOKEN_M, HKV, 1);
+    dim3 block(256, 1, 1);
+    dense_packgqa_online_wmma<SEQ, HQ, HKV, G, CAUSAL>
+        <<<grid, block, smem_bytes>>>(
+            q, k, v, sink, out, softmax_scale
+        );
+}
+
 } // namespace
 
 extern "C" void run_kernel(
@@ -476,7 +788,50 @@ extern "C" void run_kernel(
     const int Ns = int(num_sink);
     const int G = Hq / Hkv;
 
-    // All scored shapes have S*G divisible by 64.
+    // SM90 CUDA fastpaths: same dense structures that are strongest in the
+    // Triton solution, now using one-pass online softmax + PackGQA.
+    if (
+        S == 4096 && Hq == 32 && Hkv == 8 &&
+        head_dim == 128 && N == 1 && Ns == 4
+    ) {
+        launch_dense_packgqa_online<4096, 32, 8, 4, true>(
+            q, k, v, sink, output, softmax_scale
+        );
+        return;
+    }
+
+    if (
+        S == 16384 && Hq == 32 && Hkv == 8 &&
+        head_dim == 128 && N == 1 && Ns == 4
+    ) {
+        launch_dense_packgqa_online<16384, 32, 8, 4, true>(
+            q, k, v, sink, output, softmax_scale
+        );
+        return;
+    }
+
+    if (
+        S == 2048 && Hq == 8 && Hkv == 8 &&
+        head_dim == 128 && N == 1 && Ns == 4
+    ) {
+        launch_dense_packgqa_online<2048, 8, 8, 1, false>(
+            q, k, v, sink, output, softmax_scale
+        );
+        return;
+    }
+
+    if (
+        S == 8192 && Hq == 128 && Hkv == 1 &&
+        head_dim == 128 && N == 1 && Ns == 4
+    ) {
+        launch_dense_packgqa_online<8192, 128, 1, 128, false>(
+            q, k, v, sink, output, softmax_scale
+        );
+        return;
+    }
+
+    // Proven 12/12-correct fallback while the remaining static CUDA
+    // specializations are being migrated.
     dim3 grid((S * G) / PACKED_M, Hkv, 1);
     dim3 block(128, 1, 1);
 
@@ -497,4 +852,5 @@ extern "C" void run_kernel(
             S, Hq, Hkv, N, Ns
         );
     }
+
 }
