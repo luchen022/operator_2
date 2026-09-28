@@ -24,13 +24,20 @@ def quantize_k_fp8_kernel(
     D: tl.constexpr,
 ):
     row = tl.program_id(0)
-    offs_d = tl.arange(0, D)
-    x = tl.load(K + row * D + offs_d)
-    amax = tl.max(tl.abs(x), axis=0)
-    scale = tl.maximum(amax / 448.0, 1e-8)
-    x8 = (x / scale).to(tl.float8e4nv)
-    tl.store(K8 + row * D + offs_d, x8)
-    tl.store(KSCALE + row, scale)
+    offs = tl.arange(0, 64)
+
+    x0 = tl.load(K + row * D + offs)
+    x1 = tl.load(K + row * D + 64 + offs)
+
+    amax0 = tl.max(tl.abs(x0), axis=0)
+    amax1 = tl.max(tl.abs(x1), axis=0)
+    scale0 = tl.maximum(amax0 / 448.0, 1e-8)
+    scale1 = tl.maximum(amax1 / 448.0, 1e-8)
+
+    tl.store(K8 + row * D + offs, (x0 / scale0).to(tl.float8e4nv))
+    tl.store(K8 + row * D + 64 + offs, (x1 / scale1).to(tl.float8e4nv))
+    tl.store(KSCALE + row * 2 + 0, scale0)
+    tl.store(KSCALE + row * 2 + 1, scale1)
 
 
 @triton.autotune(
@@ -221,15 +228,18 @@ def single_slice_fp8_qk_kernel(
     offs_r = block_r_start + tl.arange(0, BLOCK_M)
     offs_m = q_start + offs_r
     offs_d = tl.arange(0, BLOCK_D)
+    offs64 = tl.arange(0, 64)
     mask_m = offs_r < q_len
 
-    q_ptrs = Q + offs_m[:, None] * stride_qz + pid_h * stride_qh + offs_d[None, :]
-    q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
+    q0_ptrs = Q + offs_m[:, None] * stride_qz + pid_h * stride_qh + offs64[None, :]
+    q1_ptrs = Q + offs_m[:, None] * stride_qz + pid_h * stride_qh + (64 + offs64)[None, :]
+    q0 = tl.load(q0_ptrs, mask=mask_m[:, None], other=0.0)
+    q1 = tl.load(q1_ptrs, mask=mask_m[:, None], other=0.0)
 
-    q_abs = tl.abs(q)
-    q_amax = tl.max(q_abs, axis=1)
-    q_scale = tl.maximum(q_amax / 448.0, 1e-8)
-    q8 = (q / q_scale[:, None]).to(tl.float8e4nv)
+    q_scale0 = tl.maximum(tl.max(tl.abs(q0), axis=1) / 448.0, 1e-8)
+    q_scale1 = tl.maximum(tl.max(tl.abs(q1), axis=1) / 448.0, 1e-8)
+    q8_0 = (q0 / q_scale0[:, None]).to(tl.float8e4nv)
+    q8_1 = (q1 / q_scale1[:, None]).to(tl.float8e4nv)
 
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
@@ -263,16 +273,28 @@ def single_slice_fp8_qk_kernel(
         offs_n = k_start + offs_u
         mask_n = offs_u < k_len
 
-        k8_ptrs = K8 + offs_n[:, None] * stride_kz8 + pid_kv * stride_kh8 + offs_d[None, :]
-        k8 = tl.load(k8_ptrs, mask=mask_n[:, None], other=0.0)
-        ks = tl.load(
-            KSCALE + offs_n * stride_ksz + pid_kv * stride_ksh,
+        k8_0_ptrs = K8 + offs_n[:, None] * stride_kz8 + pid_kv * stride_kh8 + offs64[None, :]
+        k8_1_ptrs = K8 + offs_n[:, None] * stride_kz8 + pid_kv * stride_kh8 + (64 + offs64)[None, :]
+        k8_0 = tl.load(k8_0_ptrs, mask=mask_n[:, None], other=0.0)
+        k8_1 = tl.load(k8_1_ptrs, mask=mask_n[:, None], other=0.0)
+
+        ks0 = tl.load(
+            KSCALE + (offs_n * num_kv_heads + pid_kv) * 2 + 0,
+            mask=mask_n,
+            other=1.0,
+        )
+        ks1 = tl.load(
+            KSCALE + (offs_n * num_kv_heads + pid_kv) * 2 + 1,
             mask=mask_n,
             other=1.0,
         )
 
-        qk = tl.dot(q8, tl.trans(k8))
-        qk = qk * q_scale[:, None] * ks[None, :] * softmax_scale
+        qk0 = tl.dot(q8_0, tl.trans(k8_0))
+        qk1 = tl.dot(q8_1, tl.trans(k8_1))
+        qk = (
+            qk0 * q_scale0[:, None] * ks0[None, :]
+            + qk1 * q_scale1[:, None] * ks1[None, :]
+        ) * softmax_scale
 
         if ATTN_TYPE == 0:
             vis = mask_m[:, None] & mask_n[None, :]
@@ -756,7 +778,7 @@ def run_kernel(
                         device=k.device,
                     )
                     _K_SCALE = torch.empty(
-                        (S, Hkv),
+                        (S, Hkv, 2),
                         dtype=torch.float32,
                         device=k.device,
                     )
@@ -776,7 +798,7 @@ def run_kernel(
                     Hq, Hkv, Ns,
                     Hq * D, D,
                     Hkv * D, D,
-                    Hkv, 1,
+                    Hkv * 2, 2,
                     Hkv * D, D,
                     Hq * D, D,
                     Hq, 1,
