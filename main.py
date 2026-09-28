@@ -747,6 +747,130 @@ def single_slice_fp8_qk_kernel(
     tl.store(out_ptrs, acc.to(tl.bfloat16), mask=mask_m[:, None])
 
 
+@triton.jit
+def partition_packgqa_causal_d64_kernel(
+    Q, K, V, Out,
+    q_ranges_ptr, k_ranges_ptr, sink_ptr,
+    softmax_scale,
+    num_sink,
+    stride_qz, stride_qh,
+    stride_kz, stride_kh,
+    stride_vz, stride_vh,
+    stride_oz, stride_oh,
+    stride_sink_s, stride_sink_h,
+    GROUP_SIZE: tl.constexpr,
+    NUM_SLICES: tl.constexpr,
+):
+    pid_tile = tl.program_id(0)
+    pid_kv = tl.program_id(1)
+
+    prefix = 0
+    qs_sel = 0
+    qe_sel = 0
+    ks_sel = 0
+    ke_sel = 0
+    local_block = 0
+
+    for sidx in tl.static_range(0, NUM_SLICES):
+        qs = tl.load(q_ranges_ptr + sidx * 2)
+        qe = tl.load(q_ranges_ptr + sidx * 2 + 1)
+        ks = tl.load(k_ranges_ptr + sidx * 2)
+        ke = tl.load(k_ranges_ptr + sidx * 2 + 1)
+        qlen = qe - qs
+        nblocks = tl.cdiv(qlen, 32)
+        hit = (pid_tile >= prefix) & (pid_tile < prefix + nblocks)
+
+        qs_sel = tl.where(hit, qs, qs_sel)
+        qe_sel = tl.where(hit, qe, qe_sel)
+        ks_sel = tl.where(hit, ks, ks_sel)
+        ke_sel = tl.where(hit, ke, ke_sel)
+        local_block = tl.where(hit, pid_tile - prefix, local_block)
+        prefix += nblocks
+
+    packed = tl.arange(0, 128)
+    tok_local = packed // GROUP_SIZE
+    gh = packed - tok_local * GROUP_SIZE
+    qh = pid_kv * GROUP_SIZE + gh
+
+    q_len = qe_sel - qs_sel
+    k_len = ke_sel - ks_sel
+    r = local_block * 32 + tok_local
+    offs_m = qs_sel + r
+    mask_m = r < q_len
+    d = tl.arange(0, 64)
+
+    q = tl.load(
+        Q + offs_m[:, None] * stride_qz + qh[:, None] * stride_qh + d[None, :],
+        mask=mask_m[:, None], other=0.0,
+    )
+
+    m_i = tl.zeros([128], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([128], dtype=tl.float32)
+    acc = tl.zeros([128, 64], dtype=tl.float32)
+
+    r_last = tl.minimum(local_block * 32 + 32, q_len) - 1
+    causal_limit = r_last + (k_len - q_len)
+    b_end = tl.cdiv(causal_limit + 1, 64)
+    b_end = tl.maximum(0, tl.minimum(b_end, tl.cdiv(k_len, 64)))
+
+    for b in range(0, b_end):
+        u = b * 64 + tl.arange(0, 64)
+        offs_n = ks_sel + u
+        mask_n = u < k_len
+
+        k = tl.load(
+            K + offs_n[:, None] * stride_kz + pid_kv * stride_kh + d[None, :],
+            mask=mask_n[:, None], other=0.0,
+        )
+        qk = tl.dot(q, tl.trans(k)) * softmax_scale
+
+        vis = mask_m[:, None] & mask_n[None, :] & (
+            u[None, :] <= (r[:, None] + (k_len - q_len))
+        )
+        qk = tl.where(vis, qk, -float("inf"))
+
+        m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+        alpha = tl.where(
+            m_i > -float("inf"),
+            tl.exp2((m_i - m_new) * 1.4426950408889634),
+            0.0,
+        )
+        p = tl.where(
+            vis,
+            tl.exp2((qk - m_new[:, None]) * 1.4426950408889634),
+            0.0,
+        )
+
+        vv = tl.load(
+            V + offs_n[:, None] * stride_vz + pid_kv * stride_vh + d[None, :],
+            mask=mask_n[:, None], other=0.0,
+        )
+
+        acc = acc * alpha[:, None]
+        acc = tl.dot(p.to(tl.bfloat16), vv, acc)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_new
+
+    s = tl.arange(0, 16)
+    smask = s[None, :] < num_sink
+    sv = tl.load(
+        sink_ptr + s[None, :] * stride_sink_s + qh[:, None] * stride_sink_h,
+        mask=mask_m[:, None] & smask,
+        other=-float("inf"),
+    )
+    smax = tl.max(sv, axis=1)
+    ssum = tl.sum(tl.exp2((sv - smax[:, None]) * 1.4426950408889634), axis=1)
+    slse = smax + tl.log2(ssum) * 0.6931471805599453
+    denom = l_i + tl.exp2((slse - m_i) * 1.4426950408889634)
+    acc = acc / denom[:, None]
+
+    tl.store(
+        Out + offs_m[:, None] * stride_oz + qh[:, None] * stride_oh + d[None, :],
+        acc.to(tl.bfloat16),
+        mask=mask_m[:, None],
+    )
+
+
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=4),
@@ -1487,7 +1611,7 @@ def run_kernel(
     global _PREFIX_META_SRC, _PREFIX_Q0, _PREFIX_Q1, _PREFIX_KE, _PREFIX_BM, _PREFIX_TILES
     global _PREFIX_SINK_SRC, _PREFIX_SINK_LSE
     if not _PRINTED_BUILD:
-        print("BUILD STABLE_87_42_V25")
+        print("BUILD D64_G4_PACKGQA_V26")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
@@ -1736,6 +1860,25 @@ def run_kernel(
                     num_warps=4 if bm == 32 else 8,
                     num_stages=4 if bn == 64 else 3,
                 )
+            return
+
+        G = Hq // Hkv
+        if D == 64 and N == 10 and all_causal and G == 4:
+            partition_packgqa_causal_d64_kernel[(_META_BLOCKS32, Hkv)](
+                q, k, v, output,
+                q_ranges, k_ranges, sink,
+                scale,
+                Ns,
+                Hq * D, D,
+                Hkv * D, D,
+                Hkv * D, D,
+                Hq * D, D,
+                Hq, 1,
+                GROUP_SIZE=G,
+                NUM_SLICES=N,
+                num_warps=8,
+                num_stages=4,
+            )
             return
 
         use_fused_partition = False
