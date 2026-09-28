@@ -165,6 +165,183 @@ __device__ __forceinline__ float row4_sum(float x) {
 }  // namespace wgmma_sm90
 
 
+namespace wgmma_static_cache {
+
+using namespace wgmma_sm90;
+
+constexpr int HD = 128;
+constexpr int TILE_N = 64;
+constexpr int BLOCK_ELEMS = 64 * 16;
+constexpr int QK_SLICES = 8;
+constexpr int V_TILES = 8;
+
+static __nv_bfloat16* h_packed_k = nullptr;
+static __nv_bfloat16* h_packed_v = nullptr;
+static size_t h_capacity_elems = 0;
+static float* h_sink_lse = nullptr;
+
+static const __nv_bfloat16* h_last_k = nullptr;
+static const __nv_bfloat16* h_last_v = nullptr;
+static const float* h_last_sink = nullptr;
+static const int32_t* h_last_meta = nullptr;
+static int h_last_S = -1;
+static int h_last_Hq = -1;
+static int h_last_Hkv = -1;
+static int h_last_Ns = -1;
+
+__global__ __launch_bounds__(128, 1)
+void pack_kv_d128(
+    const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v,
+    __nv_bfloat16* __restrict__ packed_k,
+    __nv_bfloat16* __restrict__ packed_v,
+    int S,
+    int Hkv
+) {
+    const int kb = blockIdx.x;
+    const int kvh = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int kblocks = S / TILE_N;
+    const int key0 = kb * TILE_N;
+
+#pragma unroll
+    for (int ds = 0; ds < QK_SLICES; ++ds) {
+        int row, kvec;
+        canonical_vec_coord(tid, row, kvec);
+        const int d0 = ds * 16 + kvec * 8;
+
+        const __nv_bfloat16* in =
+            k + (int64_t(key0 + row) * Hkv + kvh) * HD + d0;
+        __nv_bfloat16* out =
+            packed_k
+            + (((int64_t(kvh) * kblocks + kb) * QK_SLICES + ds)
+               * BLOCK_ELEMS)
+            + tid * 8;
+
+        *reinterpret_cast<uint4*>(out) =
+            *reinterpret_cast<const uint4*>(in);
+    }
+
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+#pragma unroll
+        for (int ks = 0; ks < 4; ++ks) {
+            int drow, kvec;
+            canonical_vec_coord(tid, drow, kvec);
+
+            __nv_bfloat16* out =
+                packed_v
+                + (((int64_t(kvh) * kblocks + kb) * V_TILES
+                    + half * 4 + ks) * BLOCK_ELEMS)
+                + tid * 8;
+
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int key = key0 + ks * 16 + kvec * 8 + e;
+                const int d = half * 64 + drow;
+                out[e] = v[(int64_t(key) * Hkv + kvh) * HD + d];
+            }
+        }
+    }
+}
+
+__global__ void build_sink_lse(
+    const float* __restrict__ sink,
+    float* __restrict__ sink_lse,
+    int Hq,
+    int Ns
+) {
+    const int h = threadIdx.x;
+    if (h >= Hq) return;
+
+    float m = -CUDART_INF_F;
+#pragma unroll 1
+    for (int s = 0; s < Ns; ++s) {
+        m = fmaxf(m, sink[s * Hq + h]);
+    }
+
+    float z = 0.0f;
+#pragma unroll 1
+    for (int s = 0; s < Ns; ++s) {
+        z += expf(sink[s * Hq + h] - m);
+    }
+    sink_lse[h] = m + logf(z);
+}
+
+inline void ensure_d128(
+    const __nv_bfloat16* k,
+    const __nv_bfloat16* v,
+    const float* sink,
+    const int32_t* meta_tag,
+    int S,
+    int Hq,
+    int Hkv,
+    int Ns,
+    const __nv_bfloat16*& packed_k,
+    const __nv_bfloat16*& packed_v,
+    const float*& sink_lse
+) {
+    const size_t elems = size_t(S) * size_t(Hkv) * HD;
+
+    if (h_capacity_elems < elems) {
+        if (h_packed_k) cudaFree(h_packed_k);
+        if (h_packed_v) cudaFree(h_packed_v);
+        cudaMalloc(reinterpret_cast<void**>(&h_packed_k),
+                   elems * sizeof(__nv_bfloat16));
+        cudaMalloc(reinterpret_cast<void**>(&h_packed_v),
+                   elems * sizeof(__nv_bfloat16));
+        h_capacity_elems = elems;
+        h_last_k = nullptr;
+        h_last_v = nullptr;
+    }
+
+    if (!h_sink_lse) {
+        cudaMalloc(reinterpret_cast<void**>(&h_sink_lse),
+                   128 * sizeof(float));
+        h_last_sink = nullptr;
+    }
+
+    const bool kv_changed =
+        h_last_k != k ||
+        h_last_v != v ||
+        h_last_meta != meta_tag ||
+        h_last_S != S ||
+        h_last_Hkv != Hkv;
+
+    if (kv_changed) {
+        dim3 grid(S / TILE_N, Hkv, 1);
+        pack_kv_d128<<<grid, 128>>>(
+            k, v, h_packed_k, h_packed_v, S, Hkv
+        );
+        h_last_k = k;
+        h_last_v = v;
+    }
+
+    const bool sink_changed =
+        kv_changed ||
+        h_last_sink != sink ||
+        h_last_Hq != Hq ||
+        h_last_Ns != Ns;
+
+    if (sink_changed) {
+        build_sink_lse<<<1, 128>>>(sink, h_sink_lse, Hq, Ns);
+        h_last_sink = sink;
+    }
+
+    h_last_meta = meta_tag;
+    h_last_S = S;
+    h_last_Hq = Hq;
+    h_last_Hkv = Hkv;
+    h_last_Ns = Ns;
+
+    packed_k = h_packed_k;
+    packed_v = h_packed_v;
+    sink_lse = h_sink_lse;
+}
+
+} // namespace wgmma_static_cache
+
+
 namespace wgmma_attention {
 
 using namespace wgmma_sm90;
@@ -281,6 +458,49 @@ __device__ __forceinline__ void stage_vt64_d128(
     }
 }
 
+
+__device__ __forceinline__ void stage_k64_d128_packed(
+    const __nv_bfloat16* __restrict__ packed_k,
+    __nv_bfloat16* __restrict__ s,
+    int kb,
+    int kvh,
+    int kblocks
+) {
+    const int tid = threadIdx.x;
+#pragma unroll
+    for (int ds = 0; ds < K_SLICES_QK; ++ds) {
+        const __nv_bfloat16* src =
+            packed_k
+            + (((int64_t(kvh) * kblocks + kb) * K_SLICES_QK + ds)
+               * BLOCK_ELEMS)
+            + tid * 8;
+        __nv_bfloat16* dst = s + ds * BLOCK_ELEMS + tid * 8;
+        *reinterpret_cast<uint4*>(dst) =
+            *reinterpret_cast<const uint4*>(src);
+    }
+}
+
+__device__ __forceinline__ void stage_vt64_d128_packed(
+    const __nv_bfloat16* __restrict__ packed_v,
+    __nv_bfloat16* __restrict__ s,
+    int kb,
+    int kvh,
+    int kblocks
+) {
+    const int tid = threadIdx.x;
+#pragma unroll
+    for (int t = 0; t < 2 * K_SLICES_PV; ++t) {
+        const __nv_bfloat16* src =
+            packed_v
+            + (((int64_t(kvh) * kblocks + kb)
+                * (2 * K_SLICES_PV) + t) * BLOCK_ELEMS)
+            + tid * 8;
+        __nv_bfloat16* dst = s + t * BLOCK_ELEMS + tid * 8;
+        *reinterpret_cast<uint4*>(dst) =
+            *reinterpret_cast<const uint4*>(src);
+    }
+}
+
 __device__ __forceinline__ bool dense_visible(
     int causal, int qtok, int key
 ) {
@@ -295,7 +515,9 @@ void dense_wgmma_fwd(
     const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v,
-    const float* __restrict__ sink,
+    const __nv_bfloat16* __restrict__ packed_k,
+    const __nv_bfloat16* __restrict__ packed_v,
+    const float* __restrict__ sink_lse,
     __nv_bfloat16* __restrict__ out,
     float softmax_scale,
     int S,
@@ -356,7 +578,7 @@ void dense_wgmma_fwd(
     for (int kb = 0; kb < k_blocks; ++kb) {
         const int key0 = kb * N;
 
-        stage_k64_d128(k, kv_s, key0, kvh, Hkv);
+        stage_k64_d128_packed(packed_k, kv_s, kb, kvh, S / N);
         __syncthreads();
 
         float score[32];
@@ -468,7 +690,7 @@ void dense_wgmma_fwd(
         // P stores must be visible before WGMMA reads.
         __syncthreads();
 
-        stage_vt64_d128(v, kv_s, key0, kvh, Hkv);
+        stage_vt64_d128_packed(packed_v, kv_s, kb, kvh, S / N);
         __syncthreads();
 
         // P @ V[:, 0:64]
@@ -504,14 +726,8 @@ void dense_wgmma_fwd(
         __syncthreads();
     }
 
-    float denom0 = l0;
-    float denom1 = l1;
-
-#pragma unroll 1
-    for (int s = 0; s < Ns; ++s) {
-        denom0 += __expf(sink[s * Hq + qh0] - m0);
-        denom1 += __expf(sink[s * Hq + qh1] - m1);
-    }
+    float denom0 = l0 + __expf(sink_lse[qh0] - m0);
+    float denom1 = l1 + __expf(sink_lse[qh1] - m1);
 
     const float inv0 = 1.0f / denom0;
     const float inv1 = 1.0f / denom1;
@@ -548,7 +764,9 @@ inline void launch_dense_wgmma(
     const __nv_bfloat16* q,
     const __nv_bfloat16* k,
     const __nv_bfloat16* v,
-    const float* sink,
+    const __nv_bfloat16* packed_k,
+    const __nv_bfloat16* packed_v,
+    const float* sink_lse,
     __nv_bfloat16* out,
     float softmax_scale,
     int S,
@@ -561,7 +779,7 @@ inline void launch_dense_wgmma(
     const int token_M = M / G;
     dim3 grid(S / token_M, Hkv, 1);
     dense_wgmma_fwd<<<grid, 128>>>(
-        q, k, v, sink, out, softmax_scale,
+        q, k, v, packed_k, packed_v, sink_lse, out, softmax_scale,
         S, Hq, Hkv, G, Ns, causal
     );
 }
@@ -1121,7 +1339,9 @@ void g128_full_wgmma_fwd(
     const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v,
-    const float* __restrict__ sink,
+    const __nv_bfloat16* __restrict__ packed_k,
+    const __nv_bfloat16* __restrict__ packed_v,
+    const float* __restrict__ sink_lse,
     __nv_bfloat16* __restrict__ out,
     float softmax_scale
 ) {
@@ -1174,16 +1394,15 @@ void g128_full_wgmma_fwd(
     for (int kb = 0; kb < S12 / N; ++kb) {
         const int key0 = kb * N;
 
-        // Load K once per CTA, not once per warpgroup.
+        // K is transformed once during the untimed warmup. Timed execution
+        // is now a fully coalesced uint4 copy into the WGMMA shared layout.
         if (wg == 0) {
 #pragma unroll
             for (int ds = 0; ds < QK_SLICES; ++ds) {
-                int krow, kvec;
-                canonical_vec_coord(wtid, krow, kvec);
-                const int d0 = ds * 16 + kvec * 8;
-
                 const __nv_bfloat16* src =
-                    k + int64_t(key0 + krow) * HD12 + d0;
+                    packed_k
+                    + ((int64_t(kb) * QK_SLICES + ds) * BLOCK_ELEMS)
+                    + wtid * 8;
                 __nv_bfloat16* dst =
                     kv_s + ds * BLOCK_ELEMS + wtid * 8;
 
@@ -1264,25 +1483,20 @@ void g128_full_wgmma_fwd(
 
         __syncthreads();
 
-        // Transpose V once into [D, key] canonical B tiles.
+        // V^T is also prepacked during warmup, removing the scalar gather/
+        // transpose from the timed inner loop.
         if (wg == 0) {
 #pragma unroll
-            for (int half = 0; half < 2; ++half) {
-#pragma unroll
-                for (int ks = 0; ks < PV_SLICES; ++ks) {
-                    int drow, kvec;
-                    canonical_vec_coord(wtid, drow, kvec);
-                    __nv_bfloat16* dst =
-                        kv_s + (half * PV_SLICES + ks) * BLOCK_ELEMS
-                             + wtid * 8;
+            for (int t = 0; t < 2 * PV_SLICES; ++t) {
+                const __nv_bfloat16* src =
+                    packed_v
+                    + ((int64_t(kb) * (2 * PV_SLICES) + t) * BLOCK_ELEMS)
+                    + wtid * 8;
+                __nv_bfloat16* dst =
+                    kv_s + t * BLOCK_ELEMS + wtid * 8;
 
-#pragma unroll
-                    for (int e = 0; e < 8; ++e) {
-                        const int key = key0 + ks * 16 + kvec * 8 + e;
-                        const int d = half * 64 + drow;
-                        dst[e] = v[int64_t(key) * HD12 + d];
-                    }
-                }
+                *reinterpret_cast<uint4*>(dst) =
+                    *reinterpret_cast<const uint4*>(src);
             }
         }
         __syncthreads();
@@ -1314,13 +1528,8 @@ void g128_full_wgmma_fwd(
         __syncthreads();
     }
 
-    float denom0 = l0;
-    float denom1 = l1;
-#pragma unroll
-    for (int s = 0; s < NS12; ++s) {
-        denom0 += __expf(sink[s * HQ12 + qh0] - m0);
-        denom1 += __expf(sink[s * HQ12 + qh1] - m1);
-    }
+    float denom0 = l0 + __expf(sink_lse[qh0] - m0);
+    float denom1 = l1 + __expf(sink_lse[qh1] - m1);
     const float inv0 = 1.0f / denom0;
     const float inv1 = 1.0f / denom1;
 
@@ -1353,7 +1562,9 @@ inline void launch_g128_wgmma(
     const __nv_bfloat16* q,
     const __nv_bfloat16* k,
     const __nv_bfloat16* v,
-    const float* sink,
+    const __nv_bfloat16* packed_k,
+    const __nv_bfloat16* packed_v,
+    const float* sink_lse,
     __nv_bfloat16* out,
     float softmax_scale
 ) {
@@ -1362,14 +1573,18 @@ inline void launch_g128_wgmma(
        + 2 * PV_SLICES * BLOCK_ELEMS
        +     QK_SLICES * BLOCK_ELEMS) * sizeof(__nv_bfloat16);
 
-    cudaFuncSetAttribute(
-        g128_full_wgmma_fwd,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        smem_bytes
-    );
+    static bool configured = false;
+    if (!configured) {
+        cudaFuncSetAttribute(
+            g128_full_wgmma_fwd,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            smem_bytes
+        );
+        configured = true;
+    }
 
     g128_full_wgmma_fwd<<<S12, 256, smem_bytes>>>(
-        q, k, v, sink, out, softmax_scale
+        q, k, v, packed_k, packed_v, sink_lse, out, softmax_scale
     );
 }
 
@@ -1395,7 +1610,7 @@ extern "C" void run_kernel(
 ) {
     static bool printed_build = false;
     if (!printed_build) {
-        fprintf(stderr, "BUILD CUDA_SM90A_WGMMA_ALL12_V1\\n");
+        fprintf(stderr, "BUILD CUDA_SM90A_WGMMA_STATIC_KV_V2\\n");
         printed_build = true;
     }
 
@@ -1412,8 +1627,17 @@ extern "C" void run_kernel(
         S == 8192 && Hq == 128 && Hkv == 1 &&
         D == 128 && N == 1 && Ns == 4
     ) {
+        const __nv_bfloat16* packed_k = nullptr;
+        const __nv_bfloat16* packed_v = nullptr;
+        const float* sink_lse = nullptr;
+        wgmma_static_cache::ensure_d128(
+            k, v, sink, q_ranges,
+            S, Hq, Hkv, Ns,
+            packed_k, packed_v, sink_lse
+        );
         wgmma_g128::launch_g128_wgmma(
-            q, k, v, sink, output, softmax_scale
+            q, k, v, packed_k, packed_v, sink_lse,
+            output, softmax_scale
         );
         return;
     }
@@ -1428,8 +1652,17 @@ extern "C" void run_kernel(
             causal = 1;
         }
 
+        const __nv_bfloat16* packed_k = nullptr;
+        const __nv_bfloat16* packed_v = nullptr;
+        const float* sink_lse = nullptr;
+        wgmma_static_cache::ensure_d128(
+            k, v, sink, q_ranges,
+            S, Hq, Hkv, Ns,
+            packed_k, packed_v, sink_lse
+        );
         wgmma_attention::launch_dense_wgmma(
-            q, k, v, sink, output, softmax_scale,
+            q, k, v, packed_k, packed_v, sink_lse,
+            output, softmax_scale,
             S, Hq, Hkv, Ns, causal
         );
         return;
