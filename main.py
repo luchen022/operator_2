@@ -886,7 +886,7 @@ def run_kernel(
     global _K_FP8_SRC, _K_FP8, _K_SCALE
     global _V_FP8_SRC, _V_FP8, _V_SCALE, _PRINTED_BUILD
     if not _PRINTED_BUILD:
-        print("BUILD FP8_PV_V5")
+        print("BUILD HYBRID_MQA_FP8_PV_V6")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
@@ -931,7 +931,12 @@ def run_kernel(
             k_len = ke - ks
             grid = lambda META: (triton.cdiv(q_len, META["BLOCK_M"]), Hq)
 
-            use_fp8 = (D == 128 and S >= 4096)
+            # FP8 P@V is accurate but too expensive for ordinary GQA.
+            # Only use it when a single V head is reused by a very large Q-head
+            # group, where the static V quantization/cache has the best chance
+            # to amortize and reduce bandwidth pressure.
+            G = Hq // Hkv
+            use_fp8 = (D == 128 and S >= 4096 and Hkv == 1 and G >= 32)
             if use_fp8:
                 if _V_FP8_SRC is not v:
                     _V_FP8_SRC = v
