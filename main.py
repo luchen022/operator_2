@@ -15,6 +15,7 @@ _META_BLOCKS128 = 0
 _K_FP8_SRC = None
 _K_FP8 = None
 _K_SCALE = None
+_PRINTED_BUILD = False
 
 
 @triton.jit
@@ -724,7 +725,10 @@ def run_kernel(
 
     global _META_Q_RANGES, _META_Q, _META_K, _META_T, _META_PARTITION
     global _META_BLOCKS32, _META_BLOCKS64, _META_BLOCKS128
-    global _K_FP8_SRC, _K_FP8, _K_SCALE
+    global _K_FP8_SRC, _K_FP8, _K_SCALE, _PRINTED_BUILD
+    if not _PRINTED_BUILD:
+        print("BUILD FP8_GROUP2X64_V2")
+        _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
         _META_Q = q_ranges.tolist()
