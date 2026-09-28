@@ -122,16 +122,12 @@ def packgqa_full_128_kernel(
         l_i = l_i * alpha + tl.sum(p, axis=1)
         m_i = m_new
 
-    s = tl.arange(0, 16)
-    smask = s[None, :] < num_sink
-    sv = tl.load(
-        sink_ptr + s[None, :] * stride_sink_s + qh[:, None] * stride_sink_h,
-        mask=mask_m[:, None] & smask,
+    # sink_ptr points to precomputed per-Q-head sink logsumexp.
+    slse = tl.load(
+        sink_ptr + qh,
+        mask=mask_m,
         other=-float("inf"),
     )
-    smax = tl.max(sv, axis=1)
-    ssum = tl.sum(tl.exp2((sv - smax[:, None]) * 1.4426950408889634), axis=1)
-    slse = smax + tl.log2(ssum) * 0.6931471805599453
     denom = l_i + tl.exp2((slse - m_i) * 1.4426950408889634)
     acc = acc / denom[:, None]
 
@@ -251,19 +247,12 @@ def packgqa_g8_kernel(
         l_i = l_i * alpha + tl.sum(p, axis=1)
         m_i = m_new
 
-    s = tl.arange(0, 16)
-    smask = s[None, :] < num_sink
-    sv = tl.load(
-        sink_ptr + s[None, :] * stride_sink_s + qh[:, None] * stride_sink_h,
-        mask=mask_m[:, None] & smask,
+    # sink_ptr points to precomputed per-Q-head sink logsumexp.
+    slse = tl.load(
+        sink_ptr + qh,
+        mask=mask_m,
         other=-float("inf"),
     )
-    smax = tl.max(sv, axis=1)
-    ssum = tl.sum(
-        tl.exp2((sv - smax[:, None]) * 1.4426950408889634),
-        axis=1,
-    )
-    slse = smax + tl.log2(ssum) * 0.6931471805599453
     denom = l_i + tl.exp2((slse - m_i) * 1.4426950408889634)
     acc = acc / denom[:, None]
 
@@ -851,16 +840,12 @@ def partition_packgqa_causal_d64_kernel(
         l_i = l_i * alpha + tl.sum(p, axis=1)
         m_i = m_new
 
-    s = tl.arange(0, 16)
-    smask = s[None, :] < num_sink
-    sv = tl.load(
-        sink_ptr + s[None, :] * stride_sink_s + qh[:, None] * stride_sink_h,
-        mask=mask_m[:, None] & smask,
+    # sink_ptr points to precomputed per-Q-head sink logsumexp.
+    slse = tl.load(
+        sink_ptr + qh,
+        mask=mask_m,
         other=-float("inf"),
     )
-    smax = tl.max(sv, axis=1)
-    ssum = tl.sum(tl.exp2((sv - smax[:, None]) * 1.4426950408889634), axis=1)
-    slse = smax + tl.log2(ssum) * 0.6931471805599453
     denom = l_i + tl.exp2((slse - m_i) * 1.4426950408889634)
     acc = acc / denom[:, None]
 
@@ -1406,16 +1391,12 @@ def overlap8_g4_special_kernel(
         l_i = l_i * alpha + tl.sum(p, axis=1)
         m_i = m_new
 
-    s = tl.arange(0, 16)
-    smask = s[None, :] < num_sink
-    sv = tl.load(
-        sink_ptr + s[None, :] * stride_sink_s + qh[:, None] * stride_sink_h,
-        mask=mask_m[:, None] & smask,
+    # sink_ptr points to precomputed per-Q-head sink logsumexp.
+    slse = tl.load(
+        sink_ptr + qh,
+        mask=mask_m,
         other=-float("inf"),
     )
-    smax = tl.max(sv, axis=1)
-    ssum = tl.sum(tl.exp2((sv - smax[:, None]) * 1.4426950408889634), axis=1)
-    slse = smax + tl.log2(ssum) * 0.6931471805599453
     denom = l_i + tl.exp2((slse - m_i) * 1.4426950408889634)
     acc = acc / denom[:, None]
 
@@ -1558,20 +1539,12 @@ def generic_packgqa_fwd_kernel(
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new
 
-    s = tl.arange(0, 16)
-    smask = s[None, :] < num_sink
-    sv = tl.load(
-        sink_ptr + s[None, :] * stride_sink_s + qh[:, None] * stride_sink_h,
-        mask=mask_m[:, None] & smask,
+    # sink_ptr points to precomputed per-Q-head sink logsumexp.
+    slse = tl.load(
+        sink_ptr + qh,
+        mask=mask_m,
         other=-float("inf"),
     )
-    smax = tl.max(sv, axis=1)
-    ssum = tl.sum(
-        tl.exp2((sv - smax[:, None]) * 1.4426950408889634),
-        axis=1,
-    )
-    slse = smax + tl.log2(ssum) * 0.6931471805599453
-
     denom = l_i + tl.exp2((slse - m_i) * 1.4426950408889634)
     acc = acc / denom[:, None]
 
@@ -1778,7 +1751,7 @@ def run_kernel(
     global _PREFIX_META_SRC, _PREFIX_Q0, _PREFIX_Q1, _PREFIX_KE, _PREFIX_BM, _PREFIX_TILES
     global _PREFIX_SINK_SRC, _PREFIX_SINK_LSE
     if not _PRINTED_BUILD:
-        print("BUILD STABLE_88_25_V40")
+        print("BUILD GLOBAL_SINK_LSE_V41")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
@@ -1812,6 +1785,21 @@ def run_kernel(
         _META_BLOCKS64 = b64
         _META_BLOCKS128 = b128
 
+    if _PREFIX_SINK_SRC is not sink:
+        _PREFIX_SINK_LSE = torch.empty(
+            (Hq,),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        build_sink_lse_kernel[(Hq,)](
+            sink,
+            _PREFIX_SINK_LSE,
+            HQ=Hq,
+            NSINK=Ns,
+            num_warps=1,
+        )
+        _PREFIX_SINK_SRC = sink
+
     if _META_PARTITION:
         if N == 1:
             qs = int(_META_Q[0][0])
@@ -1825,7 +1813,7 @@ def run_kernel(
             G = Hq // Hkv
             if typ == 0 and D == 128 and Hkv == 1 and G == 128 and q_len == S and k_len == S:
                 packgqa_full_128_kernel[(triton.cdiv(q_len * G, 128), Hkv)](
-                    q, k, v, output, sink,
+                    q, k, v, output, _PREFIX_SINK_LSE,
                     scale,
                     qs, q_len, ks, k_len, Ns,
                     Hq * D, D,
@@ -1844,7 +1832,7 @@ def run_kernel(
             # mask-capable kernel. One CTA covers 32 tokens x 4 Q heads.
             if D == 128 and G == 4:
                 packgqa_g8_kernel[(triton.cdiv(q_len * G, 128), Hkv)](
-                    q, k, v, output, sink,
+                    q, k, v, output, _PREFIX_SINK_LSE,
                     scale,
                     qs, q_len, ks, k_len, Ns,
                     Hq * D, D,
@@ -1903,7 +1891,7 @@ def run_kernel(
                 )
             else:
                 single_slice_fwd_kernel[grid](
-                    q, k, v, output, sink,
+                    q, k, v, output, _PREFIX_SINK_LSE,
                     scale,
                     qs, q_len, ks, k_len,
                     Hq, Hkv, D, Ns,
@@ -2033,7 +2021,7 @@ def run_kernel(
         if D == 64 and N == 10 and all_causal and G == 4:
             partition_packgqa_causal_d64_kernel[(_META_BLOCKS32, Hkv)](
                 q, k, v, output,
-                q_ranges, k_ranges, sink,
+                q_ranges, k_ranges, _PREFIX_SINK_LSE,
                 scale,
                 Ns,
                 Hq * D, D,
@@ -2091,7 +2079,7 @@ def run_kernel(
 
             if D == 128 and G == 8:
                 packgqa_g8_kernel[(triton.cdiv(q_len * G, 128), Hkv)](
-                    q, k, v, output, sink,
+                    q, k, v, output, _PREFIX_SINK_LSE,
                     scale,
                     qs, q_len, ks, k_len, Ns,
                     Hq * D, D,
@@ -2108,7 +2096,7 @@ def run_kernel(
             else:
                 grid = lambda META: (triton.cdiv(q_len, META["BLOCK_M"]), Hq)
                 single_slice_fwd_kernel[grid](
-                    q, k, v, output, sink,
+                    q, k, v, output, _PREFIX_SINK_LSE,
                     scale,
                     qs, q_len, ks, k_len,
                     Hq, Hkv, D, Ns,
@@ -2154,7 +2142,7 @@ def run_kernel(
     if D == 128 and (G == 2 or G == 4):
         generic_packgqa_fwd_kernel[(triton.cdiv(S * G, 128), Hkv)](
             q, k, v, output,
-            q_ranges, k_ranges, attn_type_map, sink,
+            q_ranges, k_ranges, attn_type_map, _PREFIX_SINK_LSE,
             scale,
             S, Ns,
             Hq * D, D,
@@ -2174,7 +2162,7 @@ def run_kernel(
 
         generic_fwd_kernel[grid](
             q, k, v, output,
-            q_ranges, k_ranges, attn_type_map, sink,
+            q_ranges, k_ranges, attn_type_map, _PREFIX_SINK_LSE,
             scale,
             S, Hq, Hkv, D, Ns,
             Hq * D, D, 1,
