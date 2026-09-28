@@ -1576,6 +1576,7 @@ def build_g8_mixed_tile_meta_kernel(
             tl.cdiv(max_lower, BLOCK_N),
         )
         fstart = tl.maximum(0, tl.minimum(fstart, physical_full))
+        fstart = tl.minimum(fstart, bend)
 
         fend = (min_upper + 1) // BLOCK_N
         fend = tl.maximum(fstart, tl.minimum(fend, physical_full))
