@@ -1538,18 +1538,50 @@ def prefix_packgqa_full_kernel(
     l_i = tl.zeros([128], dtype=tl.float32)
     acc = tl.zeros([128, BLOCK_D], dtype=tl.float32)
 
-    for start_n in range(0, ke, BLOCK_N):
-        offs_n = start_n + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < ke
+    # FULL attention: all complete K blocks need no score/probability masking.
+    # Invalid Q rows belong only to the final Q tile and are discarded by the
+    # masked store, so they do not need to participate in the inner-loop mask.
+    n_full = ke // BLOCK_N
 
-        k = tl.load(
+    for b in range(0, n_full):
+        offs_n = b * BLOCK_N + tl.arange(0, BLOCK_N)
+
+        kk = tl.load(
+            K + offs_n[:, None] * stride_kz + pid_kv * stride_kh + offs_d[None, :]
+        )
+        qk = tl.dot(q, tl.trans(kk)) * (softmax_scale * 1.4426950408889634)
+
+        m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+        alpha = tl.where(
+            m_i > -float("inf"),
+            tl.exp2(m_i - m_new),
+            0.0,
+        )
+        p = tl.exp2(qk - m_new[:, None])
+
+        vv = tl.load(
+            V + offs_n[:, None] * stride_vz + pid_kv * stride_vh + offs_d[None, :]
+        )
+
+        acc = acc * alpha[:, None]
+        acc = tl.dot(p.to(tl.bfloat16), vv, acc)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_new
+
+    # At most one partial K block needs masking.
+    tail = ke - n_full * BLOCK_N
+    if tail > 0:
+        offs_u = tl.arange(0, BLOCK_N)
+        offs_n = n_full * BLOCK_N + offs_u
+        mask_n = offs_u < tail
+
+        kk = tl.load(
             K + offs_n[:, None] * stride_kz + pid_kv * stride_kh + offs_d[None, :],
             mask=mask_n[:, None],
             other=0.0,
         )
-        qk = tl.dot(q, tl.trans(k)) * (softmax_scale * 1.4426950408889634)
-        vis = mask_m[:, None] & mask_n[None, :]
-        qk = tl.where(vis, qk, -float("inf"))
+        qk = tl.dot(q, tl.trans(kk)) * (softmax_scale * 1.4426950408889634)
+        qk = tl.where(mask_n[None, :], qk, -float("inf"))
 
         m_new = tl.maximum(m_i, tl.max(qk, axis=1))
         alpha = tl.where(
@@ -1558,7 +1590,7 @@ def prefix_packgqa_full_kernel(
             0.0,
         )
         p = tl.where(
-            vis,
+            mask_n[None, :],
             tl.exp2(qk - m_new[:, None]),
             0.0,
         )
@@ -1574,7 +1606,11 @@ def prefix_packgqa_full_kernel(
         l_i = l_i * alpha + tl.sum(p, axis=1)
         m_i = m_new
 
-    sink_lse = tl.load(SINK_LSE + qh, mask=mask_m, other=-float("inf")).to(tl.float32)
+    sink_lse = tl.load(
+        SINK_LSE + qh,
+        mask=mask_m,
+        other=-float("inf"),
+    ).to(tl.float32)
     denom = l_i + tl.exp2(sink_lse * 1.4426950408889634 - m_i)
     acc = acc / denom[:, None]
 
@@ -2220,7 +2256,7 @@ def run_kernel(
     global _G8M_META_SRC, _G8M_Q0, _G8M_QE, _G8M_KS, _G8M_KLEN, _G8M_R0, _G8M_LO, _G8M_HI, _G8M_BSTART, _G8M_BEND, _G8M_TILES
     global _OV8_META_SRC, _OV8_Q0, _OV8_QE, _OV8_KS, _OV8_KLEN, _OV8_R0, _OV8_DELTA, _OV8_BEND, _OV8_FULL
     if not _PRINTED_BUILD:
-        print("BUILD OVERLAP2_G2_SPECIAL_V52")
+        print("BUILD PREFIX_FULL_FASTMASK_V53")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
