@@ -424,7 +424,7 @@ def _build_static_slice_kernel(
                 Q_shared[i, d] = T.if_then_else(
                     qidx < q_end,
                     Q[qidx, by, d],
-                    T.cast(0.0, "bfloat16"),
+                    T.Cast("bfloat16", 0.0),
                 )
 
             T.fill(acc_o, 0.0)
@@ -437,7 +437,7 @@ def _build_static_slice_kernel(
                     K_shared[j, d] = T.if_then_else(
                         kidx < k_end,
                         K[kidx, kvh, d],
-                        T.cast(0.0, "bfloat16"),
+                        T.Cast("bfloat16", 0.0),
                     )
 
                 for i, j in T.Parallel(block_M, block_N):
@@ -508,7 +508,7 @@ def _build_static_slice_kernel(
                     V_shared[j, d] = T.if_then_else(
                         kidx < k_end,
                         V[kidx, kvh, d],
-                        T.cast(0.0, "bfloat16"),
+                        T.Cast("bfloat16", 0.0),
                     )
 
                 T.gemm(
@@ -614,7 +614,7 @@ def _build_overlap_base_kernel(
                 Q_shared[i, d] = T.if_then_else(
                     qidx < q_end,
                     Q[qidx, by, d],
-                    T.cast(0.0, "bfloat16"),
+                    T.Cast("bfloat16", 0.0),
                 )
 
             T.fill(acc_o, 0.0)
@@ -629,7 +629,7 @@ def _build_overlap_base_kernel(
                     K_shared[j, d] = T.if_then_else(
                         kidx < extra_k_end,
                         K[kidx, kvh, d],
-                        T.cast(0.0, "bfloat16"),
+                        T.Cast("bfloat16", 0.0),
                     )
 
                 for i, j in T.Parallel(block_M, block_N):
@@ -701,7 +701,7 @@ def _build_overlap_base_kernel(
                     V_shared[j, d] = T.if_then_else(
                         kidx < extra_k_end,
                         V[kidx, kvh, d],
-                        T.cast(0.0, "bfloat16"),
+                        T.Cast("bfloat16", 0.0),
                     )
                 T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
@@ -712,7 +712,7 @@ def _build_overlap_base_kernel(
                     K_shared[j, d] = T.if_then_else(
                         kidx < k_end,
                         K[kidx, kvh, d],
-                        T.cast(0.0, "bfloat16"),
+                        T.Cast("bfloat16", 0.0),
                     )
 
                 for i, j in T.Parallel(block_M, block_N):
@@ -774,7 +774,7 @@ def _build_overlap_base_kernel(
                     V_shared[j, d] = T.if_then_else(
                         kidx < k_end,
                         V[kidx, kvh, d],
-                        T.cast(0.0, "bfloat16"),
+                        T.Cast("bfloat16", 0.0),
                     )
                 T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
