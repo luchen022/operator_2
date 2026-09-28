@@ -1125,7 +1125,40 @@ def partition_packgqa_causal_d128_g8_static_kernel(
     l_i = tl.zeros([128], dtype=tl.float32)
     acc = tl.zeros([128, 128], dtype=tl.float32)
 
-    for b in range(0, b_end):
+    # Any complete K block ending at or before the earliest row's causal
+    # frontier is visible to every valid row in this tile. Since this G=8
+    # packed tile spans only 16 tokens, at most one later block needs masking.
+    physical_full = k_len // 64
+    full_end = (r0 + delta + 1) // 64
+    full_end = tl.maximum(0, tl.minimum(full_end, physical_full))
+    full_end = tl.minimum(full_end, b_end)
+
+    for b in range(0, full_end):
+        offs_n = ks + b * 64 + tl.arange(0, 64)
+
+        kk = tl.load(
+            K + offs_n[:, None] * stride_kz + pid_kv * stride_kh + d[None, :]
+        )
+        qk = tl.dot(q, tl.trans(kk)) * (softmax_scale * 1.4426950408889634)
+
+        m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+        alpha = tl.where(
+            m_i > -float("inf"),
+            tl.exp2(m_i - m_new),
+            0.0,
+        )
+        p = tl.exp2(qk - m_new[:, None])
+
+        vv = tl.load(
+            V + offs_n[:, None] * stride_vz + pid_kv * stride_vh + d[None, :]
+        )
+
+        acc = acc * alpha[:, None]
+        acc = tl.dot(p.to(tl.bfloat16), vv, acc)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_new
+
+    for b in range(full_end, b_end):
         u = b * 64 + tl.arange(0, 64)
         offs_n = ks + u
         mask_n = u < k_len
@@ -1223,16 +1256,45 @@ def partition_packgqa_causal_d64_kernel(
     l_i = tl.zeros([128], dtype=tl.float32)
     acc = tl.zeros([128, 64], dtype=tl.float32)
 
-    for b in range(0, b_end):
+    # G=4 packs 32 tokens per CTA, still narrower than BLOCK_N=64, so all
+    # blocks before full_end are fully visible and only one frontier block
+    # can require the elementwise causal mask.
+    physical_full = k_len // 64
+    full_end = (r0 + delta + 1) // 64
+    full_end = tl.maximum(0, tl.minimum(full_end, physical_full))
+    full_end = tl.minimum(full_end, b_end)
+
+    for b in range(0, full_end):
+        offs_n = ks + b * 64 + tl.arange(0, 64)
+
+        kk = tl.load(
+            K + offs_n[:, None] * stride_kz + pid_kv * stride_kh + d[None, :]
+        )
+        qk = tl.dot(q, tl.trans(kk)) * (softmax_scale * 1.4426950408889634)
+
+        m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+        alpha = tl.where(m_i > -float("inf"), tl.exp2(m_i - m_new), 0.0)
+        p = tl.exp2(qk - m_new[:, None])
+
+        vv = tl.load(
+            V + offs_n[:, None] * stride_vz + pid_kv * stride_vh + d[None, :]
+        )
+
+        acc = acc * alpha[:, None]
+        acc = tl.dot(p.to(tl.bfloat16), vv, acc)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_new
+
+    for b in range(full_end, b_end):
         u = b * 64 + tl.arange(0, 64)
         offs_n = ks + u
         mask_n = u < k_len
 
-        k = tl.load(
+        kk = tl.load(
             K + offs_n[:, None] * stride_kz + pid_kv * stride_kh + d[None, :],
             mask=mask_n[:, None], other=0.0,
         )
-        qk = tl.dot(q, tl.trans(k)) * (softmax_scale * 1.4426950408889634)
+        qk = tl.dot(q, tl.trans(kk)) * (softmax_scale * 1.4426950408889634)
 
         vis = mask_m[:, None] & mask_n[None, :] & (
             u[None, :] <= (r[:, None] + delta)
@@ -2467,7 +2529,7 @@ def run_kernel(
     global _G8M_META_SRC, _G8M_Q0, _G8M_QE, _G8M_KS, _G8M_KLEN, _G8M_R0, _G8M_LO, _G8M_HI, _G8M_BSTART, _G8M_BEND, _G8M_FSTART, _G8M_FEND, _G8M_TILES
     global _OV8_META_SRC, _OV8_Q0, _OV8_QE, _OV8_KS, _OV8_KLEN, _OV8_R0, _OV8_DELTA, _OV8_BEND, _OV8_FULL
     if not _PRINTED_BUILD:
-        print("BUILD MIXED_FRONTIER_FASTPATH_FIX11_V57")
+        print("BUILD STATIC_CAUSAL_FRONTIER_V58")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
