@@ -27,30 +27,6 @@ _PREFIX_BM = 0
 _PREFIX_TILES = 0
 _PREFIX_SINK_SRC = None
 _PREFIX_SINK_LSE = None
-_PACK_KV_SRC_K = None
-_PACK_KV_SRC_V = None
-_PACK_K = None
-_PACK_V = None
-
-
-@triton.jit
-def prepack_kv_headmajor_kernel(
-    K, V, KP, VP,
-    S: tl.constexpr,
-    HKV: tl.constexpr,
-    D: tl.constexpr,
-):
-    row = tl.program_id(0)
-    z = row // HKV
-    h = row - z * HKV
-    d = tl.arange(0, D)
-
-    k = tl.load(K + z * HKV * D + h * D + d)
-    v = tl.load(V + z * HKV * D + h * D + d)
-
-    dst = h * S * D + z * D + d
-    tl.store(KP + dst, k)
-    tl.store(VP + dst, v)
 
 
 @triton.jit
@@ -1510,9 +1486,8 @@ def run_kernel(
     global _V_FP8_SRC, _V_FP8, _V_SCALE, _PRINTED_BUILD
     global _PREFIX_META_SRC, _PREFIX_Q0, _PREFIX_Q1, _PREFIX_KE, _PREFIX_BM, _PREFIX_TILES
     global _PREFIX_SINK_SRC, _PREFIX_SINK_LSE
-    global _PACK_KV_SRC_K, _PACK_KV_SRC_V, _PACK_K, _PACK_V
     if not _PRINTED_BUILD:
-        print("BUILD G4_HEADMAJOR_KV_V24")
+        print("BUILD STABLE_87_42_V25")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
@@ -1577,34 +1552,13 @@ def run_kernel(
             # G=4 single-slice path (#1/#7): reuse the generic PackGQA
             # mask-capable kernel. One CTA covers 32 tokens x 4 Q heads.
             if D == 128 and G == 4:
-                if _PACK_KV_SRC_K is not k or _PACK_KV_SRC_V is not v:
-                    _PACK_KV_SRC_K = k
-                    _PACK_KV_SRC_V = v
-                    _PACK_K = torch.empty(
-                        (Hkv, S, D),
-                        dtype=torch.bfloat16,
-                        device=k.device,
-                    )
-                    _PACK_V = torch.empty(
-                        (Hkv, S, D),
-                        dtype=torch.bfloat16,
-                        device=v.device,
-                    )
-                    prepack_kv_headmajor_kernel[(S * Hkv,)](
-                        k, v, _PACK_K, _PACK_V,
-                        S=S,
-                        HKV=Hkv,
-                        D=D,
-                        num_warps=4,
-                    )
-
                 packgqa_g8_kernel[(triton.cdiv(q_len * G, 128), Hkv)](
-                    q, _PACK_K, _PACK_V, output, sink,
+                    q, k, v, output, sink,
                     scale,
                     qs, q_len, ks, k_len, Ns,
                     Hq * D, D,
-                    D, S * D,
-                    D, S * D,
+                    Hkv * D, D,
+                    Hkv * D, D,
                     Hq * D, D,
                     Hq, 1,
                     GROUP_SIZE=G,
