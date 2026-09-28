@@ -1499,6 +1499,7 @@ def build_g8_mixed_tile_meta_kernel(
     q_ranges_ptr, k_ranges_ptr, attn_type_map_ptr,
     Q0_META, QE_META, KS_META, KLEN_META,
     R0_META, LO_META, HI_META, BSTART_META, BEND_META,
+    FSTART_META, FEND_META,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     NUM_SLICES: tl.constexpr,
@@ -2466,7 +2467,7 @@ def run_kernel(
     global _G8M_META_SRC, _G8M_Q0, _G8M_QE, _G8M_KS, _G8M_KLEN, _G8M_R0, _G8M_LO, _G8M_HI, _G8M_BSTART, _G8M_BEND, _G8M_FSTART, _G8M_FEND, _G8M_TILES
     global _OV8_META_SRC, _OV8_Q0, _OV8_QE, _OV8_KS, _OV8_KLEN, _OV8_R0, _OV8_DELTA, _OV8_BEND, _OV8_FULL
     if not _PRINTED_BUILD:
-        print("BUILD MIXED_FRONTIER_FASTPATH_V56")
+        print("BUILD MIXED_FRONTIER_FASTPATH_FIX11_V57")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
