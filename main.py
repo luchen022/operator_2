@@ -118,6 +118,68 @@ def quantize_v_fp8_kernel(
 
 
 @triton.jit
+def packgqa_full_g128_half_kernel(
+    Q, K, V, Out, sink_ptr,
+    stride_qz, stride_qh,
+    stride_kz, stride_kh,
+    stride_vz, stride_vh,
+    stride_oz, stride_oh,
+):
+    pid_tok = tl.program_id(0)
+    pid_half = tl.program_id(1)
+
+    # Exact #12 specialization: Hkv=1, G=128, D=128, FULL.
+    # Split the 128 Q heads into two independent 64-head CTAs to halve
+    # the long-lived FP32 accumulator footprint.
+    qh = pid_half * 64 + tl.arange(0, 64)
+    d = tl.arange(0, 128)
+
+    q = tl.load(
+        Q + pid_tok * stride_qz + qh[:, None] * stride_qh + d[None, :]
+    )
+
+    m_i = tl.zeros([64], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([64], dtype=tl.float32)
+    acc = tl.zeros([64, 128], dtype=tl.float32)
+
+    # #12 has S=8192, exactly 128 K blocks of 64.
+    # K is already pre-scaled into log2-softmax units.
+    for b in range(0, 128):
+        n = b * 64 + tl.arange(0, 64)
+
+        kk = tl.load(
+            K + n[:, None] * stride_kz + d[None, :] * stride_kh
+        )
+        qk = tl.dot(q, tl.trans(kk))
+
+        m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+        alpha = tl.where(
+            m_i > -float("inf"),
+            tl.exp2(m_i - m_new),
+            0.0,
+        )
+        p = tl.exp2(qk - m_new[:, None])
+
+        vv = tl.load(
+            V + n[:, None] * stride_vz + d[None, :] * stride_vh
+        )
+
+        acc = acc * alpha[:, None]
+        acc = tl.dot(p.to(tl.bfloat16), vv, acc)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_new
+
+    slse = tl.load(sink_ptr + qh).to(tl.float32)
+    denom = l_i + tl.exp2(slse * 1.4426950408889634 - m_i)
+    acc = acc / denom[:, None]
+
+    tl.store(
+        Out + pid_tok * stride_oz + qh[:, None] * stride_oh + d[None, :],
+        acc.to(tl.bfloat16),
+    )
+
+
+@triton.jit
 def packgqa_full_128_kernel(
     Q, K, V, Out, sink_ptr,
     softmax_scale,
@@ -2686,7 +2748,7 @@ def run_kernel(
     global _G8M_META_SRC, _G8M_Q0, _G8M_QE, _G8M_KS, _G8M_KLEN, _G8M_R0, _G8M_LO, _G8M_HI, _G8M_BSTART, _G8M_BEND, _G8M_FSTART, _G8M_FEND, _G8M_TILES
     global _OV8_META_SRC, _OV8_Q0, _OV8_QE, _OV8_KS, _OV8_KLEN, _OV8_R0, _OV8_DELTA, _OV8_BEND, _OV8_FULL
     if not _PRINTED_BUILD:
-        print("BUILD OVERLAP2_MASKFREE_V64")
+        print("BUILD G128_HALFHEAD_V65")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
@@ -2767,18 +2829,13 @@ def run_kernel(
                     _K128_LOG2_SRC = k
                     _K128_LOG2_SCALE = k128_factor
 
-                packgqa_full_128_kernel[(triton.cdiv(q_len * G, 128), Hkv)](
+                packgqa_full_g128_half_kernel[(S, 2)](
                     q, _K128_LOG2, v, output, _PREFIX_SINK_LSE,
-                    scale,
-                    qs, q_len, ks, k_len, Ns,
                     Hq * D, D,
                     Hkv * D, D,
                     Hkv * D, D,
                     Hq * D, D,
-                    Hq, 1,
-                    GROUP_SIZE=G,
-                    BLOCK_D=D,
-                    num_warps=8,
+                    num_warps=4,
                     num_stages=4,
                 )
                 return
