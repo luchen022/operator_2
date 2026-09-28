@@ -2124,7 +2124,7 @@ def run_kernel(
     global _G8M_META_SRC, _G8M_Q0, _G8M_QE, _G8M_KS, _G8M_KLEN, _G8M_R0, _G8M_LO, _G8M_HI, _G8M_BSTART, _G8M_BEND, _G8M_TILES
     global _OV8_META_SRC, _OV8_Q0, _OV8_QE, _OV8_KS, _OV8_KLEN, _OV8_R0, _OV8_DELTA, _OV8_BEND, _OV8_FULL
     if not _PRINTED_BUILD:
-        print("BUILD STATIC_G8_MIXED_V47")
+        print("BUILD STATIC_G8_MIXED_N2N3_V48")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
@@ -2460,9 +2460,9 @@ def run_kernel(
             )
             return
 
-        # Static mixed-mask G=8 plan (#11): compile FULL/INV/BICAUSAL
+        # Static mixed-mask G=8 plan (#2/#11): compile FULL/CAUSAL/INV/BICAUSAL
         # into per-tile lower/upper key bounds, with no mask-type branch in timing.
-        if D == 128 and G == 8 and N == 3:
+        if D == 128 and G == 8 and (N == 2 or N == 3) and not all_causal:
             if _G8M_META_SRC is not q_ranges:
                 tc = 0
                 i = 0
