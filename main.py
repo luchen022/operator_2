@@ -30,6 +30,9 @@ _PREFIX_SINK_LSE = None
 _K_G2_FP8_SRC = None
 _K_G2_FP8 = None
 _K_G2_SCALE = None
+_K_G4_FP8_SRC = None
+_K_G4_FP8 = None
+_K_G4_SCALE = None
 
 
 @triton.jit
@@ -71,6 +74,40 @@ def quantize_k_fp8_g2_kernel(
 
 
 @triton.jit
+def quantize_k_fp8_g4_kernel(
+    K, K8, KSCALE,
+    total_rows: tl.constexpr,
+):
+    row = tl.program_id(0)
+    d = tl.arange(0, 32)
+
+    x0 = tl.load(K + row * 128 + d)
+    x1 = tl.load(K + row * 128 + 32 + d)
+    x2 = tl.load(K + row * 128 + 64 + d)
+    x3 = tl.load(K + row * 128 + 96 + d)
+
+    a0 = tl.max(tl.abs(x0), axis=0)
+    a1 = tl.max(tl.abs(x1), axis=0)
+    a2 = tl.max(tl.abs(x2), axis=0)
+    a3 = tl.max(tl.abs(x3), axis=0)
+
+    s0 = tl.maximum(a0 / 448.0, 1e-8)
+    s1 = tl.maximum(a1 / 448.0, 1e-8)
+    s2 = tl.maximum(a2 / 448.0, 1e-8)
+    s3 = tl.maximum(a3 / 448.0, 1e-8)
+
+    tl.store(K8 + row * 128 + d, (x0 / s0).to(tl.float8e4nv))
+    tl.store(K8 + row * 128 + 32 + d, (x1 / s1).to(tl.float8e4nv))
+    tl.store(K8 + row * 128 + 64 + d, (x2 / s2).to(tl.float8e4nv))
+    tl.store(K8 + row * 128 + 96 + d, (x3 / s3).to(tl.float8e4nv))
+
+    tl.store(KSCALE + row * 4 + 0, s0)
+    tl.store(KSCALE + row * 4 + 1, s1)
+    tl.store(KSCALE + row * 4 + 2, s2)
+    tl.store(KSCALE + row * 4 + 3, s3)
+
+
+@triton.jit
 def quantize_v_fp8_kernel(
     V, V8, VSCALE,
     D: tl.constexpr,
@@ -82,6 +119,162 @@ def quantize_v_fp8_kernel(
     scale = tl.maximum(amax / 448.0, 1e-8)
     tl.store(V8 + row * D + offs_d, (x / scale).to(tl.float8e4nv))
     tl.store(VSCALE + row, scale)
+
+
+@triton.jit
+def packgqa_full_128_fp8_g4_kernel(
+    Q, K8, KSCALE, V, Out, sink_ptr,
+    softmax_scale,
+    q_start, q_len, k_start, k_len, num_sink,
+    stride_qz, stride_qh,
+    stride_kz8, stride_kh8,
+    stride_ksz, stride_ksh,
+    stride_vz, stride_vh,
+    stride_oz, stride_oh,
+    stride_sink_s, stride_sink_h,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_kv = tl.program_id(1)
+
+    packed = pid_m * 128 + tl.arange(0, 128)
+    tok = packed // GROUP_SIZE
+    gh = packed - tok * GROUP_SIZE
+    qh = pid_kv * GROUP_SIZE + gh
+    offs_m = q_start + tok
+    d = tl.arange(0, 32)
+    mask_m = tok < q_len
+
+    q0 = tl.load(
+        Q + offs_m[:, None] * stride_qz + qh[:, None] * stride_qh + d[None, :],
+        mask=mask_m[:, None], other=0.0,
+    )
+    q1 = tl.load(
+        Q + offs_m[:, None] * stride_qz + qh[:, None] * stride_qh + 32 + d[None, :],
+        mask=mask_m[:, None], other=0.0,
+    )
+    q2 = tl.load(
+        Q + offs_m[:, None] * stride_qz + qh[:, None] * stride_qh + 64 + d[None, :],
+        mask=mask_m[:, None], other=0.0,
+    )
+    q3 = tl.load(
+        Q + offs_m[:, None] * stride_qz + qh[:, None] * stride_qh + 96 + d[None, :],
+        mask=mask_m[:, None], other=0.0,
+    )
+
+    qa0 = tl.max(tl.abs(q0), axis=1)
+    qa1 = tl.max(tl.abs(q1), axis=1)
+    qa2 = tl.max(tl.abs(q2), axis=1)
+    qa3 = tl.max(tl.abs(q3), axis=1)
+
+    qs0 = tl.maximum(qa0 / 448.0, 1e-8)
+    qs1 = tl.maximum(qa1 / 448.0, 1e-8)
+    qs2 = tl.maximum(qa2 / 448.0, 1e-8)
+    qs3 = tl.maximum(qa3 / 448.0, 1e-8)
+
+    q08 = (q0 / qs0[:, None]).to(tl.float8e4nv)
+    q18 = (q1 / qs1[:, None]).to(tl.float8e4nv)
+    q28 = (q2 / qs2[:, None]).to(tl.float8e4nv)
+    q38 = (q3 / qs3[:, None]).to(tl.float8e4nv)
+
+    m_i = tl.zeros([128], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([128], dtype=tl.float32)
+    acc = tl.zeros([128, BLOCK_D], dtype=tl.float32)
+    od = tl.arange(0, BLOCK_D)
+
+    for start_n in range(0, k_len, 64):
+        offs_u = start_n + tl.arange(0, 64)
+        offs_n = k_start + offs_u
+        mask_n = offs_u < k_len
+
+        k08 = tl.load(
+            K8 + offs_n[:, None] * stride_kz8 + pid_kv * stride_kh8 + d[None, :],
+            mask=mask_n[:, None], other=0.0,
+        )
+        k18 = tl.load(
+            K8 + offs_n[:, None] * stride_kz8 + pid_kv * stride_kh8 + 32 + d[None, :],
+            mask=mask_n[:, None], other=0.0,
+        )
+        k28 = tl.load(
+            K8 + offs_n[:, None] * stride_kz8 + pid_kv * stride_kh8 + 64 + d[None, :],
+            mask=mask_n[:, None], other=0.0,
+        )
+        k38 = tl.load(
+            K8 + offs_n[:, None] * stride_kz8 + pid_kv * stride_kh8 + 96 + d[None, :],
+            mask=mask_n[:, None], other=0.0,
+        )
+
+        ks0 = tl.load(
+            KSCALE + offs_n * stride_ksz + pid_kv * stride_ksh + 0,
+            mask=mask_n, other=1.0,
+        )
+        ks1 = tl.load(
+            KSCALE + offs_n * stride_ksz + pid_kv * stride_ksh + 1,
+            mask=mask_n, other=1.0,
+        )
+        ks2 = tl.load(
+            KSCALE + offs_n * stride_ksz + pid_kv * stride_ksh + 2,
+            mask=mask_n, other=1.0,
+        )
+        ks3 = tl.load(
+            KSCALE + offs_n * stride_ksz + pid_kv * stride_ksh + 3,
+            mask=mask_n, other=1.0,
+        )
+
+        qk0 = tl.dot(q08, tl.trans(k08), max_num_imprecise_acc=0, out_dtype=tl.float32)
+        qk1 = tl.dot(q18, tl.trans(k18), max_num_imprecise_acc=0, out_dtype=tl.float32)
+        qk2 = tl.dot(q28, tl.trans(k28), max_num_imprecise_acc=0, out_dtype=tl.float32)
+        qk3 = tl.dot(q38, tl.trans(k38), max_num_imprecise_acc=0, out_dtype=tl.float32)
+
+        qk = (
+            qk0 * (qs0[:, None] * ks0[None, :])
+            + qk1 * (qs1[:, None] * ks1[None, :])
+            + qk2 * (qs2[:, None] * ks2[None, :])
+            + qk3 * (qs3[:, None] * ks3[None, :])
+        ) * softmax_scale
+
+        vis = mask_m[:, None] & mask_n[None, :]
+        qk = tl.where(vis, qk, -float("inf"))
+        m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+        alpha = tl.where(
+            m_i > -float("inf"),
+            tl.exp2((m_i - m_new) * 1.4426950408889634),
+            0.0,
+        )
+        p = tl.where(
+            vis,
+            tl.exp2((qk - m_new[:, None]) * 1.4426950408889634),
+            0.0,
+        )
+
+        vv = tl.load(
+            V + offs_n[:, None] * stride_vz + pid_kv * stride_vh + od[None, :],
+            mask=mask_n[:, None], other=0.0,
+        )
+        acc = acc * alpha[:, None]
+        acc = tl.dot(p.to(tl.bfloat16), vv, acc)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_new
+
+    s = tl.arange(0, 16)
+    smask = s[None, :] < num_sink
+    sv = tl.load(
+        sink_ptr + s[None, :] * stride_sink_s + qh[:, None] * stride_sink_h,
+        mask=mask_m[:, None] & smask,
+        other=-float("inf"),
+    )
+    smax = tl.max(sv, axis=1)
+    ssum = tl.sum(tl.exp2((sv - smax[:, None]) * 1.4426950408889634), axis=1)
+    slse = smax + tl.log2(ssum) * 0.6931471805599453
+    denom = l_i + tl.exp2((slse - m_i) * 1.4426950408889634)
+    acc = acc / denom[:, None]
+
+    tl.store(
+        Out + offs_m[:, None] * stride_oz + qh[:, None] * stride_oh + od[None, :],
+        acc.to(tl.bfloat16),
+        mask=mask_m[:, None],
+    )
 
 
 @triton.jit
@@ -1630,8 +1823,9 @@ def run_kernel(
     global _PREFIX_META_SRC, _PREFIX_Q0, _PREFIX_Q1, _PREFIX_KE, _PREFIX_BM, _PREFIX_TILES
     global _PREFIX_SINK_SRC, _PREFIX_SINK_LSE
     global _K_G2_FP8_SRC, _K_G2_FP8, _K_G2_SCALE
+    global _K_G4_FP8_SRC, _K_G4_FP8, _K_G4_SCALE
     if not _PRINTED_BUILD:
-        print("BUILD PACKGQA_FP8_G2_V18")
+        print("BUILD PACKGQA_FP8_G4X32_V19")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
@@ -1677,33 +1871,33 @@ def run_kernel(
 
             G = Hq // Hkv
             if typ == 0 and D == 128 and Hkv == 1 and G == 128 and q_len == S and k_len == S:
-                if _K_G2_FP8_SRC is not k:
-                    _K_G2_FP8_SRC = k
-                    _K_G2_FP8 = torch.empty(
+                if _K_G4_FP8_SRC is not k:
+                    _K_G4_FP8_SRC = k
+                    _K_G4_FP8 = torch.empty(
                         (S, Hkv, D),
                         dtype=torch.float8_e4m3fn,
                         device=k.device,
                     )
-                    _K_G2_SCALE = torch.empty(
-                        (S, Hkv, 2),
+                    _K_G4_SCALE = torch.empty(
+                        (S, Hkv, 4),
                         dtype=torch.float32,
                         device=k.device,
                     )
-                    quantize_k_fp8_g2_kernel[(S * Hkv,)](
+                    quantize_k_fp8_g4_kernel[(S * Hkv,)](
                         k,
-                        _K_G2_FP8,
-                        _K_G2_SCALE,
+                        _K_G4_FP8,
+                        _K_G4_SCALE,
                         total_rows=S * Hkv,
                         num_warps=4,
                     )
 
-                packgqa_full_128_fp8_g2_kernel[(triton.cdiv(q_len * G, 128), Hkv)](
-                    q, _K_G2_FP8, _K_G2_SCALE, v, output, sink,
+                packgqa_full_128_fp8_g4_kernel[(triton.cdiv(q_len * G, 128), Hkv)](
+                    q, _K_G4_FP8, _K_G4_SCALE, v, output, sink,
                     scale,
                     qs, q_len, ks, k_len, Ns,
                     Hq * D, D,
                     Hkv * D, D,
-                    Hkv * 2, 2,
+                    Hkv * 4, 4,
                     Hkv * D, D,
                     Hq * D, D,
                     Hq, 1,
