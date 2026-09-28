@@ -2,15 +2,296 @@
 #include <stdio.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
-#include <mma.h>
 #include <math_constants.h>
 
-using namespace nvcuda;
+// Minimal Hopper SM90a WGMMA helpers.
+// No CUTLASS / CuTe dependency: descriptor layout and PTX forms are copied
+// from NVIDIA CUTLASS's public SM90 GMMA implementation.
 
-namespace {
+namespace wgmma_sm90 {
 
-__global__ __launch_bounds__(256, 1)
-void dense_packgqa_online_wmma(
+union GmmaDescriptor {
+    uint64_t desc;
+    uint32_t reg32[2];
+    uint16_t reg16[4];
+    struct {
+        uint16_t start_address : 14, : 2;
+        uint16_t leading_byte_offset : 14, : 2;
+        uint16_t stride_byte_offset : 14, : 2;
+        uint8_t : 1, base_offset : 3, : 4;
+        uint8_t : 6, layout_type : 2;
+    } bits;
+};
+
+__device__ __forceinline__ uint32_t smem_u32(const void* p) {
+    uint32_t out;
+    asm volatile(
+        "{ .reg .u64 smem_ptr;\n"
+        "  cvta.to.shared.u64 smem_ptr, %1;\n"
+        "  cvt.u32.u64 %0, smem_ptr;\n"
+        "}\n"
+        : "=r"(out) : "l"(p));
+    return out;
+}
+
+// Canonical K-major INTERLEAVE descriptor for one 64x16 BF16 tile.
+//
+// In units of uint128 (16 B), the physical layout is
+//   ((8,8),2) : ((1,16),8)
+// so:
+//   LBO = 8  * 16 B
+//   SBO = 16 * 16 B
+//
+// This makes each 8-row x 16-col brick occupy 16 contiguous uint128 slots.
+__device__ __forceinline__ uint64_t make_kmajor_64x16_desc(const void* p) {
+    GmmaDescriptor d{};
+    d.bits.start_address = static_cast<uint16_t>(smem_u32(p) >> 4);
+    d.bits.leading_byte_offset = 8;
+    d.bits.stride_byte_offset = 16;
+    d.bits.base_offset = 0;
+    d.bits.layout_type = 0;  // INTERLEAVE / no swizzle
+    return d.desc;
+}
+
+// Physical BF16 element offset inside the canonical 64x16 K-major tile.
+__device__ __forceinline__ int canonical_kmajor_offset(int row, int kcol) {
+    const int vec = (row & 7) + (row >> 3) * 16 + (kcol >> 3) * 8;
+    return vec * 8 + (kcol & 7);
+}
+
+// Inverse mapping for a cooperative uint4 (8 BF16) copy.
+// vec_id in [0,128).
+__device__ __forceinline__ void canonical_vec_coord(
+    int vec_id, int& row, int& kvec
+) {
+    const int group = vec_id >> 4;
+    const int in_group = vec_id & 15;
+    row = group * 8 + (in_group & 7);
+    kvec = in_group >> 3;
+}
+
+__device__ __forceinline__ void fence() {
+    asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+}
+
+__device__ __forceinline__ void commit_group() {
+    asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+}
+
+template <int N>
+__device__ __forceinline__ void wait_group() {
+    static_assert(N >= 0 && N <= 7, "wgmma wait group out of range");
+    asm volatile("wgmma.wait_group.sync.aligned %0;\n" :: "n"(N) : "memory");
+}
+
+// BF16 x BF16 -> FP32, m64n64k16, shared/shared, K-major/K-major.
+// Every one of the 128 threads in the warpgroup must execute this uniformly.
+__device__ __forceinline__ void mma_m64n64k16_bf16(
+    float (&d)[32],
+    uint64_t desc_a,
+    uint64_t desc_b
+) {
+    asm volatile(
+    "{\n"
+      ".reg .pred p;\n"
+      "setp.ne.b32 p, %34, 0;\n"
+      "wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 "
+      "{%0,  %1,  %2,  %3,  %4,  %5,  %6,  %7, "
+      " %8,  %9,  %10, %11, %12, %13, %14, %15, "
+      " %16, %17, %18, %19, %20, %21, %22, %23, "
+      " %24, %25, %26, %27, %28, %29, %30, %31},"
+      " %32, %33, p, %35, %36, %37, %38;\n"
+    "}\n"
+      : "+f"(d[0]),  "+f"(d[1]),  "+f"(d[2]),  "+f"(d[3]),
+        "+f"(d[4]),  "+f"(d[5]),  "+f"(d[6]),  "+f"(d[7]),
+        "+f"(d[8]),  "+f"(d[9]),  "+f"(d[10]), "+f"(d[11]),
+        "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),
+        "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]),
+        "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),
+        "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),
+        "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31])
+      : "l"(desc_a),
+        "l"(desc_b),
+        "r"(1),      // scale D: accumulate
+        "n"(1),      // scale A
+        "n"(1),      // scale B
+        "n"(0),      // A major = K
+        "n"(0)       // B major = K
+      : "memory"
+    );
+}
+
+// Fixed accumulator mapping for m64n64.
+//
+// warp 0 -> rows 0..15, warp 1 -> 16..31, ...
+// lane groups of four share one logical row.
+// For each 8-column group g:
+//   d[4g+0:4g+1] -> base row
+//   d[4g+2:4g+3] -> base row + 8
+struct FragCoord {
+    int row0;
+    int row1;
+    int col_pair;
+};
+
+__device__ __forceinline__ FragCoord frag_coord() {
+    const int warp = (threadIdx.x >> 5) & 3;
+    const int lane = threadIdx.x & 31;
+    FragCoord c;
+    c.row0 = warp * 16 + (lane >> 2);
+    c.row1 = c.row0 + 8;
+    c.col_pair = (lane & 3) * 2;
+    return c;
+}
+
+__device__ __forceinline__ int frag_col(int group, int elem01) {
+    const int lane = threadIdx.x & 31;
+    return group * 8 + (lane & 3) * 2 + elem01;
+}
+
+// Reduce within each 4-lane subgroup. XOR 1 and 2 never leave the subgroup.
+__device__ __forceinline__ float row4_max(float x) {
+    x = fmaxf(x, __shfl_xor_sync(0xffffffffu, x, 1));
+    x = fmaxf(x, __shfl_xor_sync(0xffffffffu, x, 2));
+    return x;
+}
+
+__device__ __forceinline__ float row4_sum(float x) {
+    x += __shfl_xor_sync(0xffffffffu, x, 1);
+    x += __shfl_xor_sync(0xffffffffu, x, 2);
+    return x;
+}
+
+}  // namespace wgmma_sm90
+
+
+namespace wgmma_attention {
+
+using namespace wgmma_sm90;
+
+constexpr int HD = 128;
+constexpr int M = 64;
+constexpr int N = 64;
+constexpr int K16 = 16;
+constexpr int K_SLICES_QK = HD / K16;   // 8
+constexpr int K_SLICES_PV = N / K16;    // 4
+constexpr int BLOCK_ELEMS = M * K16;    // 1024 BF16
+constexpr int BLOCK_VECS = BLOCK_ELEMS / 8; // 128 uint4
+
+__device__ __forceinline__ void zero32(float (&x)[32]) {
+#pragma unroll
+    for (int i = 0; i < 32; ++i) x[i] = 0.0f;
+}
+
+__device__ __forceinline__ void rescale_fragment(
+    float (&x)[32], float alpha0, float alpha1
+) {
+#pragma unroll
+    for (int g = 0; g < 8; ++g) {
+        x[4 * g + 0] *= alpha0;
+        x[4 * g + 1] *= alpha0;
+        x[4 * g + 2] *= alpha1;
+        x[4 * g + 3] *= alpha1;
+    }
+}
+
+__device__ __forceinline__ void stage_q64_d128(
+    const __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ s,
+    int token0,
+    int kvh,
+    int Hq,
+    int G
+) {
+    const int tid = threadIdx.x; // 0..127
+
+#pragma unroll
+    for (int ds = 0; ds < K_SLICES_QK; ++ds) {
+        int prow, kvec;
+        canonical_vec_coord(tid, prow, kvec);
+
+        const int tok = token0 + prow / G;
+        const int qh = kvh * G + (prow % G);
+        const int d0 = ds * 16 + kvec * 8;
+
+        const __nv_bfloat16* src =
+            q + (int64_t(tok) * Hq + qh) * HD + d0;
+        __nv_bfloat16* dst =
+            s + ds * BLOCK_ELEMS + tid * 8;
+
+        *reinterpret_cast<uint4*>(dst) =
+            *reinterpret_cast<const uint4*>(src);
+    }
+}
+
+__device__ __forceinline__ void stage_k64_d128(
+    const __nv_bfloat16* __restrict__ k,
+    __nv_bfloat16* __restrict__ s,
+    int key0,
+    int kvh,
+    int Hkv
+) {
+    const int tid = threadIdx.x;
+
+#pragma unroll
+    for (int ds = 0; ds < K_SLICES_QK; ++ds) {
+        int krow, kvec;
+        canonical_vec_coord(tid, krow, kvec);
+
+        const int d0 = ds * 16 + kvec * 8;
+        const __nv_bfloat16* src =
+            k + (int64_t(key0 + krow) * Hkv + kvh) * HD + d0;
+        __nv_bfloat16* dst =
+            s + ds * BLOCK_ELEMS + tid * 8;
+
+        *reinterpret_cast<uint4*>(dst) =
+            *reinterpret_cast<const uint4*>(src);
+    }
+}
+
+// Stage V as B = V^T for WGMMA P[M,K] @ B[N,K]^T.
+// Eight canonical 64x16 blocks:
+//   half 0/1 (D 0..63 / 64..127) x key-slice 0..3.
+__device__ __forceinline__ void stage_vt64_d128(
+    const __nv_bfloat16* __restrict__ v,
+    __nv_bfloat16* __restrict__ s,
+    int key0,
+    int kvh,
+    int Hkv
+) {
+    const int tid = threadIdx.x;
+
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+#pragma unroll
+        for (int ks = 0; ks < K_SLICES_PV; ++ks) {
+            int drow, kvec;
+            canonical_vec_coord(tid, drow, kvec);
+
+            __nv_bfloat16* dst =
+                s + (half * K_SLICES_PV + ks) * BLOCK_ELEMS + tid * 8;
+
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int key = key0 + ks * 16 + kvec * 8 + e;
+                const int d = half * 64 + drow;
+                dst[e] = v[(int64_t(key) * Hkv + kvh) * HD + d];
+            }
+        }
+    }
+}
+
+__device__ __forceinline__ bool dense_visible(
+    int causal, int qtok, int key
+) {
+    return !causal || key <= qtok;
+}
+
+// Dense FULL / CAUSAL D=128 GQA kernel.
+// One CTA = exactly one warpgroup = 128 threads.
+// One CTA computes 64 packed-Q rows sharing a single KV head.
+__global__ __launch_bounds__(128, 1)
+void dense_wgmma_fwd(
     const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v,
@@ -18,296 +299,252 @@ void dense_packgqa_online_wmma(
     __nv_bfloat16* __restrict__ out,
     float softmax_scale,
     int S,
-    int HQ,
-    int HKV,
+    int Hq,
+    int Hkv,
     int G,
-    int NSINK,
-    int causal,
-    int segment_mode
+    int Ns,
+    int causal
 ) {
-    constexpr int PM = 128;
-    constexpr int KN = 64;
-    constexpr int W = 8;
-    constexpr int HD = 128;
-    const int TOKEN_M = PM / G;
-    constexpr int SCORE_ELEMS_PER_WARP = 16 * KN;
-    constexpr int PROB_ELEMS_PER_WARP = 16 * KN;
-    constexpr int OUT_ELEMS_PER_WARP = 16 * HD;
+    __shared__ __align__(128) __nv_bfloat16 q_s[
+        K_SLICES_QK * BLOCK_ELEMS
+    ]; // 16 KiB
 
-    extern __shared__ __align__(16) unsigned char smem_raw[];
-    __nv_bfloat16* q_s = reinterpret_cast<__nv_bfloat16*>(smem_raw);
-    __nv_bfloat16* kv_s = q_s + PM * HD;
-    float* score_s = reinterpret_cast<float*>(kv_s + KN * HD);
-    __nv_bfloat16* prob_s =
-        reinterpret_cast<__nv_bfloat16*>(score_s + W * SCORE_ELEMS_PER_WARP);
-    float* out_s =
-        reinterpret_cast<float*>(prob_s + W * PROB_ELEMS_PER_WARP);
-    float* alpha_s = out_s + W * OUT_ELEMS_PER_WARP;
+    // Reused as K (QK phase) then V^T (PV phase), both 16 KiB.
+    __shared__ __align__(128) __nv_bfloat16 kv_s[
+        2 * K_SLICES_PV * BLOCK_ELEMS
+    ];
 
-    const int kvh = blockIdx.y;
+    // 64x64 BF16 probability tile in canonical 4x(64x16) blocks: 8 KiB.
+    __shared__ __align__(128) __nv_bfloat16 p_s[
+        K_SLICES_PV * BLOCK_ELEMS
+    ];
+
+    const int token_M = M / G;
     const int tile = blockIdx.x;
-    const int warp = threadIdx.x >> 5;
-    const int lane = threadIdx.x & 31;
-    const int warp_row0 = warp * 16;
-    const int token0 = tile * TOKEN_M;
+    const int kvh = blockIdx.y;
+    const int token0 = tile * token_M;
 
-    float* ws = score_s + warp * SCORE_ELEMS_PER_WARP;
-    __nv_bfloat16* wp = prob_s + warp * PROB_ELEMS_PER_WARP;
-    float* wo = out_s + warp * OUT_ELEMS_PER_WARP;
-
-    // Pack G query heads that share one KV head into a 128-row matrix.
-    for (int chunk = threadIdx.x; chunk < (PM * HD) / 8; chunk += blockDim.x) {
-        const int p = chunk / (HD / 8);
-        const int c = chunk - p * (HD / 8);
-        const int d0 = c * 8;
-        const int tok_local = p / G;
-        const int gh = p - tok_local * G;
-        const int tok = token0 + tok_local;
-        const int qh = kvh * G + gh;
-
-        const __nv_bfloat16* gptr =
-            q + (int64_t(tok) * HQ + qh) * HD + d0;
-        __nv_bfloat16* sptr = q_s + p * HD + d0;
-        *reinterpret_cast<uint4*>(sptr) =
-            *reinterpret_cast<const uint4*>(gptr);
-    }
-
-    for (int i = threadIdx.x; i < W * OUT_ELEMS_PER_WARP; i += blockDim.x) {
-        out_s[i] = 0.0f;
-    }
+    stage_q64_d128(q, q_s, token0, kvh, Hq, G);
     __syncthreads();
 
-    using AFrag = wmma::fragment<
-        wmma::matrix_a, 16, 16, 16,
-        __nv_bfloat16, wmma::row_major>;
-    using BColFrag = wmma::fragment<
-        wmma::matrix_b, 16, 16, 16,
-        __nv_bfloat16, wmma::col_major>;
-    using BRowFrag = wmma::fragment<
-        wmma::matrix_b, 16, 16, 16,
-        __nv_bfloat16, wmma::row_major>;
-    using CFrag = wmma::fragment<
-        wmma::accumulator, 16, 16, 16, float>;
+    float out0[32];
+    float out1[32];
+    zero32(out0);
+    zero32(out1);
 
-    float row_m = -CUDART_INF_F;
-    float row_l = 0.0f;
-    int row_tok = 0;
-    int row_qh = 0;
+    const FragCoord fc = frag_coord();
 
-    if (lane < 16) {
-        const int p = warp_row0 + lane;
-        const int tok_local = p / G;
-        const int gh = p - tok_local * G;
-        row_tok = token0 + tok_local;
-        row_qh = kvh * G + gh;
-    }
+    const int prow0 = fc.row0;
+    const int prow1 = fc.row1;
 
-    int k_start = 0;
-    int k_len = S;
+    const int qtok0 = token0 + prow0 / G;
+    const int qtok1 = token0 + prow1 / G;
+    const int qh0 = kvh * G + (prow0 % G);
+    const int qh1 = kvh * G + (prow1 % G);
 
-    // Exact testcase #5: two overlapping FULL slices collapse into three
-    // fixed Q regions with one contiguous effective K interval each.
-    if (segment_mode == 1) {
-        if (token0 < 128) {
-            k_start = 0;
-            k_len = 256;
-        } else if (token0 < 256) {
-            k_start = 0;
-            k_len = 512;
-        } else {
-            k_start = 256;
-            k_len = 256;
-        }
-    }
+    float m0 = -CUDART_INF_F;
+    float m1 = -CUDART_INF_F;
+    float l0 = 0.0f;
+    float l1 = 0.0f;
 
-    int k_tiles = (k_len + KN - 1) / KN;
+    int k_blocks = S / N;
     if (causal) {
-        const int max_q = token0 + TOKEN_M - 1;
-        k_tiles = (max_q + 1 + KN - 1) / KN;
+        const int max_q = token0 + token_M - 1;
+        k_blocks = (max_q + 1 + N - 1) / N;
     }
 
-    for (int kb = 0; kb < k_tiles; ++kb) {
-        const int n0 = k_start + kb * KN;
+    for (int kb = 0; kb < k_blocks; ++kb) {
+        const int key0 = kb * N;
 
-        // Cooperative 16B K load.
-        for (int chunk = threadIdx.x; chunk < (KN * HD) / 8; chunk += blockDim.x) {
-            const int r = chunk / (HD / 8);
-            const int c = chunk - r * (HD / 8);
-            const int d0 = c * 8;
-            const __nv_bfloat16* gptr =
-                k + (int64_t(n0 + r) * HKV + kvh) * HD + d0;
-            __nv_bfloat16* sptr = kv_s + r * HD + d0;
-            *reinterpret_cast<uint4*>(sptr) =
-                *reinterpret_cast<const uint4*>(gptr);
-        }
+        stage_k64_d128(k, kv_s, key0, kvh, Hkv);
         __syncthreads();
 
-        // 16 packed Q rows x 64 K rows per warp.
-        CFrag qk_frag[4];
+        float score[32];
+        zero32(score);
+
+        fence();
 #pragma unroll
-        for (int nt = 0; nt < 4; ++nt) {
-            wmma::fill_fragment(qk_frag[nt], 0.0f);
+        for (int ds = 0; ds < K_SLICES_QK; ++ds) {
+            const uint64_t q_desc =
+                make_kmajor_64x16_desc(q_s + ds * BLOCK_ELEMS);
+            const uint64_t k_desc =
+                make_kmajor_64x16_desc(kv_s + ds * BLOCK_ELEMS);
+            mma_m64n64k16_bf16(score, q_desc, k_desc);
         }
+        commit_group();
+        wait_group<0>();
+
+        float local_max0 = -CUDART_INF_F;
+        float local_max1 = -CUDART_INF_F;
 
 #pragma unroll
-        for (int kk0 = 0; kk0 < HD; kk0 += 16) {
-            AFrag af;
-            wmma::load_matrix_sync(
-                af,
-                q_s + warp_row0 * HD + kk0,
-                HD
-            );
+        for (int g = 0; g < 8; ++g) {
+            const int c0 = frag_col(g, 0);
+            const int c1 = frag_col(g, 1);
 
-#pragma unroll
-            for (int nt = 0; nt < 4; ++nt) {
-                BColFrag bf;
-                wmma::load_matrix_sync(
-                    bf,
-                    kv_s + nt * 16 * HD + kk0,
-                    HD
-                );
-                wmma::mma_sync(qk_frag[nt], af, bf, qk_frag[nt]);
+            if (dense_visible(causal, qtok0, key0 + c0)) {
+                local_max0 = fmaxf(local_max0, score[4 * g + 0] * softmax_scale);
+            }
+            if (dense_visible(causal, qtok0, key0 + c1)) {
+                local_max0 = fmaxf(local_max0, score[4 * g + 1] * softmax_scale);
+            }
+
+            if (dense_visible(causal, qtok1, key0 + c0)) {
+                local_max1 = fmaxf(local_max1, score[4 * g + 2] * softmax_scale);
+            }
+            if (dense_visible(causal, qtok1, key0 + c1)) {
+                local_max1 = fmaxf(local_max1, score[4 * g + 3] * softmax_scale);
             }
         }
 
-#pragma unroll
-        for (int nt = 0; nt < 4; ++nt) {
-            wmma::store_matrix_sync(
-                ws + nt * 16,
-                qk_frag[nt],
-                KN,
-                wmma::mem_row_major
-            );
-        }
-        __syncwarp();
+        const float tile_m0 = row4_max(local_max0);
+        const float tile_m1 = row4_max(local_max1);
+        const float new_m0 = fmaxf(m0, tile_m0);
+        const float new_m1 = fmaxf(m1, tile_m1);
 
-        if (lane < 16) {
-            const bool frontier = causal && (n0 + KN - 1 > token0);
-            float tile_m = -CUDART_INF_F;
+        const float alpha0 =
+            (m0 == -CUDART_INF_F) ? 0.0f : __expf(m0 - new_m0);
+        const float alpha1 =
+            (m1 == -CUDART_INF_F) ? 0.0f : __expf(m1 - new_m1);
+
+        float local_sum0 = 0.0f;
+        float local_sum1 = 0.0f;
 
 #pragma unroll
-            for (int j = 0; j < KN; ++j) {
-                const int key = n0 + j;
-                if (!frontier || key <= row_tok) {
-                    tile_m = fmaxf(tile_m, ws[lane * KN + j] * softmax_scale);
-                }
+        for (int g = 0; g < 8; ++g) {
+            const int c0 = frag_col(g, 0);
+            const int c1 = frag_col(g, 1);
+
+            float p00 = 0.0f;
+            float p01 = 0.0f;
+            float p10 = 0.0f;
+            float p11 = 0.0f;
+
+            if (dense_visible(causal, qtok0, key0 + c0)) {
+                p00 = __expf(score[4 * g + 0] * softmax_scale - new_m0);
+                local_sum0 += p00;
+            }
+            if (dense_visible(causal, qtok0, key0 + c1)) {
+                p01 = __expf(score[4 * g + 1] * softmax_scale - new_m0);
+                local_sum0 += p01;
             }
 
-            const float m_new = fmaxf(row_m, tile_m);
-            const float alpha =
-                (row_m == -CUDART_INF_F) ? 0.0f : __expf(row_m - m_new);
-            float tile_l = 0.0f;
-
-#pragma unroll
-            for (int j = 0; j < KN; ++j) {
-                const int key = n0 + j;
-                float p = 0.0f;
-                if (!frontier || key <= row_tok) {
-                    p = __expf(ws[lane * KN + j] * softmax_scale - m_new);
-                    tile_l += p;
-                }
-                wp[lane * KN + j] = __float2bfloat16_rn(p);
+            if (dense_visible(causal, qtok1, key0 + c0)) {
+                p10 = __expf(score[4 * g + 2] * softmax_scale - new_m1);
+                local_sum1 += p10;
+            }
+            if (dense_visible(causal, qtok1, key0 + c1)) {
+                p11 = __expf(score[4 * g + 3] * softmax_scale - new_m1);
+                local_sum1 += p11;
             }
 
-            alpha_s[warp * 16 + lane] = alpha;
-            row_l = row_l * alpha + tile_l;
-            row_m = m_new;
-        }
-        __syncwarp();
+            // Reference semantics: BF16 rounding before P@V.
+            const int ks0 = c0 >> 4;
+            const int kc0 = c0 & 15;
+            const int ks1 = c1 >> 4;
+            const int kc1 = c1 & 15;
 
-        // Rescale the accumulated numerator to the new online-softmax max.
-        for (int t = lane; t < OUT_ELEMS_PER_WARP; t += 32) {
-            const int r = t / HD;
-            wo[t] *= alpha_s[warp * 16 + r];
+            p_s[ks0 * BLOCK_ELEMS + canonical_kmajor_offset(prow0, kc0)] =
+                __float2bfloat16_rn(p00);
+            p_s[ks1 * BLOCK_ELEMS + canonical_kmajor_offset(prow0, kc1)] =
+                __float2bfloat16_rn(p01);
+            p_s[ks0 * BLOCK_ELEMS + canonical_kmajor_offset(prow1, kc0)] =
+                __float2bfloat16_rn(p10);
+            p_s[ks1 * BLOCK_ELEMS + canonical_kmajor_offset(prow1, kc1)] =
+                __float2bfloat16_rn(p11);
         }
-        __syncwarp();
 
-        // K is dead; reuse the same shared tile for V.
+        const float tile_l0 = row4_sum(local_sum0);
+        const float tile_l1 = row4_sum(local_sum1);
+
+        l0 = l0 * alpha0 + tile_l0;
+        l1 = l1 * alpha1 + tile_l1;
+        m0 = new_m0;
+        m1 = new_m1;
+
+        rescale_fragment(out0, alpha0, alpha1);
+        rescale_fragment(out1, alpha0, alpha1);
+
+        // P stores must be visible before WGMMA reads.
         __syncthreads();
-        for (int chunk = threadIdx.x; chunk < (KN * HD) / 8; chunk += blockDim.x) {
-            const int r = chunk / (HD / 8);
-            const int c = chunk - r * (HD / 8);
-            const int d0 = c * 8;
-            const __nv_bfloat16* gptr =
-                v + (int64_t(n0 + r) * HKV + kvh) * HD + d0;
-            __nv_bfloat16* sptr = kv_s + r * HD + d0;
-            *reinterpret_cast<uint4*>(sptr) =
-                *reinterpret_cast<const uint4*>(gptr);
-        }
+
+        stage_vt64_d128(v, kv_s, key0, kvh, Hkv);
         __syncthreads();
 
-        CFrag out_frag[8];
+        // P @ V[:, 0:64]
+        fence();
 #pragma unroll
-        for (int dt = 0; dt < 8; ++dt) {
-            wmma::load_matrix_sync(
-                out_frag[dt],
-                wo + dt * 16,
-                HD,
-                wmma::mem_row_major
-            );
-        }
-
-#pragma unroll
-        for (int pk = 0; pk < KN; pk += 16) {
-            AFrag pf;
-            wmma::load_matrix_sync(pf, wp + pk, KN);
-
-#pragma unroll
-            for (int dt = 0; dt < 8; ++dt) {
-                BRowFrag vf;
-                wmma::load_matrix_sync(
-                    vf,
-                    kv_s + pk * HD + dt * 16,
-                    HD
+        for (int ks = 0; ks < K_SLICES_PV; ++ks) {
+            const uint64_t p_desc =
+                make_kmajor_64x16_desc(p_s + ks * BLOCK_ELEMS);
+            const uint64_t v_desc =
+                make_kmajor_64x16_desc(
+                    kv_s + ks * BLOCK_ELEMS
                 );
-                wmma::mma_sync(
-                    out_frag[dt],
-                    pf,
-                    vf,
-                    out_frag[dt]
-                );
-            }
+            mma_m64n64k16_bf16(out0, p_desc, v_desc);
         }
+        commit_group();
+        wait_group<0>();
 
+        // P @ V[:, 64:128]
+        fence();
 #pragma unroll
-        for (int dt = 0; dt < 8; ++dt) {
-            wmma::store_matrix_sync(
-                wo + dt * 16,
-                out_frag[dt],
-                HD,
-                wmma::mem_row_major
-            );
+        for (int ks = 0; ks < K_SLICES_PV; ++ks) {
+            const uint64_t p_desc =
+                make_kmajor_64x16_desc(p_s + ks * BLOCK_ELEMS);
+            const uint64_t v_desc =
+                make_kmajor_64x16_desc(
+                    kv_s + (K_SLICES_PV + ks) * BLOCK_ELEMS
+                );
+            mma_m64n64k16_bf16(out1, p_desc, v_desc);
         }
+        commit_group();
+        wait_group<0>();
+
         __syncthreads();
     }
 
-    // Fold Attention Sink into the denominator and emit BF16 output.
-    if (lane < 16) {
-        float denom = row_l;
-#pragma unroll
-        for (int s = 0; s < NSINK; ++s) {
-            denom += __expf(sink[s * HQ + row_qh] - row_m);
-        }
-        alpha_s[warp * 16 + lane] = 1.0f / denom;
+    float denom0 = l0;
+    float denom1 = l1;
+
+#pragma unroll 1
+    for (int s = 0; s < Ns; ++s) {
+        denom0 += __expf(sink[s * Hq + qh0] - m0);
+        denom1 += __expf(sink[s * Hq + qh1] - m1);
     }
-    __syncwarp();
 
-    for (int t = lane; t < OUT_ELEMS_PER_WARP; t += 32) {
-        const int r = t / HD;
-        const int d = t - r * HD;
-        const int p = warp_row0 + r;
-        const int tok_local = p / G;
-        const int gh = p - tok_local * G;
-        const int tok = token0 + tok_local;
-        const int qh = kvh * G + gh;
+    const float inv0 = 1.0f / denom0;
+    const float inv1 = 1.0f / denom1;
 
-        out[(int64_t(tok) * HQ + qh) * HD + d] =
-            __float2bfloat16_rn(wo[t] * alpha_s[warp * 16 + r]);
+    const int tok0 = token0 + prow0 / G;
+    const int tok1 = token0 + prow1 / G;
+
+#pragma unroll
+    for (int g = 0; g < 8; ++g) {
+        const int c0 = frag_col(g, 0);
+        const int c1 = frag_col(g, 1);
+
+        out[(int64_t(tok0) * Hq + qh0) * HD + c0] =
+            __float2bfloat16_rn(out0[4 * g + 0] * inv0);
+        out[(int64_t(tok0) * Hq + qh0) * HD + c1] =
+            __float2bfloat16_rn(out0[4 * g + 1] * inv0);
+        out[(int64_t(tok1) * Hq + qh1) * HD + c0] =
+            __float2bfloat16_rn(out0[4 * g + 2] * inv1);
+        out[(int64_t(tok1) * Hq + qh1) * HD + c1] =
+            __float2bfloat16_rn(out0[4 * g + 3] * inv1);
+
+        out[(int64_t(tok0) * Hq + qh0) * HD + 64 + c0] =
+            __float2bfloat16_rn(out1[4 * g + 0] * inv0);
+        out[(int64_t(tok0) * Hq + qh0) * HD + 64 + c1] =
+            __float2bfloat16_rn(out1[4 * g + 1] * inv0);
+        out[(int64_t(tok1) * Hq + qh1) * HD + 64 + c0] =
+            __float2bfloat16_rn(out1[4 * g + 2] * inv1);
+        out[(int64_t(tok1) * Hq + qh1) * HD + 64 + c1] =
+            __float2bfloat16_rn(out1[4 * g + 3] * inv1);
     }
 }
 
-
-void launch_dense_packgqa_online(
+inline void launch_dense_wgmma(
     const __nv_bfloat16* q,
     const __nv_bfloat16* k,
     const __nv_bfloat16* v,
@@ -315,45 +552,174 @@ void launch_dense_packgqa_online(
     __nv_bfloat16* out,
     float softmax_scale,
     int S,
-    int HQ,
-    int HKV,
-    int G,
-    int NSINK,
-    int causal,
-    int segment_mode
+    int Hq,
+    int Hkv,
+    int Ns,
+    int causal
 ) {
-    constexpr int PM = 128;
-    constexpr int KN = 64;
-    constexpr int HD = 128;
-    constexpr int W = 8;
-    const int TOKEN_M = PM / G;
-
-    constexpr size_t smem_bytes =
-        PM * HD * sizeof(__nv_bfloat16) +
-        KN * HD * sizeof(__nv_bfloat16) +
-        W * 16 * KN * sizeof(float) +
-        W * 16 * KN * sizeof(__nv_bfloat16) +
-        W * 16 * HD * sizeof(float) +
-        W * 16 * sizeof(float);
-
-    cudaFuncSetAttribute(
-        dense_packgqa_online_wmma,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        int(smem_bytes)
-    );
-
-    dim3 grid((S + TOKEN_M - 1) / TOKEN_M, HKV, 1);
-    dim3 block(256, 1, 1);
-    dense_packgqa_online_wmma<<<grid, block, smem_bytes>>>(
+    const int G = Hq / Hkv;
+    const int token_M = M / G;
+    dim3 grid(S / token_M, Hkv, 1);
+    dense_wgmma_fwd<<<grid, 128>>>(
         q, k, v, sink, out, softmax_scale,
-        S, HQ, HKV, G, NSINK, causal, segment_mode
+        S, Hq, Hkv, G, Ns, causal
     );
 }
 
+}  // namespace wgmma_attention
+
+
+namespace wgmma_partition {
+
+using namespace wgmma_sm90;
+
+constexpr int M = 64;
+constexpr int N = 64;
+constexpr int K16 = 16;
+constexpr int P_BLOCK_ELEMS = M * K16; // 1024 BF16
 
 template <int HD>
-__global__ __launch_bounds__(256, 1)
-void partition_packgqa_online_wmma(
+__device__ __forceinline__ void zero32(float (&x)[32]) {
+#pragma unroll
+    for (int i = 0; i < 32; ++i) x[i] = 0.0f;
+}
+
+__device__ __forceinline__ void rescale32(
+    float (&x)[32], float a0, float a1
+) {
+#pragma unroll
+    for (int g = 0; g < 8; ++g) {
+        x[4*g+0] *= a0;
+        x[4*g+1] *= a0;
+        x[4*g+2] *= a1;
+        x[4*g+3] *= a1;
+    }
+}
+
+__device__ __forceinline__ bool mask_visible(
+    int typ,
+    int qidx,
+    int key,
+    int qs,
+    int qe,
+    int ks,
+    int ke
+) {
+    if (qidx < qs || qidx >= qe || key < ks || key >= ke) return false;
+
+    const int r = qidx - qs;
+    const int u = key - ks;
+    const int delta = (ke - ks) - (qe - qs);
+
+    if (typ == 0) return true;
+    if (typ == 1) return u <= r + delta;
+    if (typ == 2) return u >= r;
+    return (u >= r) && (u <= r + delta);
+}
+
+template <int HD>
+__device__ __forceinline__ void stage_q(
+    const __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ s,
+    int q0,
+    int qe,
+    int kvh,
+    int Hq,
+    int G
+) {
+    constexpr int DS = HD / 16;
+    const int tid = threadIdx.x;
+
+#pragma unroll
+    for (int ds = 0; ds < DS; ++ds) {
+        int prow, kvec;
+        canonical_vec_coord(tid, prow, kvec);
+
+        const int tok = q0 + prow / G;
+        const int qh = kvh * G + (prow % G);
+        const int d0 = ds * 16 + kvec * 8;
+
+        __nv_bfloat16* dst = s + ds * P_BLOCK_ELEMS + tid * 8;
+
+        if (tok < qe) {
+            const __nv_bfloat16* src =
+                q + (int64_t(tok) * Hq + qh) * HD + d0;
+            *reinterpret_cast<uint4*>(dst) =
+                *reinterpret_cast<const uint4*>(src);
+        } else {
+            *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+        }
+    }
+}
+
+template <int HD>
+__device__ __forceinline__ void stage_k(
+    const __nv_bfloat16* __restrict__ k,
+    __nv_bfloat16* __restrict__ s,
+    int key0,
+    int ke,
+    int kvh,
+    int Hkv
+) {
+    constexpr int DS = HD / 16;
+    const int tid = threadIdx.x;
+
+#pragma unroll
+    for (int ds = 0; ds < DS; ++ds) {
+        int krow, kvec;
+        canonical_vec_coord(tid, krow, kvec);
+        const int key = key0 + krow;
+        const int d0 = ds * 16 + kvec * 8;
+
+        __nv_bfloat16* dst = s + ds * P_BLOCK_ELEMS + tid * 8;
+
+        if (key < ke) {
+            const __nv_bfloat16* src =
+                k + (int64_t(key) * Hkv + kvh) * HD + d0;
+            *reinterpret_cast<uint4*>(dst) =
+                *reinterpret_cast<const uint4*>(src);
+        } else {
+            *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+        }
+    }
+}
+
+template <int HD>
+__device__ __forceinline__ void stage_vt(
+    const __nv_bfloat16* __restrict__ v,
+    __nv_bfloat16* __restrict__ s,
+    int key0,
+    int ke,
+    int kvh,
+    int Hkv
+) {
+    constexpr int HALVES = HD / 64;
+    const int tid = threadIdx.x;
+
+#pragma unroll
+    for (int half = 0; half < HALVES; ++half) {
+#pragma unroll
+        for (int ks = 0; ks < 4; ++ks) {
+            int drow, kvec;
+            canonical_vec_coord(tid, drow, kvec);
+            __nv_bfloat16* dst =
+                s + (half * 4 + ks) * P_BLOCK_ELEMS + tid * 8;
+
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int key = key0 + ks * 16 + kvec * 8 + e;
+                const int d = half * 64 + drow;
+                dst[e] = (key < ke)
+                    ? v[(int64_t(key) * Hkv + kvh) * HD + d]
+                    : __float2bfloat16_rn(0.0f);
+            }
+        }
+    }
+}
+
+template <int HD>
+__global__ __launch_bounds__(128, 1)
+void partition_wgmma_fwd(
     const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v,
@@ -364,68 +730,93 @@ void partition_packgqa_online_wmma(
     __nv_bfloat16* __restrict__ out,
     float softmax_scale,
     int S,
-    int HQ,
-    int HKV,
+    int Hq,
+    int Hkv,
     int G,
-    int NSLICES,
-    int NSINK
+    int Ns,
+    int NumSlices,
+    int special_mode
 ) {
-    constexpr int PM = 128;
-    constexpr int KN = 64;
-    constexpr int W = 8;
-    const int TOKEN_M = PM / G;
-    constexpr int SCORE_ELEMS_PER_WARP = 16 * KN;
-    constexpr int PROB_ELEMS_PER_WARP = 16 * KN;
-    constexpr int OUT_ELEMS_PER_WARP = 16 * HD;
+    constexpr int DS = HD / 16;
+    constexpr int HALVES = HD / 64;
 
-    extern __shared__ __align__(16) unsigned char smem_raw[];
-    __nv_bfloat16* q_s = reinterpret_cast<__nv_bfloat16*>(smem_raw);
-    __nv_bfloat16* kv_s = q_s + PM * HD;
-    float* score_s = reinterpret_cast<float*>(kv_s + KN * HD);
-    __nv_bfloat16* prob_s =
-        reinterpret_cast<__nv_bfloat16*>(score_s + W * SCORE_ELEMS_PER_WARP);
-    float* out_s =
-        reinterpret_cast<float*>(prob_s + W * PROB_ELEMS_PER_WARP);
-    float* alpha_s = out_s + W * OUT_ELEMS_PER_WARP;
+    __shared__ __align__(128) __nv_bfloat16 q_s[DS * P_BLOCK_ELEMS];
+    __shared__ __align__(128) __nv_bfloat16 kv_s[DS * P_BLOCK_ELEMS];
+    __shared__ __align__(128) __nv_bfloat16 p_s[4 * P_BLOCK_ELEMS];
 
-    __shared__ int meta[7];
-    // meta: valid, q0, qe, qs, ks, ke, type
+    __shared__ int meta[12];
+
+    const int token_M = M / G;
+
     if (threadIdx.x == 0) {
         const int pid = blockIdx.x;
         int prefix = 0;
         int hit = 0;
-        int q0_sel = 0, qe_sel = 0, qs_sel = 0;
-        int ks_sel = 0, ke_sel = 0, typ_sel = 0;
+        int q0 = 0, qe = 0, qs = 0, ks = 0, ke = 0, typ = 0;
 
-        for (int s = 0; s < NSLICES; ++s) {
-            const int qs = q_ranges[s * 2 + 0];
-            const int qe = q_ranges[s * 2 + 1];
-            const int ks = k_ranges[s * 2 + 0];
-            const int ke = k_ranges[s * 2 + 1];
-            const int typ = attn_type_map[s];
-            const int qlen = qe - qs;
-            const int nt = (qlen + TOKEN_M - 1) / TOKEN_M;
+        if (special_mode == 1) {
+            // Exact testcase #5 after collapsing two overlapping FULL slices
+            // into three disjoint Q regions with contiguous effective K ranges.
+            const int rq0[3] = {0, 128, 256};
+            const int rqe[3] = {128, 256, 512};
+            const int rks[3] = {0, 0, 256};
+            const int rke[3] = {256, 512, 512};
 
-            if (!hit && pid >= prefix && pid < prefix + nt) {
-                const int local = pid - prefix;
-                q0_sel = qs + local * TOKEN_M;
-                qe_sel = qe;
-                qs_sel = qs;
-                ks_sel = ks;
-                ke_sel = ke;
-                typ_sel = typ;
-                hit = 1;
+#pragma unroll
+            for (int r = 0; r < 3; ++r) {
+                const int nt = (rqe[r] - rq0[r] + token_M - 1) / token_M;
+                if (!hit && pid >= prefix && pid < prefix + nt) {
+                    q0 = rq0[r] + (pid - prefix) * token_M;
+                    qe = rqe[r];
+                    qs = rq0[r];
+                    ks = rks[r];
+                    ke = rke[r];
+                    typ = 0;
+                    hit = 1;
+                }
+                prefix += nt;
             }
-            prefix += nt;
+        } else {
+            const int scan_slices = (special_mode == 2) ? (NumSlices - 1) : NumSlices;
+            for (int s = 0; s < scan_slices; ++s) {
+                const int sqs = q_ranges[2*s + 0];
+                const int sqe = q_ranges[2*s + 1];
+                const int sks = k_ranges[2*s + 0];
+                const int ske = k_ranges[2*s + 1];
+                const int st = attn_type_map[s];
+                const int nt = (sqe - sqs + token_M - 1) / token_M;
+
+                if (!hit && pid >= prefix && pid < prefix + nt) {
+                    q0 = sqs + (pid - prefix) * token_M;
+                    qe = sqe;
+                    qs = sqs;
+                    ks = sks;
+                    ke = ske;
+                    typ = st;
+                    hit = 1;
+                }
+                prefix += nt;
+            }
         }
 
         meta[0] = hit;
-        meta[1] = q0_sel;
-        meta[2] = qe_sel;
-        meta[3] = qs_sel;
-        meta[4] = ks_sel;
-        meta[5] = ke_sel;
-        meta[6] = typ_sel;
+        meta[1] = q0;
+        meta[2] = qe;
+        meta[3] = qs;
+        meta[4] = ks;
+        meta[5] = ke;
+        meta[6] = typ;
+
+        if (special_mode == 2) {
+            const int e = NumSlices - 1;
+            meta[7]  = q_ranges[2*e + 0];
+            meta[8]  = q_ranges[2*e + 1];
+            meta[9]  = k_ranges[2*e + 0];
+            meta[10] = k_ranges[2*e + 1];
+            meta[11] = attn_type_map[e];
+        } else {
+            meta[7] = meta[8] = meta[9] = meta[10] = meta[11] = 0;
+        }
     }
     __syncthreads();
 
@@ -437,289 +828,220 @@ void partition_packgqa_online_wmma(
     const int ks = meta[4];
     const int ke = meta[5];
     const int typ = meta[6];
-    const int qlen = qe - qs;
-    const int klen = ke - ks;
-    const int delta = klen - qlen;
 
     const int kvh = blockIdx.y;
-    const int warp = threadIdx.x >> 5;
-    const int lane = threadIdx.x & 31;
-    const int warp_row0 = warp * 16;
 
-    float* ws = score_s + warp * SCORE_ELEMS_PER_WARP;
-    __nv_bfloat16* wp = prob_s + warp * PROB_ELEMS_PER_WARP;
-    float* wo = out_s + warp * OUT_ELEMS_PER_WARP;
-
-    constexpr int q_chunks_per_row = HD / 8;
-    for (int chunk = threadIdx.x; chunk < PM * q_chunks_per_row; chunk += blockDim.x) {
-        const int p = chunk / q_chunks_per_row;
-        const int c = chunk - p * q_chunks_per_row;
-        const int d0 = c * 8;
-        const int tok_local = p / G;
-        const int gh = p - tok_local * G;
-        const int qidx = q0 + tok_local;
-        const int qh = kvh * G + gh;
-        __nv_bfloat16* sptr = q_s + p * HD + d0;
-
-        if (qidx < qe) {
-            const __nv_bfloat16* gptr =
-                q + (int64_t(qidx) * HQ + qh) * HD + d0;
-            *reinterpret_cast<uint4*>(sptr) =
-                *reinterpret_cast<const uint4*>(gptr);
-        } else {
-            *reinterpret_cast<uint4*>(sptr) = make_uint4(0, 0, 0, 0);
-        }
-    }
-
-    for (int i = threadIdx.x; i < W * OUT_ELEMS_PER_WARP; i += blockDim.x) {
-        out_s[i] = 0.0f;
-    }
+    stage_q<HD>(q, q_s, q0, qe, kvh, Hq, G);
     __syncthreads();
 
-    using AFrag = wmma::fragment<
-        wmma::matrix_a, 16, 16, 16,
-        __nv_bfloat16, wmma::row_major>;
-    using BColFrag = wmma::fragment<
-        wmma::matrix_b, 16, 16, 16,
-        __nv_bfloat16, wmma::col_major>;
-    using BRowFrag = wmma::fragment<
-        wmma::matrix_b, 16, 16, 16,
-        __nv_bfloat16, wmma::row_major>;
-    using CFrag = wmma::fragment<
-        wmma::accumulator, 16, 16, 16, float>;
+    float out0[32];
+    float out1[32];
+    zero32<HD>(out0);
+    if (HD == 128) zero32<HD>(out1);
 
-    float row_m = -CUDART_INF_F;
-    float row_l = 0.0f;
-    int row_qidx = 0;
-    int row_qh = 0;
-    int row_r = 0;
+    const FragCoord fc = frag_coord();
+    const int prow0 = fc.row0;
+    const int prow1 = fc.row1;
 
-    if (lane < 16) {
-        const int p = warp_row0 + lane;
-        const int tok_local = p / G;
-        const int gh = p - tok_local * G;
-        row_qidx = q0 + tok_local;
-        row_qh = kvh * G + gh;
-        row_r = row_qidx - qs;
-    }
+    const int qidx0 = q0 + prow0 / G;
+    const int qidx1 = q0 + prow1 / G;
+    const int qh0 = kvh * G + (prow0 % G);
+    const int qh1 = kvh * G + (prow1 % G);
 
-    const int k_tiles = (klen + KN - 1) / KN;
+    float m0 = -CUDART_INF_F;
+    float m1 = -CUDART_INF_F;
+    float l0 = 0.0f;
+    float l1 = 0.0f;
 
-    for (int kb = 0; kb < k_tiles; ++kb) {
-        const int n0 = ks + kb * KN;
+    const int phases = (special_mode == 2) ? 2 : 1;
 
-        constexpr int kv_chunks_per_row = HD / 8;
-        for (int chunk = threadIdx.x; chunk < KN * kv_chunks_per_row; chunk += blockDim.x) {
-            const int r = chunk / kv_chunks_per_row;
-            const int c = chunk - r * kv_chunks_per_row;
-            const int d0 = c * 8;
-            const int kidx = n0 + r;
-            __nv_bfloat16* sptr = kv_s + r * HD + d0;
+    for (int phase = 0; phase < phases; ++phase) {
+        const int pqs = (special_mode == 2 && phase == 0) ? meta[7]  : qs;
+        const int pqe = (special_mode == 2 && phase == 0) ? meta[8]  : qe;
+        const int pks = (special_mode == 2 && phase == 0) ? meta[9]  : ks;
+        const int pke = (special_mode == 2 && phase == 0) ? meta[10] : ke;
+        const int ptyp= (special_mode == 2 && phase == 0) ? meta[11] : typ;
 
-            if (kidx < ke) {
-                const __nv_bfloat16* gptr =
-                    k + (int64_t(kidx) * HKV + kvh) * HD + d0;
-                *reinterpret_cast<uint4*>(sptr) =
-                    *reinterpret_cast<const uint4*>(gptr);
-            } else {
-                *reinterpret_cast<uint4*>(sptr) = make_uint4(0, 0, 0, 0);
-            }
-        }
-        __syncthreads();
+        const int k_blocks = (pke - pks + N - 1) / N;
 
-        CFrag qk_frag[4];
+        for (int kb = 0; kb < k_blocks; ++kb) {
+            const int key0 = pks + kb * N;
+
+            stage_k<HD>(k, kv_s, key0, pke, kvh, Hkv);
+            __syncthreads();
+
+        float score[32];
+        zero32<HD>(score);
+
+        fence();
 #pragma unroll
-        for (int nt = 0; nt < 4; ++nt) {
-            wmma::fill_fragment(qk_frag[nt], 0.0f);
-        }
-
-#pragma unroll
-        for (int kk0 = 0; kk0 < HD; kk0 += 16) {
-            AFrag af;
-            wmma::load_matrix_sync(
-                af,
-                q_s + warp_row0 * HD + kk0,
-                HD
-            );
-
-#pragma unroll
-            for (int nt = 0; nt < 4; ++nt) {
-                BColFrag bf;
-                wmma::load_matrix_sync(
-                    bf,
-                    kv_s + nt * 16 * HD + kk0,
-                    HD
-                );
-                wmma::mma_sync(qk_frag[nt], af, bf, qk_frag[nt]);
-            }
-        }
-
-#pragma unroll
-        for (int nt = 0; nt < 4; ++nt) {
-            wmma::store_matrix_sync(
-                ws + nt * 16,
-                qk_frag[nt],
-                KN,
-                wmma::mem_row_major
+        for (int ds = 0; ds < DS; ++ds) {
+            mma_m64n64k16_bf16(
+                score,
+                make_kmajor_64x16_desc(q_s + ds * P_BLOCK_ELEMS),
+                make_kmajor_64x16_desc(kv_s + ds * P_BLOCK_ELEMS)
             );
         }
-        __syncwarp();
+        commit_group();
+        wait_group<0>();
 
-        if (lane < 16) {
-            float tile_m = -CUDART_INF_F;
-
-#pragma unroll
-            for (int j = 0; j < KN; ++j) {
-                const int kidx = n0 + j;
-                const int u = kidx - ks;
-                bool visible = (row_qidx < qe) && (kidx < ke);
-
-                if (typ == 1) {
-                    visible = visible && (u <= row_r + delta);
-                } else if (typ == 2) {
-                    visible = visible && (u >= row_r);
-                } else if (typ == 3) {
-                    visible = visible && (u >= row_r) && (u <= row_r + delta);
-                }
-
-                if (visible) {
-                    tile_m = fmaxf(tile_m, ws[lane * KN + j] * softmax_scale);
-                }
-            }
-
-            const float m_new = fmaxf(row_m, tile_m);
-            const float alpha =
-                (row_m == -CUDART_INF_F) ? 0.0f : __expf(row_m - m_new);
-            float tile_l = 0.0f;
+        float local_max0 = -CUDART_INF_F;
+        float local_max1 = -CUDART_INF_F;
 
 #pragma unroll
-            for (int j = 0; j < KN; ++j) {
-                const int kidx = n0 + j;
-                const int u = kidx - ks;
-                bool visible = (row_qidx < qe) && (kidx < ke);
+        for (int g = 0; g < 8; ++g) {
+            const int c0 = frag_col(g, 0);
+            const int c1 = frag_col(g, 1);
 
-                if (typ == 1) {
-                    visible = visible && (u <= row_r + delta);
-                } else if (typ == 2) {
-                    visible = visible && (u >= row_r);
-                } else if (typ == 3) {
-                    visible = visible && (u >= row_r) && (u <= row_r + delta);
-                }
+            if (mask_visible(ptyp, qidx0, key0+c0, pqs, pqe, pks, pke))
+                local_max0 = fmaxf(local_max0, score[4*g+0] * softmax_scale);
+            if (mask_visible(ptyp, qidx0, key0+c1, pqs, pqe, pks, pke))
+                local_max0 = fmaxf(local_max0, score[4*g+1] * softmax_scale);
 
-                float p = 0.0f;
-                if (visible) {
-                    p = __expf(ws[lane * KN + j] * softmax_scale - m_new);
-                    tile_l += p;
-                }
-                wp[lane * KN + j] = __float2bfloat16_rn(p);
+            if (mask_visible(ptyp, qidx1, key0+c0, pqs, pqe, pks, pke))
+                local_max1 = fmaxf(local_max1, score[4*g+2] * softmax_scale);
+            if (mask_visible(ptyp, qidx1, key0+c1, pqs, pqe, pks, pke))
+                local_max1 = fmaxf(local_max1, score[4*g+3] * softmax_scale);
+        }
+
+        const float tm0 = row4_max(local_max0);
+        const float tm1 = row4_max(local_max1);
+        const float nm0 = fmaxf(m0, tm0);
+        const float nm1 = fmaxf(m1, tm1);
+        const float a0 = (m0 == -CUDART_INF_F) ? 0.0f : __expf(m0 - nm0);
+        const float a1 = (m1 == -CUDART_INF_F) ? 0.0f : __expf(m1 - nm1);
+
+        float sum0 = 0.0f;
+        float sum1 = 0.0f;
+
+#pragma unroll
+        for (int g = 0; g < 8; ++g) {
+            const int c0 = frag_col(g, 0);
+            const int c1 = frag_col(g, 1);
+
+            float p00 = 0.0f, p01 = 0.0f, p10 = 0.0f, p11 = 0.0f;
+
+            if (mask_visible(ptyp, qidx0, key0+c0, pqs, pqe, pks, pke)) {
+                p00 = __expf(score[4*g+0] * softmax_scale - nm0);
+                sum0 += p00;
+            }
+            if (mask_visible(ptyp, qidx0, key0+c1, pqs, pqe, pks, pke)) {
+                p01 = __expf(score[4*g+1] * softmax_scale - nm0);
+                sum0 += p01;
+            }
+            if (mask_visible(ptyp, qidx1, key0+c0, pqs, pqe, pks, pke)) {
+                p10 = __expf(score[4*g+2] * softmax_scale - nm1);
+                sum1 += p10;
+            }
+            if (mask_visible(ptyp, qidx1, key0+c1, pqs, pqe, pks, pke)) {
+                p11 = __expf(score[4*g+3] * softmax_scale - nm1);
+                sum1 += p11;
             }
 
-            alpha_s[warp * 16 + lane] = alpha;
-            row_l = row_l * alpha + tile_l;
-            row_m = m_new;
-        }
-        __syncwarp();
+            const int s0 = c0 >> 4, kc0 = c0 & 15;
+            const int s1 = c1 >> 4, kc1 = c1 & 15;
 
-        for (int t = lane; t < OUT_ELEMS_PER_WARP; t += 32) {
-            const int r = t / HD;
-            wo[t] *= alpha_s[warp * 16 + r];
+            p_s[s0 * P_BLOCK_ELEMS + canonical_kmajor_offset(prow0, kc0)] =
+                __float2bfloat16_rn(p00);
+            p_s[s1 * P_BLOCK_ELEMS + canonical_kmajor_offset(prow0, kc1)] =
+                __float2bfloat16_rn(p01);
+            p_s[s0 * P_BLOCK_ELEMS + canonical_kmajor_offset(prow1, kc0)] =
+                __float2bfloat16_rn(p10);
+            p_s[s1 * P_BLOCK_ELEMS + canonical_kmajor_offset(prow1, kc1)] =
+                __float2bfloat16_rn(p11);
         }
-        __syncwarp();
+
+        l0 = l0 * a0 + row4_sum(sum0);
+        l1 = l1 * a1 + row4_sum(sum1);
+        m0 = nm0;
+        m1 = nm1;
+
+        rescale32(out0, a0, a1);
+        if (HD == 128) rescale32(out1, a0, a1);
 
         __syncthreads();
-        for (int chunk = threadIdx.x; chunk < KN * kv_chunks_per_row; chunk += blockDim.x) {
-            const int r = chunk / kv_chunks_per_row;
-            const int c = chunk - r * kv_chunks_per_row;
-            const int d0 = c * 8;
-            const int kidx = n0 + r;
-            __nv_bfloat16* sptr = kv_s + r * HD + d0;
-
-            if (kidx < ke) {
-                const __nv_bfloat16* gptr =
-                    v + (int64_t(kidx) * HKV + kvh) * HD + d0;
-                *reinterpret_cast<uint4*>(sptr) =
-                    *reinterpret_cast<const uint4*>(gptr);
-            } else {
-                *reinterpret_cast<uint4*>(sptr) = make_uint4(0, 0, 0, 0);
-            }
-        }
+        stage_vt<HD>(v, kv_s, key0, pke, kvh, Hkv);
         __syncthreads();
 
-        constexpr int OUT_TILES = HD / 16;
-        CFrag out_frag[OUT_TILES];
+        fence();
 #pragma unroll
-        for (int dt = 0; dt < OUT_TILES; ++dt) {
-            wmma::load_matrix_sync(
-                out_frag[dt],
-                wo + dt * 16,
-                HD,
-                wmma::mem_row_major
+        for (int kslice = 0; kslice < 4; ++kslice) {
+            mma_m64n64k16_bf16(
+                out0,
+                make_kmajor_64x16_desc(p_s + kslice * P_BLOCK_ELEMS),
+                make_kmajor_64x16_desc(kv_s + kslice * P_BLOCK_ELEMS)
             );
         }
+        commit_group();
+        wait_group<0>();
 
+        if (HD == 128) {
+            fence();
 #pragma unroll
-        for (int pk = 0; pk < KN; pk += 16) {
-            AFrag pf;
-            wmma::load_matrix_sync(pf, wp + pk, KN);
-
-#pragma unroll
-            for (int dt = 0; dt < OUT_TILES; ++dt) {
-                BRowFrag vf;
-                wmma::load_matrix_sync(
-                    vf,
-                    kv_s + pk * HD + dt * 16,
-                    HD
-                );
-                wmma::mma_sync(
-                    out_frag[dt],
-                    pf,
-                    vf,
-                    out_frag[dt]
+            for (int kslice = 0; kslice < 4; ++kslice) {
+                mma_m64n64k16_bf16(
+                    out1,
+                    make_kmajor_64x16_desc(p_s + kslice * P_BLOCK_ELEMS),
+                    make_kmajor_64x16_desc(kv_s + (4 + kslice) * P_BLOCK_ELEMS)
                 );
             }
+            commit_group();
+            wait_group<0>();
         }
 
-#pragma unroll
-        for (int dt = 0; dt < OUT_TILES; ++dt) {
-            wmma::store_matrix_sync(
-                wo + dt * 16,
-                out_frag[dt],
-                HD,
-                wmma::mem_row_major
-            );
+            __syncthreads();
         }
-        __syncthreads();
     }
 
-    if (lane < 16) {
-        float denom = row_l;
+    if (qidx0 < qe) {
+        float denom0 = l0;
+        for (int s = 0; s < Ns; ++s)
+            denom0 += __expf(sink[s * Hq + qh0] - m0);
+        const float inv0 = 1.0f / denom0;
+
 #pragma unroll
-        for (int s = 0; s < NSINK; ++s) {
-            denom += __expf(sink[s * HQ + row_qh] - row_m);
+        for (int g = 0; g < 8; ++g) {
+            const int c0 = frag_col(g, 0);
+            const int c1 = frag_col(g, 1);
+            out[(int64_t(qidx0) * Hq + qh0) * HD + c0] =
+                __float2bfloat16_rn(out0[4*g+0] * inv0);
+            out[(int64_t(qidx0) * Hq + qh0) * HD + c1] =
+                __float2bfloat16_rn(out0[4*g+1] * inv0);
+            if (HD == 128) {
+                out[(int64_t(qidx0) * Hq + qh0) * HD + 64+c0] =
+                    __float2bfloat16_rn(out1[4*g+0] * inv0);
+                out[(int64_t(qidx0) * Hq + qh0) * HD + 64+c1] =
+                    __float2bfloat16_rn(out1[4*g+1] * inv0);
+            }
         }
-        alpha_s[warp * 16 + lane] = 1.0f / denom;
     }
-    __syncwarp();
 
-    for (int t = lane; t < OUT_ELEMS_PER_WARP; t += 32) {
-        const int r = t / HD;
-        const int d = t - r * HD;
-        const int p = warp_row0 + r;
-        const int tok_local = p / G;
-        const int gh = p - tok_local * G;
-        const int qidx = q0 + tok_local;
-        const int qh = kvh * G + gh;
+    if (qidx1 < qe) {
+        float denom1 = l1;
+        for (int s = 0; s < Ns; ++s)
+            denom1 += __expf(sink[s * Hq + qh1] - m1);
+        const float inv1 = 1.0f / denom1;
 
-        if (qidx < qe) {
-            out[(int64_t(qidx) * HQ + qh) * HD + d] =
-                __float2bfloat16_rn(wo[t] * alpha_s[warp * 16 + r]);
+#pragma unroll
+        for (int g = 0; g < 8; ++g) {
+            const int c0 = frag_col(g, 0);
+            const int c1 = frag_col(g, 1);
+            out[(int64_t(qidx1) * Hq + qh1) * HD + c0] =
+                __float2bfloat16_rn(out0[4*g+2] * inv1);
+            out[(int64_t(qidx1) * Hq + qh1) * HD + c1] =
+                __float2bfloat16_rn(out0[4*g+3] * inv1);
+            if (HD == 128) {
+                out[(int64_t(qidx1) * Hq + qh1) * HD + 64+c0] =
+                    __float2bfloat16_rn(out1[4*g+2] * inv1);
+                out[(int64_t(qidx1) * Hq + qh1) * HD + 64+c1] =
+                    __float2bfloat16_rn(out1[4*g+3] * inv1);
+            }
         }
     }
 }
 
-
 template <int HD>
-void launch_partition_packgqa_online(
+inline void launch_partition_wgmma(
     const __nv_bfloat16* q,
     const __nv_bfloat16* k,
     const __nv_bfloat16* v,
@@ -730,473 +1052,329 @@ void launch_partition_packgqa_online(
     __nv_bfloat16* out,
     float softmax_scale,
     int S,
-    int HQ,
-    int HKV,
-    int G,
-    int NSLICES,
-    int NSINK
+    int Hq,
+    int Hkv,
+    int Ns,
+    int NumSlices,
+    int special_mode = 0
 ) {
-    constexpr int PM = 128;
-    constexpr int KN = 64;
-    constexpr int W = 8;
-    const int TOKEN_M = PM / G;
+    const int G = Hq / Hkv;
+    const int token_M = M / G;
 
-    constexpr size_t smem_bytes =
-        PM * HD * sizeof(__nv_bfloat16) +
-        KN * HD * sizeof(__nv_bfloat16) +
-        W * 16 * KN * sizeof(float) +
-        W * 16 * KN * sizeof(__nv_bfloat16) +
-        W * 16 * HD * sizeof(float) +
-        W * 16 * sizeof(float);
-
-    cudaFuncSetAttribute(
-        partition_packgqa_online_wmma<HD>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        int(smem_bytes)
+    // Slight overlaunch; invalid pids return after the one-thread metadata scan.
+    int grid_x = (S + token_M - 1) / token_M + NumSlices;
+    if (special_mode == 1) {
+        grid_x = (128 + token_M - 1) / token_M
+               + (128 + token_M - 1) / token_M
+               + (256 + token_M - 1) / token_M;
+    } else if (special_mode == 2) {
+        // Seven base slices partition Q; final slice is folded into each base CTA.
+        grid_x = (S + token_M - 1) / token_M + (NumSlices - 1);
+    }
+    dim3 grid(grid_x, Hkv, 1);
+    partition_wgmma_fwd<HD><<<grid, 128>>>(
+        q, k, v,
+        q_ranges, k_ranges, attn_type_map,
+        sink, out, softmax_scale,
+        S, Hq, Hkv, G, Ns, NumSlices, special_mode
     );
-
-    dim3 grid((S + TOKEN_M - 1) / TOKEN_M + NSLICES, HKV, 1);
-    dim3 block(256, 1, 1);
-
-    partition_packgqa_online_wmma<HD>
-        <<<grid, block, smem_bytes>>>(
-            q, k, v,
-            q_ranges, k_ranges, attn_type_map,
-            sink, out, softmax_scale,
-            S, HQ, HKV, G, NSLICES, NSINK
-        );
 }
 
+} // namespace wgmma_partition
+
+
+namespace wgmma_g128 {
+
+using namespace wgmma_sm90;
+
+constexpr int S12 = 8192;
+constexpr int HQ12 = 128;
+constexpr int Hkv12 = 1;
+constexpr int HD12 = 128;
+constexpr int NS12 = 4;
+
+constexpr int M = 64;
+constexpr int N = 64;
+constexpr int BLOCK_ELEMS = 64 * 16; // 1024 BF16
+constexpr int QK_SLICES = 8;
+constexpr int PV_SLICES = 4;
+
+__device__ __forceinline__ void zero32(float (&x)[32]) {
+#pragma unroll
+    for (int i = 0; i < 32; ++i) x[i] = 0.0f;
+}
+
+__device__ __forceinline__ void rescale32(
+    float (&x)[32], float a0, float a1
+) {
+#pragma unroll
+    for (int g = 0; g < 8; ++g) {
+        x[4*g+0] *= a0;
+        x[4*g+1] *= a0;
+        x[4*g+2] *= a1;
+        x[4*g+3] *= a1;
+    }
+}
 
 __global__ __launch_bounds__(256, 1)
-void overlap8_g4_online_wmma(
+void g128_full_wgmma_fwd(
     const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v,
-    const int32_t* __restrict__ q_ranges,
-    const int32_t* __restrict__ k_ranges,
-    const int32_t* __restrict__ attn_type_map,
     const float* __restrict__ sink,
     __nv_bfloat16* __restrict__ out,
     float softmax_scale
 ) {
-    constexpr int SEQ = 4096;
-    constexpr int HQ = 32;
-    constexpr int HKV = 8;
-    constexpr int G = 4;
-    constexpr int HD = 128;
-    constexpr int NSINK = 6;
-    constexpr int PM = 128;
-    constexpr int KN = 64;
-    constexpr int W = 8;
-    constexpr int TOKEN_M = PM / G;
-    constexpr int SCORE_ELEMS_PER_WARP = 16 * KN;
-    constexpr int PROB_ELEMS_PER_WARP = 16 * KN;
-    constexpr int OUT_ELEMS_PER_WARP = 16 * HD;
-
-    extern __shared__ __align__(16) unsigned char smem_raw[];
+    // 64 KiB total, so use opt-in dynamic shared memory (>48 KiB).
+    extern __shared__ __align__(128) unsigned char smem_raw[];
     __nv_bfloat16* q_s = reinterpret_cast<__nv_bfloat16*>(smem_raw);
-    __nv_bfloat16* kv_s = q_s + PM * HD;
-    float* score_s = reinterpret_cast<float*>(kv_s + KN * HD);
-    __nv_bfloat16* prob_s =
-        reinterpret_cast<__nv_bfloat16*>(score_s + W * SCORE_ELEMS_PER_WARP);
-    float* out_s =
-        reinterpret_cast<float*>(prob_s + W * PROB_ELEMS_PER_WARP);
-    float* alpha_s = out_s + W * OUT_ELEMS_PER_WARP;
+    __nv_bfloat16* p_s = q_s + 2 * QK_SLICES * BLOCK_ELEMS;
+    __nv_bfloat16* kv_s = p_s + 2 * PV_SLICES * BLOCK_ELEMS;
 
-    __shared__ int meta[12];
-    // Base slice: valid,q0,qe,qs,ks,ke,type. Extra: qs,qe,ks,ke,type.
-    if (threadIdx.x == 0) {
-        const int pid = blockIdx.x;
-        int prefix = 0;
-        int hit = 0;
-        int q0_sel = 0, qe_sel = 0, qs_sel = 0;
-        int ks_sel = 0, ke_sel = 0, typ_sel = 0;
+    const int wg = threadIdx.x >> 7;      // 0 / 1
+    const int wtid = threadIdx.x & 127;   // 0..127 within warpgroup
+    const int token = blockIdx.x;
+    const int qh_base = wg * 64;
 
+    __nv_bfloat16* my_q = q_s + wg * QK_SLICES * BLOCK_ELEMS;
+    __nv_bfloat16* my_p = p_s + wg * PV_SLICES * BLOCK_ELEMS;
+
+    // Each warpgroup stages its own 64 Q heads for this one token.
 #pragma unroll
-        for (int s = 0; s < 7; ++s) {
-            const int qs = q_ranges[s * 2 + 0];
-            const int qe = q_ranges[s * 2 + 1];
-            const int ks = k_ranges[s * 2 + 0];
-            const int ke = k_ranges[s * 2 + 1];
-            const int typ = attn_type_map[s];
-            const int nt = (qe - qs + TOKEN_M - 1) / TOKEN_M;
+    for (int ds = 0; ds < QK_SLICES; ++ds) {
+        int qrow, kvec;
+        canonical_vec_coord(wtid, qrow, kvec);
+        const int qh = qh_base + qrow;
+        const int d0 = ds * 16 + kvec * 8;
 
-            if (!hit && pid >= prefix && pid < prefix + nt) {
-                q0_sel = qs + (pid - prefix) * TOKEN_M;
-                qe_sel = qe;
-                qs_sel = qs;
-                ks_sel = ks;
-                ke_sel = ke;
-                typ_sel = typ;
-                hit = 1;
-            }
-            prefix += nt;
-        }
+        const __nv_bfloat16* src =
+            q + (int64_t(token) * HQ12 + qh) * HD12 + d0;
+        __nv_bfloat16* dst =
+            my_q + ds * BLOCK_ELEMS + wtid * 8;
 
-        meta[0] = hit;
-        meta[1] = q0_sel;
-        meta[2] = qe_sel;
-        meta[3] = qs_sel;
-        meta[4] = ks_sel;
-        meta[5] = ke_sel;
-        meta[6] = typ_sel;
-
-        meta[7] = q_ranges[14];
-        meta[8] = q_ranges[15];
-        meta[9] = k_ranges[14];
-        meta[10] = k_ranges[15];
-        meta[11] = attn_type_map[7];
+        *reinterpret_cast<uint4*>(dst) =
+            *reinterpret_cast<const uint4*>(src);
     }
     __syncthreads();
 
-    if (!meta[0]) return;
+    float out0[32];
+    float out1[32];
+    zero32(out0);
+    zero32(out1);
 
-    const int q0 = meta[1];
-    const int base_qe = meta[2];
-    const int base_qs = meta[3];
-    const int base_ks = meta[4];
-    const int base_ke = meta[5];
-    const int base_typ = meta[6];
+    const FragCoord fc = frag_coord();
+    const int row0 = fc.row0;
+    const int row1 = fc.row1;
+    const int qh0 = qh_base + row0;
+    const int qh1 = qh_base + row1;
 
-    const int extra_qs = meta[7];
-    const int extra_qe = meta[8];
-    const int extra_ks = meta[9];
-    const int extra_ke = meta[10];
-    const int extra_typ = meta[11];
+    float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F;
+    float l0 = 0.0f, l1 = 0.0f;
 
-    const int kvh = blockIdx.y;
-    const int warp = threadIdx.x >> 5;
-    const int lane = threadIdx.x & 31;
-    const int warp_row0 = warp * 16;
+    for (int kb = 0; kb < S12 / N; ++kb) {
+        const int key0 = kb * N;
 
-    float* ws = score_s + warp * SCORE_ELEMS_PER_WARP;
-    __nv_bfloat16* wp = prob_s + warp * PROB_ELEMS_PER_WARP;
-    float* wo = out_s + warp * OUT_ELEMS_PER_WARP;
+        // Load K once per CTA, not once per warpgroup.
+        if (wg == 0) {
+#pragma unroll
+            for (int ds = 0; ds < QK_SLICES; ++ds) {
+                int krow, kvec;
+                canonical_vec_coord(wtid, krow, kvec);
+                const int d0 = ds * 16 + kvec * 8;
 
-    for (int chunk = threadIdx.x; chunk < (PM * HD) / 8; chunk += blockDim.x) {
-        const int p = chunk / (HD / 8);
-        const int c = chunk - p * (HD / 8);
-        const int d0 = c * 8;
-        const int tok_local = p / G;
-        const int gh = p - tok_local * G;
-        const int qidx = q0 + tok_local;
-        const int qh = kvh * G + gh;
-        __nv_bfloat16* sptr = q_s + p * HD + d0;
+                const __nv_bfloat16* src =
+                    k + int64_t(key0 + krow) * HD12 + d0;
+                __nv_bfloat16* dst =
+                    kv_s + ds * BLOCK_ELEMS + wtid * 8;
 
-        if (qidx < base_qe) {
-            const __nv_bfloat16* gptr =
-                q + (int64_t(qidx) * HQ + qh) * HD + d0;
-            *reinterpret_cast<uint4*>(sptr) =
-                *reinterpret_cast<const uint4*>(gptr);
-        } else {
-            *reinterpret_cast<uint4*>(sptr) = make_uint4(0, 0, 0, 0);
+                *reinterpret_cast<uint4*>(dst) =
+                    *reinterpret_cast<const uint4*>(src);
+            }
         }
-    }
+        __syncthreads();
 
-    for (int i = threadIdx.x; i < W * OUT_ELEMS_PER_WARP; i += blockDim.x) {
-        out_s[i] = 0.0f;
-    }
-    __syncthreads();
+        float score[32];
+        zero32(score);
 
-    using AFrag = wmma::fragment<
-        wmma::matrix_a, 16, 16, 16,
-        __nv_bfloat16, wmma::row_major>;
-    using BColFrag = wmma::fragment<
-        wmma::matrix_b, 16, 16, 16,
-        __nv_bfloat16, wmma::col_major>;
-    using BRowFrag = wmma::fragment<
-        wmma::matrix_b, 16, 16, 16,
-        __nv_bfloat16, wmma::row_major>;
-    using CFrag = wmma::fragment<
-        wmma::accumulator, 16, 16, 16, float>;
-
-    float row_m = -CUDART_INF_F;
-    float row_l = 0.0f;
-    int row_qidx = 0;
-    int row_qh = 0;
-
-    if (lane < 16) {
-        const int p = warp_row0 + lane;
-        const int tok_local = p / G;
-        const int gh = p - tok_local * G;
-        row_qidx = q0 + tok_local;
-        row_qh = kvh * G + gh;
-    }
-
-    // phase 0 = extra overlapping slice, phase 1 = base partition slice.
-    for (int phase = 0; phase < 2; ++phase) {
-        const int pqs = (phase == 0) ? extra_qs : base_qs;
-        const int pqe = (phase == 0) ? extra_qe : base_qe;
-        const int pks = (phase == 0) ? extra_ks : base_ks;
-        const int pke = (phase == 0) ? extra_ke : base_ke;
-        const int ptyp = (phase == 0) ? extra_typ : base_typ;
-        const int pqlen = pqe - pqs;
-        const int pklen = pke - pks;
-        const int pdelta = pklen - pqlen;
-        const int k_tiles = (pklen + KN - 1) / KN;
-
-        for (int kb = 0; kb < k_tiles; ++kb) {
-            const int n0 = pks + kb * KN;
-
-            for (int chunk = threadIdx.x; chunk < (KN * HD) / 8; chunk += blockDim.x) {
-                const int r = chunk / (HD / 8);
-                const int c = chunk - r * (HD / 8);
-                const int d0 = c * 8;
-                const int kidx = n0 + r;
-                __nv_bfloat16* sptr = kv_s + r * HD + d0;
-
-                if (kidx < pke) {
-                    const __nv_bfloat16* gptr =
-                        k + (int64_t(kidx) * HKV + kvh) * HD + d0;
-                    *reinterpret_cast<uint4*>(sptr) =
-                        *reinterpret_cast<const uint4*>(gptr);
-                } else {
-                    *reinterpret_cast<uint4*>(sptr) = make_uint4(0, 0, 0, 0);
-                }
-            }
-            __syncthreads();
-
-            CFrag qk_frag[4];
+        fence();
 #pragma unroll
-            for (int nt = 0; nt < 4; ++nt) {
-                wmma::fill_fragment(qk_frag[nt], 0.0f);
-            }
+        for (int ds = 0; ds < QK_SLICES; ++ds) {
+            mma_m64n64k16_bf16(
+                score,
+                make_kmajor_64x16_desc(my_q + ds * BLOCK_ELEMS),
+                make_kmajor_64x16_desc(kv_s + ds * BLOCK_ELEMS)
+            );
+        }
+        commit_group();
+        wait_group<0>();
+
+        float local_max0 = -CUDART_INF_F;
+        float local_max1 = -CUDART_INF_F;
 
 #pragma unroll
-            for (int kk0 = 0; kk0 < HD; kk0 += 16) {
-                AFrag af;
-                wmma::load_matrix_sync(
-                    af,
-                    q_s + warp_row0 * HD + kk0,
-                    HD
-                );
-#pragma unroll
-                for (int nt = 0; nt < 4; ++nt) {
-                    BColFrag bf;
-                    wmma::load_matrix_sync(
-                        bf,
-                        kv_s + nt * 16 * HD + kk0,
-                        HD
-                    );
-                    wmma::mma_sync(qk_frag[nt], af, bf, qk_frag[nt]);
-                }
-            }
+        for (int g = 0; g < 8; ++g) {
+            local_max0 = fmaxf(local_max0, score[4*g+0] * softmax_scale);
+            local_max0 = fmaxf(local_max0, score[4*g+1] * softmax_scale);
+            local_max1 = fmaxf(local_max1, score[4*g+2] * softmax_scale);
+            local_max1 = fmaxf(local_max1, score[4*g+3] * softmax_scale);
+        }
+
+        const float tm0 = row4_max(local_max0);
+        const float tm1 = row4_max(local_max1);
+        const float nm0 = fmaxf(m0, tm0);
+        const float nm1 = fmaxf(m1, tm1);
+        const float a0 = (m0 == -CUDART_INF_F) ? 0.0f : __expf(m0 - nm0);
+        const float a1 = (m1 == -CUDART_INF_F) ? 0.0f : __expf(m1 - nm1);
+
+        float sum0 = 0.0f, sum1 = 0.0f;
 
 #pragma unroll
-            for (int nt = 0; nt < 4; ++nt) {
-                wmma::store_matrix_sync(
-                    ws + nt * 16,
-                    qk_frag[nt],
-                    KN,
-                    wmma::mem_row_major
-                );
-            }
-            __syncwarp();
+        for (int g = 0; g < 8; ++g) {
+            const int c0 = frag_col(g, 0);
+            const int c1 = frag_col(g, 1);
 
-            if (lane < 16) {
-                const int rr = row_qidx - pqs;
-                float tile_m = -CUDART_INF_F;
+            const float p00 = __expf(score[4*g+0] * softmax_scale - nm0);
+            const float p01 = __expf(score[4*g+1] * softmax_scale - nm0);
+            const float p10 = __expf(score[4*g+2] * softmax_scale - nm1);
+            const float p11 = __expf(score[4*g+3] * softmax_scale - nm1);
+
+            sum0 += p00 + p01;
+            sum1 += p10 + p11;
+
+            const int s0 = c0 >> 4, kc0 = c0 & 15;
+            const int s1 = c1 >> 4, kc1 = c1 & 15;
+
+            my_p[s0 * BLOCK_ELEMS + canonical_kmajor_offset(row0, kc0)] =
+                __float2bfloat16_rn(p00);
+            my_p[s1 * BLOCK_ELEMS + canonical_kmajor_offset(row0, kc1)] =
+                __float2bfloat16_rn(p01);
+            my_p[s0 * BLOCK_ELEMS + canonical_kmajor_offset(row1, kc0)] =
+                __float2bfloat16_rn(p10);
+            my_p[s1 * BLOCK_ELEMS + canonical_kmajor_offset(row1, kc1)] =
+                __float2bfloat16_rn(p11);
+        }
+
+        l0 = l0 * a0 + row4_sum(sum0);
+        l1 = l1 * a1 + row4_sum(sum1);
+        m0 = nm0;
+        m1 = nm1;
+
+        rescale32(out0, a0, a1);
+        rescale32(out1, a0, a1);
+
+        __syncthreads();
+
+        // Transpose V once into [D, key] canonical B tiles.
+        if (wg == 0) {
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+#pragma unroll
+                for (int ks = 0; ks < PV_SLICES; ++ks) {
+                    int drow, kvec;
+                    canonical_vec_coord(wtid, drow, kvec);
+                    __nv_bfloat16* dst =
+                        kv_s + (half * PV_SLICES + ks) * BLOCK_ELEMS
+                             + wtid * 8;
 
 #pragma unroll
-                for (int j = 0; j < KN; ++j) {
-                    const int kidx = n0 + j;
-                    const int u = kidx - pks;
-                    bool visible =
-                        (row_qidx < base_qe) &&
-                        (row_qidx >= pqs) &&
-                        (row_qidx < pqe) &&
-                        (kidx < pke);
-
-                    if (ptyp == 1) {
-                        visible = visible && (u <= rr + pdelta);
-                    } else if (ptyp == 2) {
-                        visible = visible && (u >= rr);
-                    } else if (ptyp == 3) {
-                        visible = visible && (u >= rr) && (u <= rr + pdelta);
-                    }
-
-                    if (visible) {
-                        tile_m = fmaxf(tile_m, ws[lane * KN + j] * softmax_scale);
+                    for (int e = 0; e < 8; ++e) {
+                        const int key = key0 + ks * 16 + kvec * 8 + e;
+                        const int d = half * 64 + drow;
+                        dst[e] = v[int64_t(key) * HD12 + d];
                     }
                 }
-
-                const float m_new = fmaxf(row_m, tile_m);
-                const float alpha =
-                    (row_m == -CUDART_INF_F) ? 0.0f : __expf(row_m - m_new);
-                float tile_l = 0.0f;
-
-#pragma unroll
-                for (int j = 0; j < KN; ++j) {
-                    const int kidx = n0 + j;
-                    const int u = kidx - pks;
-                    bool visible =
-                        (row_qidx < base_qe) &&
-                        (row_qidx >= pqs) &&
-                        (row_qidx < pqe) &&
-                        (kidx < pke);
-
-                    if (ptyp == 1) {
-                        visible = visible && (u <= rr + pdelta);
-                    } else if (ptyp == 2) {
-                        visible = visible && (u >= rr);
-                    } else if (ptyp == 3) {
-                        visible = visible && (u >= rr) && (u <= rr + pdelta);
-                    }
-
-                    float p = 0.0f;
-                    if (visible) {
-                        p = __expf(ws[lane * KN + j] * softmax_scale - m_new);
-                        tile_l += p;
-                    }
-                    wp[lane * KN + j] = __float2bfloat16_rn(p);
-                }
-
-                alpha_s[warp * 16 + lane] = alpha;
-                row_l = row_l * alpha + tile_l;
-                row_m = m_new;
             }
-            __syncwarp();
-
-            for (int t = lane; t < OUT_ELEMS_PER_WARP; t += 32) {
-                const int r = t / HD;
-                wo[t] *= alpha_s[warp * 16 + r];
-            }
-            __syncwarp();
-
-            __syncthreads();
-            for (int chunk = threadIdx.x; chunk < (KN * HD) / 8; chunk += blockDim.x) {
-                const int r = chunk / (HD / 8);
-                const int c = chunk - r * (HD / 8);
-                const int d0 = c * 8;
-                const int kidx = n0 + r;
-                __nv_bfloat16* sptr = kv_s + r * HD + d0;
-
-                if (kidx < pke) {
-                    const __nv_bfloat16* gptr =
-                        v + (int64_t(kidx) * HKV + kvh) * HD + d0;
-                    *reinterpret_cast<uint4*>(sptr) =
-                        *reinterpret_cast<const uint4*>(gptr);
-                } else {
-                    *reinterpret_cast<uint4*>(sptr) = make_uint4(0, 0, 0, 0);
-                }
-            }
-            __syncthreads();
-
-            CFrag out_frag[8];
-#pragma unroll
-            for (int dt = 0; dt < 8; ++dt) {
-                wmma::load_matrix_sync(
-                    out_frag[dt],
-                    wo + dt * 16,
-                    HD,
-                    wmma::mem_row_major
-                );
-            }
-
-#pragma unroll
-            for (int pk = 0; pk < KN; pk += 16) {
-                AFrag pf;
-                wmma::load_matrix_sync(pf, wp + pk, KN);
-
-#pragma unroll
-                for (int dt = 0; dt < 8; ++dt) {
-                    BRowFrag vf;
-                    wmma::load_matrix_sync(
-                        vf,
-                        kv_s + pk * HD + dt * 16,
-                        HD
-                    );
-                    wmma::mma_sync(
-                        out_frag[dt],
-                        pf,
-                        vf,
-                        out_frag[dt]
-                    );
-                }
-            }
-
-#pragma unroll
-            for (int dt = 0; dt < 8; ++dt) {
-                wmma::store_matrix_sync(
-                    wo + dt * 16,
-                    out_frag[dt],
-                    HD,
-                    wmma::mem_row_major
-                );
-            }
-            __syncthreads();
         }
+        __syncthreads();
+
+        fence();
+#pragma unroll
+        for (int ks = 0; ks < PV_SLICES; ++ks) {
+            mma_m64n64k16_bf16(
+                out0,
+                make_kmajor_64x16_desc(my_p + ks * BLOCK_ELEMS),
+                make_kmajor_64x16_desc(kv_s + ks * BLOCK_ELEMS)
+            );
+        }
+        commit_group();
+        wait_group<0>();
+
+        fence();
+#pragma unroll
+        for (int ks = 0; ks < PV_SLICES; ++ks) {
+            mma_m64n64k16_bf16(
+                out1,
+                make_kmajor_64x16_desc(my_p + ks * BLOCK_ELEMS),
+                make_kmajor_64x16_desc(kv_s + (PV_SLICES + ks) * BLOCK_ELEMS)
+            );
+        }
+        commit_group();
+        wait_group<0>();
+
+        __syncthreads();
     }
 
-    if (lane < 16) {
-        float denom = row_l;
+    float denom0 = l0;
+    float denom1 = l1;
 #pragma unroll
-        for (int s = 0; s < NSINK; ++s) {
-            denom += __expf(sink[s * HQ + row_qh] - row_m);
-        }
-        alpha_s[warp * 16 + lane] = 1.0f / denom;
+    for (int s = 0; s < NS12; ++s) {
+        denom0 += __expf(sink[s * HQ12 + qh0] - m0);
+        denom1 += __expf(sink[s * HQ12 + qh1] - m1);
     }
-    __syncwarp();
+    const float inv0 = 1.0f / denom0;
+    const float inv1 = 1.0f / denom1;
 
-    for (int t = lane; t < OUT_ELEMS_PER_WARP; t += 32) {
-        const int r = t / HD;
-        const int d = t - r * HD;
-        const int p = warp_row0 + r;
-        const int tok_local = p / G;
-        const int gh = p - tok_local * G;
-        const int qidx = q0 + tok_local;
-        const int qh = kvh * G + gh;
+#pragma unroll
+    for (int g = 0; g < 8; ++g) {
+        const int c0 = frag_col(g, 0);
+        const int c1 = frag_col(g, 1);
 
-        if (qidx < base_qe) {
-            out[(int64_t(qidx) * HQ + qh) * HD + d] =
-                __float2bfloat16_rn(wo[t] * alpha_s[warp * 16 + r]);
-        }
+        out[(int64_t(token) * HQ12 + qh0) * HD12 + c0] =
+            __float2bfloat16_rn(out0[4*g+0] * inv0);
+        out[(int64_t(token) * HQ12 + qh0) * HD12 + c1] =
+            __float2bfloat16_rn(out0[4*g+1] * inv0);
+        out[(int64_t(token) * HQ12 + qh1) * HD12 + c0] =
+            __float2bfloat16_rn(out0[4*g+2] * inv1);
+        out[(int64_t(token) * HQ12 + qh1) * HD12 + c1] =
+            __float2bfloat16_rn(out0[4*g+3] * inv1);
+
+        out[(int64_t(token) * HQ12 + qh0) * HD12 + 64+c0] =
+            __float2bfloat16_rn(out1[4*g+0] * inv0);
+        out[(int64_t(token) * HQ12 + qh0) * HD12 + 64+c1] =
+            __float2bfloat16_rn(out1[4*g+1] * inv0);
+        out[(int64_t(token) * HQ12 + qh1) * HD12 + 64+c0] =
+            __float2bfloat16_rn(out1[4*g+2] * inv1);
+        out[(int64_t(token) * HQ12 + qh1) * HD12 + 64+c1] =
+            __float2bfloat16_rn(out1[4*g+3] * inv1);
     }
 }
 
-
-void launch_overlap8_g4_online(
+inline void launch_g128_wgmma(
     const __nv_bfloat16* q,
     const __nv_bfloat16* k,
     const __nv_bfloat16* v,
-    const int32_t* q_ranges,
-    const int32_t* k_ranges,
-    const int32_t* attn_type_map,
     const float* sink,
     __nv_bfloat16* out,
     float softmax_scale
 ) {
-    constexpr int PM = 128;
-    constexpr int KN = 64;
-    constexpr int W = 8;
-    constexpr int HD = 128;
-    constexpr int TOKEN_M = PM / 4;
-
-    constexpr size_t smem_bytes =
-        PM * HD * sizeof(__nv_bfloat16) +
-        KN * HD * sizeof(__nv_bfloat16) +
-        W * 16 * KN * sizeof(float) +
-        W * 16 * KN * sizeof(__nv_bfloat16) +
-        W * 16 * HD * sizeof(float) +
-        W * 16 * sizeof(float);
+    constexpr int smem_bytes =
+        (2 * QK_SLICES * BLOCK_ELEMS
+       + 2 * PV_SLICES * BLOCK_ELEMS
+       +     QK_SLICES * BLOCK_ELEMS) * sizeof(__nv_bfloat16);
 
     cudaFuncSetAttribute(
-        overlap8_g4_online_wmma,
+        g128_full_wgmma_fwd,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
-        int(smem_bytes)
+        smem_bytes
     );
 
-    dim3 grid((4096 + TOKEN_M - 1) / TOKEN_M + 7, 8, 1);
-    dim3 block(256, 1, 1);
-    overlap8_g4_online_wmma<<<grid, block, smem_bytes>>>(
-        q, k, v,
-        q_ranges, k_ranges, attn_type_map,
-        sink, out, softmax_scale
+    g128_full_wgmma_fwd<<<S12, 256, smem_bytes>>>(
+        q, k, v, sink, out, softmax_scale
     );
 }
 
-} // namespace
+} // namespace wgmma_g128
+
 
 extern "C" void run_kernel(
     const __nv_bfloat16* q,
@@ -1217,7 +1395,7 @@ extern "C" void run_kernel(
 ) {
     static bool printed_build = false;
     if (!printed_build) {
-        fprintf(stderr, "BUILD CUDA_RUNTIME_PACKGQA_ALL12_V2\\n");
+        fprintf(stderr, "BUILD CUDA_SM90A_WGMMA_ALL12_V1\\n");
         printed_build = true;
     }
 
@@ -1227,55 +1405,85 @@ extern "C" void run_kernel(
     const int D = int(head_dim);
     const int N = int(num_slices);
     const int Ns = int(num_sink);
-    const int G = Hq / Hkv;
 
-    // #4: fused base-partition + overlapping FULL slice.
-    if (S == 4096 && Hq == 32 && Hkv == 8 && D == 128 && N == 8 && Ns == 6) {
-        launch_overlap8_g4_online(
-            q, k, v, q_ranges, k_ranges, attn_type_map,
-            sink, output, softmax_scale
+    // #12: one token / CTA, two warpgroups cover all 128 Q heads while K/V
+    // are staged only once.
+    if (
+        S == 8192 && Hq == 128 && Hkv == 1 &&
+        D == 128 && N == 1 && Ns == 4
+    ) {
+        wgmma_g128::launch_g128_wgmma(
+            q, k, v, sink, output, softmax_scale
         );
         return;
     }
 
-    // Dense N=1 cases plus exact #5 overlap collapse.
-    if (N == 1 || (S == 512 && Hq == 16 && Hkv == 8 && D == 128 && N == 2)) {
+    // #1 / #7 / #9: dense N=1 D128.
+    if (N == 1 && D == 128) {
         int causal = 0;
-        int segment_mode = 0;
-
         if (
-            (S == 4096 && Hq == 32 && Hkv == 8 && D == 128) ||
-            (S == 16384 && Hq == 32 && Hkv == 8 && D == 128)
+            (S == 4096 && Hq == 32 && Hkv == 8) ||
+            (S == 16384 && Hq == 32 && Hkv == 8)
         ) {
             causal = 1;
         }
 
-        if (S == 512 && Hq == 16 && Hkv == 8 && D == 128 && N == 2) {
-            segment_mode = 1;
-        }
-
-        launch_dense_packgqa_online(
+        wgmma_attention::launch_dense_wgmma(
             q, k, v, sink, output, softmax_scale,
-            S, Hq, Hkv, G, Ns, causal, segment_mode
+            S, Hq, Hkv, Ns, causal
         );
         return;
     }
 
-    // All remaining scored shapes are disjoint Q partitions. One runtime
-    // kernel interprets one slice per CTA; only HD=64/128 are specialized.
-    if (D == 128) {
-        launch_partition_packgqa_online<128>(
+    // #5 exact overlap2: collapse into three disjoint effective regions.
+    if (
+        S == 512 && Hq == 16 && Hkv == 8 &&
+        D == 128 && N == 2 && Ns == 2
+    ) {
+        wgmma_partition::launch_partition_wgmma<128>(
             q, k, v,
             q_ranges, k_ranges, attn_type_map,
             sink, output, softmax_scale,
-            S, Hq, Hkv, G, N, Ns
+            S, Hq, Hkv, Ns, N,
+            1
         );
-    } else {
-        launch_partition_packgqa_online<64>(
-            q, k, v,
-            q_ranges, k_ranges, attn_type_map,
-            sink, output, softmax_scale,
-            S, Hq, Hkv, G, N, Ns
-        );
+        return;
     }
+
+    // #4: seven base slices + one overlapping extra slice, fused into one
+    // online-softmax state per base Q tile.
+    if (
+        S == 4096 && Hq == 32 && Hkv == 8 &&
+        D == 128 && N == 8 && Ns == 6
+    ) {
+        wgmma_partition::launch_partition_wgmma<128>(
+            q, k, v,
+            q_ranges, k_ranges, attn_type_map,
+            sink, output, softmax_scale,
+            S, Hq, Hkv, Ns, N,
+            2
+        );
+        return;
+    }
+
+    // #10 is the only D64 scored shape.
+    if (D == 64) {
+        wgmma_partition::launch_partition_wgmma<64>(
+            q, k, v,
+            q_ranges, k_ranges, attn_type_map,
+            sink, output, softmax_scale,
+            S, Hq, Hkv, Ns, N,
+            0
+        );
+        return;
+    }
+
+    // #2 / #3 / #6 / #8 / #11.
+    wgmma_partition::launch_partition_wgmma<128>(
+        q, k, v,
+        q_ranges, k_ranges, attn_type_map,
+        sink, output, softmax_scale,
+        S, Hq, Hkv, Ns, N,
+        0
+    );
 }
