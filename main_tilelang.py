@@ -84,7 +84,7 @@ def _build_ffa_kernel(
 
             T.fill(acc_o, 0.0)
             T.fill(logsum, 0.0)
-            T.fill(scores_max, -T.infinity("float32"))
+            T.fill(scores_max, -T.infinity(acc_s.dtype))
 
             for kb in T.Pipelined(T.ceildiv(S, block_N), num_stages=num_stages):
                 T.copy(
@@ -111,23 +111,23 @@ def _build_ffa_kernel(
                         u = kidx - ks
                         delta = (ke - ks) - (qe - qs)
 
-                        q_active = (qidx >= qs) and (qidx < qe)
-                        k_active = (kidx >= ks) and (kidx < ke)
+                        q_active = (qidx >= qs) & (qidx < qe)
+                        k_active = (kidx >= ks) & (kidx < ke)
 
                         mask_ok = (
                             (typ == 0)
-                            or ((typ == 1) and (u <= r + delta))
-                            or ((typ == 2) and (u >= r))
-                            or ((typ == 3) and (u >= r) and (u <= r + delta))
+                            | ((typ == 1) & (u <= r + delta))
+                            | ((typ == 2) & (u >= r))
+                            | ((typ == 3) & (u >= r) & (u <= r + delta))
                         )
 
-                        if q_active and k_active and mask_ok:
+                        if q_active & k_active & mask_ok:
                             mult[i, j] = mult[i, j] + 1.0
 
                     acc_s[i, j] = T.if_then_else(
                         mult[i, j] > 0.0,
                         0.0,
-                        -T.infinity("float32"),
+                        -T.infinity(acc_s.dtype),
                     )
 
                 T.gemm(
@@ -140,7 +140,7 @@ def _build_ffa_kernel(
 
                 # Online softmax.
                 T.copy(scores_max, scores_max_prev)
-                T.fill(scores_max, -T.infinity("float32"))
+                T.fill(scores_max, -T.infinity(acc_s.dtype))
                 T.reduce_max(acc_s, scores_max, dim=1, clear=False)
 
                 for i in T.Parallel(block_M):
