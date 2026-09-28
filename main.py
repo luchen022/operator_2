@@ -30,9 +30,6 @@ _PREFIX_SINK_LSE = None
 _K128_LOG2_SRC = None
 _K128_LOG2 = None
 _K128_LOG2_SCALE = None
-_PREFIX_K_LOG2_SRC = None
-_PREFIX_K_LOG2 = None
-_PREFIX_K_LOG2_SCALE = None
 
 _D64_META_SRC = None
 _D64_Q0 = None
@@ -1848,7 +1845,6 @@ def prefix_packgqa_full_kernel(
     GROUP_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
-    K_PRESCALED: tl.constexpr,
 ):
     pid_t = tl.program_id(0)
     pid_kv = tl.program_id(1)
@@ -1887,10 +1883,7 @@ def prefix_packgqa_full_kernel(
         kk = tl.load(
             K + offs_n[:, None] * stride_kz + pid_kv * stride_kh + offs_d[None, :]
         )
-        if K_PRESCALED:
-            qk = tl.dot(q, tl.trans(kk))
-        else:
-            qk = tl.dot(q, tl.trans(kk)) * (softmax_scale * 1.4426950408889634)
+        qk = tl.dot(q, tl.trans(kk)) * (softmax_scale * 1.4426950408889634)
 
         m_new = tl.maximum(m_i, tl.max(qk, axis=1))
         alpha = tl.where(
@@ -1921,10 +1914,7 @@ def prefix_packgqa_full_kernel(
             mask=mask_n[:, None],
             other=0.0,
         )
-        if K_PRESCALED:
-            qk = tl.dot(q, tl.trans(kk))
-        else:
-            qk = tl.dot(q, tl.trans(kk)) * (softmax_scale * 1.4426950408889634)
+        qk = tl.dot(q, tl.trans(kk)) * (softmax_scale * 1.4426950408889634)
         qk = tl.where(mask_n[None, :], qk, -float("inf"))
 
         m_new = tl.maximum(m_i, tl.max(qk, axis=1))
@@ -2691,13 +2681,12 @@ def run_kernel(
     global _PREFIX_META_SRC, _PREFIX_Q0, _PREFIX_Q1, _PREFIX_KE, _PREFIX_BM, _PREFIX_TILES
     global _PREFIX_SINK_SRC, _PREFIX_SINK_LSE
     global _K128_LOG2_SRC, _K128_LOG2, _K128_LOG2_SCALE
-    global _PREFIX_K_LOG2_SRC, _PREFIX_K_LOG2, _PREFIX_K_LOG2_SCALE
     global _D64_META_SRC, _D64_Q0, _D64_QE, _D64_KS, _D64_KLEN, _D64_R0, _D64_DELTA, _D64_BEND
     global _G8C_META_SRC, _G8C_Q0, _G8C_QE, _G8C_KS, _G8C_KLEN, _G8C_R0, _G8C_DELTA, _G8C_BEND, _G8C_TILES
     global _G8M_META_SRC, _G8M_Q0, _G8M_QE, _G8M_KS, _G8M_KLEN, _G8M_R0, _G8M_LO, _G8M_HI, _G8M_BSTART, _G8M_BEND, _G8M_FSTART, _G8M_FEND, _G8M_TILES
     global _OV8_META_SRC, _OV8_Q0, _OV8_QE, _OV8_KS, _OV8_KLEN, _OV8_R0, _OV8_DELTA, _OV8_BEND, _OV8_FULL
     if not _PRINTED_BUILD:
-        print("BUILD PREFIX_G4_KPRESCALE_FIX_V70")
+        print("BUILD STABLE_94_33_V71")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
@@ -2966,35 +2955,8 @@ def run_kernel(
 
             if use_prefix_packgqa:
                 bn = 64 if G == 4 else 128
-
-                # Exact #8 experiment: K is static across timed groups, so
-                # pre-scale it once into log2-softmax units during warmup.
-                prefix_prescale = (G == 4 and Hq == 8 and Hkv == 2 and S == 4096)
-                k_for_prefix = k
-                if prefix_prescale:
-                    prefix_factor = scale * 1.4426950408889634
-                    if (
-                        _PREFIX_K_LOG2_SRC is not k
-                        or _PREFIX_K_LOG2_SCALE != prefix_factor
-                    ):
-                        _PREFIX_K_LOG2 = torch.empty(
-                            (S, Hkv, D),
-                            dtype=torch.bfloat16,
-                            device=k.device,
-                        )
-                        prescale_k128_log2_kernel[(S * Hkv,)](
-                            k,
-                            _PREFIX_K_LOG2,
-                            prefix_factor,
-                            D=D,
-                            num_warps=4,
-                        )
-                        _PREFIX_K_LOG2_SRC = k
-                        _PREFIX_K_LOG2_SCALE = prefix_factor
-                    k_for_prefix = _PREFIX_K_LOG2
-
                 prefix_packgqa_full_kernel[(_PREFIX_TILES, Hkv)](
-                    q, k_for_prefix, v, output,
+                    q, k, v, output,
                     _PREFIX_Q0, _PREFIX_Q1, _PREFIX_KE,
                     _PREFIX_SINK_LSE,
                     scale,
@@ -3005,7 +2967,6 @@ def run_kernel(
                     GROUP_SIZE=G,
                     BLOCK_N=bn,
                     BLOCK_D=D,
-                    K_PRESCALED=prefix_prescale,
                     num_warps=8,
                     num_stages=4 if bn == 64 else 3,
                 )
