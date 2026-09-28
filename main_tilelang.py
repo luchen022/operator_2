@@ -8,7 +8,9 @@ import tilelang.language as T
 _KERNEL_CACHE = {}
 _FULL9_KERNEL_CACHE = {}
 _SLICE_KERNEL_CACHE = {}
+_PACK_SLICE_KERNEL_CACHE = {}
 _OVERLAP_KERNEL_CACHE = {}
+_PACK_OVERLAP_KERNEL_CACHE = {}
 _META_CACHE = {}
 _PRINTED_BUILD = False
 
@@ -355,6 +357,419 @@ def _get_full9_kernel(scale):
             threads=128,
         )
         _FULL9_KERNEL_CACHE[key] = kernel
+    return kernel
+
+
+PACKED_M = 128
+
+
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+    }
+)
+def _build_static_packgqa_slice_kernel(
+    S,
+    Hq,
+    Hkv,
+    D,
+    Ns,
+    softmax_scale,
+    q_start,
+    q_len,
+    k_start,
+    k_len,
+    attn_type,
+    block_N=64,
+    num_stages=2,
+    threads=128,
+):
+    G = Hq // Hkv
+    token_M = PACKED_M // G
+    q_end = q_start + q_len
+    k_end = k_start + k_len
+    delta = k_len - q_len
+    num_k_blocks = (k_len + block_N - 1) // block_N
+    scale_log2 = softmax_scale * _LOG2E
+    neg_large = -1.0e30
+
+    q_shape = (S, Hq, D)
+    kv_shape = (S, Hkv, D)
+    sink_shape = (Ns, Hq)
+
+    @T.prim_func
+    def kernel(
+        Q: T.Tensor(q_shape, dtype="bfloat16"),
+        K: T.Tensor(kv_shape, dtype="bfloat16"),
+        V: T.Tensor(kv_shape, dtype="bfloat16"),
+        Sink: T.Tensor(sink_shape, dtype="float32"),
+        Out: T.Tensor(q_shape, dtype="bfloat16"),
+    ):
+        with T.Kernel(T.ceildiv(q_len, token_M), Hkv, threads=threads) as (bx, kvh):
+            Q_shared = T.alloc_shared((PACKED_M, D), dtype="bfloat16")
+            K_shared = T.alloc_shared((block_N, D), dtype="bfloat16")
+            V_shared = T.alloc_shared((block_N, D), dtype="bfloat16")
+            O_shared = T.alloc_shared((PACKED_M, D), dtype="bfloat16")
+
+            acc_s = T.alloc_fragment((PACKED_M, block_N), dtype="float32")
+            acc_s_cast = T.alloc_fragment((PACKED_M, block_N), dtype="bfloat16")
+            acc_o = T.alloc_fragment((PACKED_M, D), dtype="float32")
+            scores_max = T.alloc_fragment((PACKED_M,), dtype="float32")
+            scores_max_prev = T.alloc_fragment((PACKED_M,), dtype="float32")
+            scores_scale = T.alloc_fragment((PACKED_M,), dtype="float32")
+            scores_sum = T.alloc_fragment((PACKED_M,), dtype="float32")
+            logsum = T.alloc_fragment((PACKED_M,), dtype="float32")
+
+            for p, d in T.Parallel(PACKED_M, D):
+                tok_local = p // G
+                gh = p - tok_local * G
+                qidx = q_start + bx * token_M + tok_local
+                qh = kvh * G + gh
+                Q_shared[p, d] = T.if_then_else(
+                    qidx < q_end,
+                    Q[qidx, qh, d],
+                    T.Cast("bfloat16", 0.0),
+                )
+
+            T.fill(acc_o, 0.0)
+            T.fill(logsum, 0.0)
+            T.fill(scores_max, neg_large)
+
+            for kb in T.Pipelined(num_k_blocks, num_stages=num_stages):
+                for j, d in T.Parallel(block_N, D):
+                    kidx = k_start + kb * block_N + j
+                    K_shared[j, d] = T.if_then_else(
+                        kidx < k_end,
+                        K[kidx, kvh, d],
+                        T.Cast("bfloat16", 0.0),
+                    )
+
+                for p, j in T.Parallel(PACKED_M, block_N):
+                    tok_local = p // G
+                    qidx = q_start + bx * token_M + tok_local
+                    kidx = k_start + kb * block_N + j
+                    r = qidx - q_start
+                    u = kidx - k_start
+                    valid = (qidx < q_end) & (kidx < k_end)
+
+                    if attn_type == 1:
+                        valid = valid & (u <= r + delta)
+                    elif attn_type == 2:
+                        valid = valid & (u >= r)
+                    elif attn_type == 3:
+                        valid = valid & (u >= r) & (u <= r + delta)
+
+                    acc_s[p, j] = T.if_then_else(valid, 0.0, neg_large)
+
+                T.gemm(
+                    Q_shared,
+                    K_shared,
+                    acc_s,
+                    transpose_B=True,
+                    policy=T.GemmWarpPolicy.FullRow,
+                )
+
+                T.copy(scores_max, scores_max_prev)
+                T.fill(scores_max, neg_large)
+                T.reduce_max(acc_s, scores_max, dim=1, clear=False)
+
+                for p in T.Parallel(PACKED_M):
+                    scores_max[p] = T.max(scores_max[p], scores_max_prev[p])
+                    scores_scale[p] = T.exp2(
+                        (scores_max_prev[p] - scores_max[p]) * scale_log2
+                    )
+
+                for p, j in T.Parallel(PACKED_M, block_N):
+                    tok_local = p // G
+                    qidx = q_start + bx * token_M + tok_local
+                    kidx = k_start + kb * block_N + j
+                    r = qidx - q_start
+                    u = kidx - k_start
+                    valid = (qidx < q_end) & (kidx < k_end)
+
+                    if attn_type == 1:
+                        valid = valid & (u <= r + delta)
+                    elif attn_type == 2:
+                        valid = valid & (u >= r)
+                    elif attn_type == 3:
+                        valid = valid & (u >= r) & (u <= r + delta)
+
+                    acc_s[p, j] = T.if_then_else(
+                        valid,
+                        T.exp2((acc_s[p, j] - scores_max[p]) * scale_log2),
+                        0.0,
+                    )
+
+                T.reduce_sum(acc_s, scores_sum, dim=1)
+                for p in T.Parallel(PACKED_M):
+                    logsum[p] = logsum[p] * scores_scale[p] + scores_sum[p]
+
+                T.copy(acc_s, acc_s_cast)
+
+                for p, d in T.Parallel(PACKED_M, D):
+                    acc_o[p, d] = acc_o[p, d] * scores_scale[p]
+
+                for j, d in T.Parallel(block_N, D):
+                    kidx = k_start + kb * block_N + j
+                    V_shared[j, d] = T.if_then_else(
+                        kidx < k_end,
+                        V[kidx, kvh, d],
+                        T.Cast("bfloat16", 0.0),
+                    )
+
+                T.gemm(
+                    acc_s_cast,
+                    V_shared,
+                    acc_o,
+                    policy=T.GemmWarpPolicy.FullRow,
+                )
+
+            for p in T.Parallel(PACKED_M):
+                tok_local = p // G
+                gh = p - tok_local * G
+                qh = kvh * G + gh
+                for s in T.serial(Ns):
+                    logsum[p] = logsum[p] + T.exp2(
+                        Sink[s, qh] * _LOG2E
+                        - scores_max[p] * scale_log2
+                    )
+
+            for p, d in T.Parallel(PACKED_M, D):
+                acc_o[p, d] = acc_o[p, d] / logsum[p]
+
+            T.copy(acc_o, O_shared)
+
+            for p, d in T.Parallel(PACKED_M, D):
+                tok_local = p // G
+                gh = p - tok_local * G
+                qidx = q_start + bx * token_M + tok_local
+                qh = kvh * G + gh
+                if qidx < q_end:
+                    Out[qidx, qh, d] = O_shared[p, d]
+
+    return kernel
+
+
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+    }
+)
+def _build_static_packgqa_overlap_kernel(
+    S,
+    Hq,
+    Hkv,
+    D,
+    Ns,
+    softmax_scale,
+    q_start,
+    q_len,
+    k_start,
+    k_len,
+    attn_type,
+    extra_q_start,
+    extra_q_len,
+    extra_k_start,
+    extra_k_len,
+    extra_attn_type,
+    block_N=64,
+    num_stages=2,
+    threads=128,
+):
+    G = Hq // Hkv
+    token_M = PACKED_M // G
+    q_end = q_start + q_len
+    k_end = k_start + k_len
+    extra_q_end = extra_q_start + extra_q_len
+    extra_k_end = extra_k_start + extra_k_len
+    delta = k_len - q_len
+    extra_delta = extra_k_len - extra_q_len
+    base_blocks = (k_len + block_N - 1) // block_N
+    extra_blocks = (extra_k_len + block_N - 1) // block_N
+    scale_log2 = softmax_scale * _LOG2E
+    neg_large = -1.0e30
+
+    q_shape = (S, Hq, D)
+    kv_shape = (S, Hkv, D)
+    sink_shape = (Ns, Hq)
+
+    @T.prim_func
+    def kernel(
+        Q: T.Tensor(q_shape, dtype="bfloat16"),
+        K: T.Tensor(kv_shape, dtype="bfloat16"),
+        V: T.Tensor(kv_shape, dtype="bfloat16"),
+        Sink: T.Tensor(sink_shape, dtype="float32"),
+        Out: T.Tensor(q_shape, dtype="bfloat16"),
+    ):
+        with T.Kernel(T.ceildiv(q_len, token_M), Hkv, threads=threads) as (bx, kvh):
+            Q_shared = T.alloc_shared((PACKED_M, D), dtype="bfloat16")
+            K_shared = T.alloc_shared((block_N, D), dtype="bfloat16")
+            V_shared = T.alloc_shared((block_N, D), dtype="bfloat16")
+            O_shared = T.alloc_shared((PACKED_M, D), dtype="bfloat16")
+
+            acc_s = T.alloc_fragment((PACKED_M, block_N), dtype="float32")
+            acc_s_cast = T.alloc_fragment((PACKED_M, block_N), dtype="bfloat16")
+            acc_o = T.alloc_fragment((PACKED_M, D), dtype="float32")
+            scores_max = T.alloc_fragment((PACKED_M,), dtype="float32")
+            scores_max_prev = T.alloc_fragment((PACKED_M,), dtype="float32")
+            scores_scale = T.alloc_fragment((PACKED_M,), dtype="float32")
+            scores_sum = T.alloc_fragment((PACKED_M,), dtype="float32")
+            logsum = T.alloc_fragment((PACKED_M,), dtype="float32")
+
+            for p, d in T.Parallel(PACKED_M, D):
+                tok_local = p // G
+                gh = p - tok_local * G
+                qidx = q_start + bx * token_M + tok_local
+                qh = kvh * G + gh
+                Q_shared[p, d] = T.if_then_else(
+                    qidx < q_end,
+                    Q[qidx, qh, d],
+                    T.Cast("bfloat16", 0.0),
+                )
+
+            T.fill(acc_o, 0.0)
+            T.fill(logsum, 0.0)
+            T.fill(scores_max, neg_large)
+
+            for phase in T.serial(2):
+                phase_k_start = T.if_then_else(phase == 0, extra_k_start, k_start)
+                phase_k_end = T.if_then_else(phase == 0, extra_k_end, k_end)
+                phase_blocks = T.if_then_else(phase == 0, extra_blocks, base_blocks)
+
+                for kb in T.serial(phase_blocks):
+                    for j, d in T.Parallel(block_N, D):
+                        kidx = phase_k_start + kb * block_N + j
+                        K_shared[j, d] = T.if_then_else(
+                            kidx < phase_k_end,
+                            K[kidx, kvh, d],
+                            T.Cast("bfloat16", 0.0),
+                        )
+
+                    for p, j in T.Parallel(PACKED_M, block_N):
+                        tok_local = p // G
+                        qidx = q_start + bx * token_M + tok_local
+                        kidx = phase_k_start + kb * block_N + j
+
+                        base_r = qidx - q_start
+                        base_u = kidx - k_start
+                        base_valid = (qidx < q_end) & (kidx >= k_start) & (kidx < k_end)
+                        if attn_type == 1:
+                            base_valid = base_valid & (base_u <= base_r + delta)
+                        elif attn_type == 2:
+                            base_valid = base_valid & (base_u >= base_r)
+                        elif attn_type == 3:
+                            base_valid = base_valid & (base_u >= base_r) & (base_u <= base_r + delta)
+
+                        extra_r = qidx - extra_q_start
+                        extra_u = kidx - extra_k_start
+                        extra_valid = (
+                            (qidx < q_end)
+                            & (qidx >= extra_q_start)
+                            & (qidx < extra_q_end)
+                            & (kidx >= extra_k_start)
+                            & (kidx < extra_k_end)
+                        )
+                        if extra_attn_type == 1:
+                            extra_valid = extra_valid & (extra_u <= extra_r + extra_delta)
+                        elif extra_attn_type == 2:
+                            extra_valid = extra_valid & (extra_u >= extra_r)
+                        elif extra_attn_type == 3:
+                            extra_valid = extra_valid & (extra_u >= extra_r) & (extra_u <= extra_r + extra_delta)
+
+                        valid = T.if_then_else(phase == 0, extra_valid, base_valid)
+                        acc_s[p, j] = T.if_then_else(valid, 0.0, neg_large)
+
+                    T.gemm(
+                        Q_shared, K_shared, acc_s,
+                        transpose_B=True,
+                        policy=T.GemmWarpPolicy.FullRow,
+                    )
+
+                    T.copy(scores_max, scores_max_prev)
+                    T.fill(scores_max, neg_large)
+                    T.reduce_max(acc_s, scores_max, dim=1, clear=False)
+                    for p in T.Parallel(PACKED_M):
+                        scores_max[p] = T.max(scores_max[p], scores_max_prev[p])
+                        scores_scale[p] = T.exp2(
+                            (scores_max_prev[p] - scores_max[p]) * scale_log2
+                        )
+
+                    for p, j in T.Parallel(PACKED_M, block_N):
+                        tok_local = p // G
+                        qidx = q_start + bx * token_M + tok_local
+                        kidx = phase_k_start + kb * block_N + j
+
+                        base_r = qidx - q_start
+                        base_u = kidx - k_start
+                        base_valid = (qidx < q_end) & (kidx >= k_start) & (kidx < k_end)
+                        if attn_type == 1:
+                            base_valid = base_valid & (base_u <= base_r + delta)
+                        elif attn_type == 2:
+                            base_valid = base_valid & (base_u >= base_r)
+                        elif attn_type == 3:
+                            base_valid = base_valid & (base_u >= base_r) & (base_u <= base_r + delta)
+
+                        extra_r = qidx - extra_q_start
+                        extra_u = kidx - extra_k_start
+                        extra_valid = (
+                            (qidx < q_end)
+                            & (qidx >= extra_q_start)
+                            & (qidx < extra_q_end)
+                            & (kidx >= extra_k_start)
+                            & (kidx < extra_k_end)
+                        )
+                        if extra_attn_type == 1:
+                            extra_valid = extra_valid & (extra_u <= extra_r + extra_delta)
+                        elif extra_attn_type == 2:
+                            extra_valid = extra_valid & (extra_u >= extra_r)
+                        elif extra_attn_type == 3:
+                            extra_valid = extra_valid & (extra_u >= extra_r) & (extra_u <= extra_r + extra_delta)
+
+                        valid = T.if_then_else(phase == 0, extra_valid, base_valid)
+                        acc_s[p, j] = T.if_then_else(
+                            valid,
+                            T.exp2((acc_s[p, j] - scores_max[p]) * scale_log2),
+                            0.0,
+                        )
+
+                    T.reduce_sum(acc_s, scores_sum, dim=1)
+                    for p in T.Parallel(PACKED_M):
+                        logsum[p] = logsum[p] * scores_scale[p] + scores_sum[p]
+                    T.copy(acc_s, acc_s_cast)
+                    for p, d in T.Parallel(PACKED_M, D):
+                        acc_o[p, d] = acc_o[p, d] * scores_scale[p]
+
+                    for j, d in T.Parallel(block_N, D):
+                        kidx = phase_k_start + kb * block_N + j
+                        V_shared[j, d] = T.if_then_else(
+                            kidx < phase_k_end,
+                            V[kidx, kvh, d],
+                            T.Cast("bfloat16", 0.0),
+                        )
+                    T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+
+            for p in T.Parallel(PACKED_M):
+                tok_local = p // G
+                gh = p - tok_local * G
+                qh = kvh * G + gh
+                for s in T.serial(Ns):
+                    logsum[p] = logsum[p] + T.exp2(
+                        Sink[s, qh] * _LOG2E
+                        - scores_max[p] * scale_log2
+                    )
+
+            for p, d in T.Parallel(PACKED_M, D):
+                acc_o[p, d] = acc_o[p, d] / logsum[p]
+
+            T.copy(acc_o, O_shared)
+            for p, d in T.Parallel(PACKED_M, D):
+                tok_local = p // G
+                gh = p - tok_local * G
+                qidx = q_start + bx * token_M + tok_local
+                qh = kvh * G + gh
+                if qidx < q_end:
+                    Out[qidx, qh, d] = O_shared[p, d]
+
     return kernel
 
 
@@ -803,15 +1218,16 @@ def _get_static_slice_kernel(
     key = (
         S, Hq, Hkv, D, Ns, float(scale),
         q_start, q_len, k_start, k_len, attn_type,
+        "pack128",
     )
-    kernel = _SLICE_KERNEL_CACHE.get(key)
+    kernel = _PACK_SLICE_KERNEL_CACHE.get(key)
     if kernel is None:
-        kernel = _build_static_slice_kernel(
+        kernel = _build_static_packgqa_slice_kernel(
             S, Hq, Hkv, D, Ns, float(scale),
             q_start, q_len, k_start, k_len, attn_type,
-            block_M=64, block_N=64, num_stages=2, threads=128,
+            block_N=64, num_stages=2, threads=128,
         )
-        _SLICE_KERNEL_CACHE[key] = kernel
+        _PACK_SLICE_KERNEL_CACHE[key] = kernel
     return kernel
 
 
@@ -824,16 +1240,17 @@ def _get_overlap_kernel(
         S, Hq, Hkv, D, Ns, float(scale),
         q_start, q_len, k_start, k_len, attn_type,
         extra_q_start, extra_q_len, extra_k_start, extra_k_len, extra_attn_type,
+        "pack128",
     )
-    kernel = _OVERLAP_KERNEL_CACHE.get(key)
+    kernel = _PACK_OVERLAP_KERNEL_CACHE.get(key)
     if kernel is None:
-        kernel = _build_overlap_base_kernel(
+        kernel = _build_static_packgqa_overlap_kernel(
             S, Hq, Hkv, D, Ns, float(scale),
             q_start, q_len, k_start, k_len, attn_type,
             extra_q_start, extra_q_len, extra_k_start, extra_k_len, extra_attn_type,
-            block_M=64, block_N=64, num_stages=2, threads=128,
+            block_N=64, num_stages=2, threads=128,
         )
-        _OVERLAP_KERNEL_CACHE[key] = kernel
+        _PACK_OVERLAP_KERNEL_CACHE[key] = kernel
     return kernel
 
 
@@ -993,7 +1410,7 @@ def run_kernel(
 
     global _PRINTED_BUILD
     if not _PRINTED_BUILD:
-        print("BUILD TILELANG_STATIC_ALL12_V4")
+        print("BUILD TILELANG_PACKGQA_ALL12_V5")
         _PRINTED_BUILD = True
 
     # N=1 dense scored cases: metadata is known from the testcase shape, so
