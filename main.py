@@ -142,6 +142,138 @@ def packgqa_full_128_kernel(
     )
 
 
+@triton.jit
+def packgqa_g8_kernel(
+    Q, K, V, Out, sink_ptr,
+    softmax_scale,
+    q_start, q_len, k_start, k_len, num_sink,
+    stride_qz, stride_qh,
+    stride_kz, stride_kh,
+    stride_vz, stride_vh,
+    stride_oz, stride_oh,
+    stride_sink_s, stride_sink_h,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    ATTN_TYPE: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_kv = tl.program_id(1)
+
+    packed = pid_m * 128 + tl.arange(0, 128)
+    tok = packed // GROUP_SIZE
+    gh = packed - tok * GROUP_SIZE
+    qh = pid_kv * GROUP_SIZE + gh
+    offs_m = q_start + tok
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_m = tok < q_len
+
+    q = tl.load(
+        Q + offs_m[:, None] * stride_qz + qh[:, None] * stride_qh + offs_d[None, :],
+        mask=mask_m[:, None],
+        other=0.0,
+    )
+
+    m_i = tl.zeros([128], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([128], dtype=tl.float32)
+    acc = tl.zeros([128, BLOCK_D], dtype=tl.float32)
+
+    tok_first = pid_m * (128 // GROUP_SIZE)
+    tok_last = tl.minimum(tok_first + (128 // GROUP_SIZE), q_len) - 1
+    num_k_blocks = tl.cdiv(k_len, 64)
+
+    if ATTN_TYPE == 0:
+        b_start = 0
+        b_end = num_k_blocks
+    elif ATTN_TYPE == 1:
+        b_start = 0
+        causal_limit = tok_last + (k_len - q_len)
+        b_end = tl.cdiv(causal_limit + 1, 64)
+        b_end = tl.maximum(0, tl.minimum(b_end, num_k_blocks))
+    elif ATTN_TYPE == 2:
+        b_start = tl.maximum(0, tl.minimum(tok_first // 64, num_k_blocks))
+        b_end = num_k_blocks
+    else:
+        b_start = tl.maximum(0, tl.minimum(tok_first // 64, num_k_blocks))
+        causal_limit = tok_last + (k_len - q_len)
+        b_end = tl.cdiv(causal_limit + 1, 64)
+        b_end = tl.maximum(0, tl.minimum(b_end, num_k_blocks))
+
+    for b in range(b_start, b_end):
+        offs_u = b * 64 + tl.arange(0, 64)
+        offs_n = k_start + offs_u
+        mask_n = offs_u < k_len
+
+        k = tl.load(
+            K + offs_n[:, None] * stride_kz + pid_kv * stride_kh + offs_d[None, :],
+            mask=mask_n[:, None],
+            other=0.0,
+        )
+
+        qk = tl.dot(q, tl.trans(k)) * softmax_scale
+        if ATTN_TYPE == 0:
+            vis = mask_m[:, None] & mask_n[None, :]
+        elif ATTN_TYPE == 1:
+            vis = mask_m[:, None] & mask_n[None, :] & (
+                offs_u[None, :] <= (tok[:, None] + (k_len - q_len))
+            )
+        elif ATTN_TYPE == 2:
+            vis = mask_m[:, None] & mask_n[None, :] & (
+                offs_u[None, :] >= tok[:, None]
+            )
+        else:
+            vis = mask_m[:, None] & mask_n[None, :] & (
+                offs_u[None, :] >= tok[:, None]
+            ) & (
+                offs_u[None, :] <= (tok[:, None] + (k_len - q_len))
+            )
+
+        qk = tl.where(vis, qk, -float("inf"))
+        m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+        alpha = tl.where(
+            m_i > -float("inf"),
+            tl.exp2((m_i - m_new) * 1.4426950408889634),
+            0.0,
+        )
+        p = tl.where(
+            vis,
+            tl.exp2((qk - m_new[:, None]) * 1.4426950408889634),
+            0.0,
+        )
+
+        vv = tl.load(
+            V + offs_n[:, None] * stride_vz + pid_kv * stride_vh + offs_d[None, :],
+            mask=mask_n[:, None],
+            other=0.0,
+        )
+
+        acc = acc * alpha[:, None]
+        acc = tl.dot(p.to(tl.bfloat16), vv, acc)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_new
+
+    s = tl.arange(0, 16)
+    smask = s[None, :] < num_sink
+    sv = tl.load(
+        sink_ptr + s[None, :] * stride_sink_s + qh[:, None] * stride_sink_h,
+        mask=mask_m[:, None] & smask,
+        other=-float("inf"),
+    )
+    smax = tl.max(sv, axis=1)
+    ssum = tl.sum(
+        tl.exp2((sv - smax[:, None]) * 1.4426950408889634),
+        axis=1,
+    )
+    slse = smax + tl.log2(ssum) * 0.6931471805599453
+    denom = l_i + tl.exp2((slse - m_i) * 1.4426950408889634)
+    acc = acc / denom[:, None]
+
+    tl.store(
+        Out + offs_m[:, None] * stride_oz + qh[:, None] * stride_oh + offs_d[None, :],
+        acc.to(tl.bfloat16),
+        mask=mask_m[:, None],
+    )
+
+
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=4),
@@ -1112,7 +1244,7 @@ def run_kernel(
     global _PREFIX_META_SRC, _PREFIX_Q0, _PREFIX_Q1, _PREFIX_KE, _PREFIX_BM, _PREFIX_TILES
     global _PREFIX_SINK_SRC, _PREFIX_SINK_LSE
     if not _PRINTED_BUILD:
-        print("BUILD PACKGQA_FULL_V13")
+        print("BUILD PACKGQA_G8_V14")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
@@ -1348,6 +1480,7 @@ def run_kernel(
             )
             return
 
+        G = Hq // Hkv
         i = 0
         while i < N:
             qs = int(_META_Q[i][0])
@@ -1357,20 +1490,38 @@ def run_kernel(
             typ = int(_META_T[i])
             q_len = qe - qs
             k_len = ke - ks
-            grid = lambda META: (triton.cdiv(q_len, META["BLOCK_M"]), Hq)
-            single_slice_fwd_kernel[grid](
-                q, k, v, output, sink,
-                scale,
-                qs, q_len, ks, k_len,
-                Hq, Hkv, D, Ns,
-                Hq * D, D, 1,
-                Hkv * D, D, 1,
-                Hkv * D, D, 1,
-                Hq * D, D, 1,
-                Hq, 1,
-                BLOCK_D=D,
-                ATTN_TYPE=typ,
-            )
+
+            if D == 128 and G == 8:
+                packgqa_g8_kernel[(triton.cdiv(q_len * G, 128), Hkv)](
+                    q, k, v, output, sink,
+                    scale,
+                    qs, q_len, ks, k_len, Ns,
+                    Hq * D, D,
+                    Hkv * D, D,
+                    Hkv * D, D,
+                    Hq * D, D,
+                    Hq, 1,
+                    GROUP_SIZE=G,
+                    BLOCK_D=D,
+                    ATTN_TYPE=typ,
+                    num_warps=8,
+                    num_stages=4,
+                )
+            else:
+                grid = lambda META: (triton.cdiv(q_len, META["BLOCK_M"]), Hq)
+                single_slice_fwd_kernel[grid](
+                    q, k, v, output, sink,
+                    scale,
+                    qs, q_len, ks, k_len,
+                    Hq, Hkv, D, Ns,
+                    Hq * D, D, 1,
+                    Hkv * D, D, 1,
+                    Hkv * D, D, 1,
+                    Hq * D, D, 1,
+                    Hq, 1,
+                    BLOCK_D=D,
+                    ATTN_TYPE=typ,
+                )
             i += 1
         return
 
