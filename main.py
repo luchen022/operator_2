@@ -509,7 +509,7 @@ def single_full_g1_d128_tma_ws_kernel(
 
     # Hopper FULL-attention path: tensor-descriptor loads + warp-specialized
     # loop allow the compiler to overlap K/V TMA traffic with QK/PV compute.
-    for start_n in tl.range(0, 2048, 64, warp_specialize=True):
+    for start_n in tl.range(0, 2048, 64):
         start_n = tl.multiple_of(start_n, 64)
 
         kk = k_desc.load([start_n, 0])
@@ -2770,7 +2770,7 @@ def run_kernel(
     global _G8M_META_SRC, _G8M_Q0, _G8M_QE, _G8M_KS, _G8M_KLEN, _G8M_R0, _G8M_LO, _G8M_HI, _G8M_BSTART, _G8M_BEND, _G8M_FSTART, _G8M_FEND, _G8M_TILES
     global _OV8_META_SRC, _OV8_Q0, _OV8_QE, _OV8_KS, _OV8_KLEN, _OV8_R0, _OV8_DELTA, _OV8_BEND, _OV8_FULL
     if not _PRINTED_BUILD:
-        print("BUILD HOPPER_TMA_WS_G1_V72")
+        print("BUILD HOPPER_TMA_G1_V73")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
@@ -2900,8 +2900,8 @@ def run_kernel(
                     Hkv * D, D,
                     Hkv * D, D,
                     Hq * D, D,
-                    num_warps=4,
-                    num_stages=2,
+                    num_warps=8,
+                    num_stages=4,
                 )
                 return
 
