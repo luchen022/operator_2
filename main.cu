@@ -539,7 +539,7 @@ void dense_packgqa_online_wmma(
     }
 
     int k_tiles = SEQ / KN;
-    if constexpr (CAUSAL) {
+    if (CAUSAL) {
         const int max_q = token0 + TOKEN_M - 1;
         k_tiles = (max_q + 1 + KN - 1) / KN;
     }
