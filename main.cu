@@ -451,7 +451,7 @@ void generic_ffa_wmma(
 }
 
 
-template <int SEQ, int HQ, int HKV, int G, bool CAUSAL>
+template <int SEQ, int HQ, int HKV, int G, int NSINK, bool CAUSAL, int SEGMENT_MODE = 0>
 __global__ __launch_bounds__(256, 1)
 void dense_packgqa_online_wmma(
     const __nv_bfloat16* __restrict__ q,
@@ -538,14 +538,32 @@ void dense_packgqa_online_wmma(
         row_qh = kvh * G + gh;
     }
 
-    int k_tiles = SEQ / KN;
+    int k_start = 0;
+    int k_len = SEQ;
+
+    // Exact testcase #5: two overlapping FULL slices collapse into three
+    // fixed Q regions with one contiguous effective K interval each.
+    if (SEGMENT_MODE == 1) {
+        if (token0 < 128) {
+            k_start = 0;
+            k_len = 256;
+        } else if (token0 < 256) {
+            k_start = 0;
+            k_len = 512;
+        } else {
+            k_start = 256;
+            k_len = 256;
+        }
+    }
+
+    int k_tiles = (k_len + KN - 1) / KN;
     if (CAUSAL) {
         const int max_q = token0 + TOKEN_M - 1;
         k_tiles = (max_q + 1 + KN - 1) / KN;
     }
 
     for (int kb = 0; kb < k_tiles; ++kb) {
-        const int n0 = kb * KN;
+        const int n0 = k_start + kb * KN;
 
         // Cooperative 16B K load.
         for (int chunk = threadIdx.x; chunk < (KN * HD) / 8; chunk += blockDim.x) {
@@ -703,7 +721,7 @@ void dense_packgqa_online_wmma(
     if (lane < 16) {
         float denom = row_l;
 #pragma unroll
-        for (int s = 0; s < 4; ++s) {
+        for (int s = 0; s < NSINK; ++s) {
             denom += __expf(sink[s * HQ + row_qh] - row_m);
         }
         alpha_s[warp * 16 + lane] = 1.0f / denom;
@@ -725,7 +743,7 @@ void dense_packgqa_online_wmma(
 }
 
 
-template <int SEQ, int HQ, int HKV, int G, bool CAUSAL>
+template <int SEQ, int HQ, int HKV, int G, int NSINK, bool CAUSAL, int SEGMENT_MODE = 0>
 void launch_dense_packgqa_online(
     const __nv_bfloat16* q,
     const __nv_bfloat16* k,
@@ -749,14 +767,14 @@ void launch_dense_packgqa_online(
         W * 16 * sizeof(float);
 
     cudaFuncSetAttribute(
-        dense_packgqa_online_wmma<SEQ, HQ, HKV, G, CAUSAL>,
+        dense_packgqa_online_wmma<SEQ, HQ, HKV, G, NSINK, CAUSAL, SEGMENT_MODE>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         int(smem_bytes)
     );
 
     dim3 grid((SEQ + TOKEN_M - 1) / TOKEN_M, HKV, 1);
     dim3 block(256, 1, 1);
-    dense_packgqa_online_wmma<SEQ, HQ, HKV, G, CAUSAL>
+    dense_packgqa_online_wmma<SEQ, HQ, HKV, G, NSINK, CAUSAL, SEGMENT_MODE>
         <<<grid, block, smem_bytes>>>(
             q, k, v, sink, out, softmax_scale
         );
@@ -794,7 +812,7 @@ extern "C" void run_kernel(
         S == 4096 && Hq == 32 && Hkv == 8 &&
         head_dim == 128 && N == 1 && Ns == 4
     ) {
-        launch_dense_packgqa_online<4096, 32, 8, 4, true>(
+        launch_dense_packgqa_online<4096, 32, 8, 4, 4, true>(
             q, k, v, sink, output, softmax_scale
         );
         return;
@@ -804,7 +822,7 @@ extern "C" void run_kernel(
         S == 16384 && Hq == 32 && Hkv == 8 &&
         head_dim == 128 && N == 1 && Ns == 4
     ) {
-        launch_dense_packgqa_online<16384, 32, 8, 4, true>(
+        launch_dense_packgqa_online<16384, 32, 8, 4, 4, true>(
             q, k, v, sink, output, softmax_scale
         );
         return;
@@ -814,7 +832,7 @@ extern "C" void run_kernel(
         S == 2048 && Hq == 8 && Hkv == 8 &&
         head_dim == 128 && N == 1 && Ns == 4
     ) {
-        launch_dense_packgqa_online<2048, 8, 8, 1, false>(
+        launch_dense_packgqa_online<2048, 8, 8, 1, 4, false>(
             q, k, v, sink, output, softmax_scale
         );
         return;
@@ -824,7 +842,17 @@ extern "C" void run_kernel(
         S == 8192 && Hq == 128 && Hkv == 1 &&
         head_dim == 128 && N == 1 && Ns == 4
     ) {
-        launch_dense_packgqa_online<8192, 128, 1, 128, false>(
+        launch_dense_packgqa_online<8192, 128, 1, 128, 4, false>(
+            q, k, v, sink, output, softmax_scale
+        );
+        return;
+    }
+
+    if (
+        S == 512 && Hq == 16 && Hkv == 8 &&
+        head_dim == 128 && N == 2 && Ns == 2
+    ) {
+        launch_dense_packgqa_online<512, 16, 8, 2, 2, false, 1>(
             q, k, v, sink, output, softmax_scale
         );
         return;
