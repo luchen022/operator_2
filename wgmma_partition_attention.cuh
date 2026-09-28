@@ -178,7 +178,7 @@ void partition_wgmma_fwd(
     __shared__ __align__(128) __nv_bfloat16 kv_s[DS * P_BLOCK_ELEMS];
     __shared__ __align__(128) __nv_bfloat16 p_s[4 * P_BLOCK_ELEMS];
 
-    __shared__ int meta[7];
+    __shared__ int meta[12];
 
     const int token_M = M / G;
 
@@ -211,7 +211,8 @@ void partition_wgmma_fwd(
                 prefix += nt;
             }
         } else {
-            for (int s = 0; s < NumSlices; ++s) {
+            const int scan_slices = (special_mode == 2) ? (NumSlices - 1) : NumSlices;
+            for (int s = 0; s < scan_slices; ++s) {
                 const int sqs = q_ranges[2*s + 0];
                 const int sqe = q_ranges[2*s + 1];
                 const int sks = k_ranges[2*s + 0];
@@ -239,6 +240,17 @@ void partition_wgmma_fwd(
         meta[4] = ks;
         meta[5] = ke;
         meta[6] = typ;
+
+        if (special_mode == 2) {
+            const int e = NumSlices - 1;
+            meta[7]  = q_ranges[2*e + 0];
+            meta[8]  = q_ranges[2*e + 1];
+            meta[9]  = k_ranges[2*e + 0];
+            meta[10] = k_ranges[2*e + 1];
+            meta[11] = attn_type_map[e];
+        } else {
+            meta[7] = meta[8] = meta[9] = meta[10] = meta[11] = 0;
+        }
     }
     __syncthreads();
 
@@ -275,13 +287,22 @@ void partition_wgmma_fwd(
     float l0 = 0.0f;
     float l1 = 0.0f;
 
-    const int k_blocks = (ke - ks + N - 1) / N;
+    const int phases = (special_mode == 2) ? 2 : 1;
 
-    for (int kb = 0; kb < k_blocks; ++kb) {
-        const int key0 = ks + kb * N;
+    for (int phase = 0; phase < phases; ++phase) {
+        const int pqs = (special_mode == 2 && phase == 0) ? meta[7]  : qs;
+        const int pqe = (special_mode == 2 && phase == 0) ? meta[8]  : qe;
+        const int pks = (special_mode == 2 && phase == 0) ? meta[9]  : ks;
+        const int pke = (special_mode == 2 && phase == 0) ? meta[10] : ke;
+        const int ptyp= (special_mode == 2 && phase == 0) ? meta[11] : typ;
 
-        stage_k<HD>(k, kv_s, key0, ke, kvh, Hkv);
-        __syncthreads();
+        const int k_blocks = (pke - pks + N - 1) / N;
+
+        for (int kb = 0; kb < k_blocks; ++kb) {
+            const int key0 = pks + kb * N;
+
+            stage_k<HD>(k, kv_s, key0, pke, kvh, Hkv);
+            __syncthreads();
 
         float score[32];
         zero32<HD>(score);
@@ -306,14 +327,14 @@ void partition_wgmma_fwd(
             const int c0 = frag_col(g, 0);
             const int c1 = frag_col(g, 1);
 
-            if (mask_visible(typ, qidx0, key0+c0, qs, qe, ks, ke))
+            if (mask_visible(ptyp, qidx0, key0+c0, pqs, pqe, pks, pke))
                 local_max0 = fmaxf(local_max0, score[4*g+0] * softmax_scale);
-            if (mask_visible(typ, qidx0, key0+c1, qs, qe, ks, ke))
+            if (mask_visible(ptyp, qidx0, key0+c1, pqs, pqe, pks, pke))
                 local_max0 = fmaxf(local_max0, score[4*g+1] * softmax_scale);
 
-            if (mask_visible(typ, qidx1, key0+c0, qs, qe, ks, ke))
+            if (mask_visible(ptyp, qidx1, key0+c0, pqs, pqe, pks, pke))
                 local_max1 = fmaxf(local_max1, score[4*g+2] * softmax_scale);
-            if (mask_visible(typ, qidx1, key0+c1, qs, qe, ks, ke))
+            if (mask_visible(ptyp, qidx1, key0+c1, pqs, pqe, pks, pke))
                 local_max1 = fmaxf(local_max1, score[4*g+3] * softmax_scale);
         }
 
@@ -334,19 +355,19 @@ void partition_wgmma_fwd(
 
             float p00 = 0.0f, p01 = 0.0f, p10 = 0.0f, p11 = 0.0f;
 
-            if (mask_visible(typ, qidx0, key0+c0, qs, qe, ks, ke)) {
+            if (mask_visible(ptyp, qidx0, key0+c0, pqs, pqe, pks, pke)) {
                 p00 = __expf(score[4*g+0] * softmax_scale - nm0);
                 sum0 += p00;
             }
-            if (mask_visible(typ, qidx0, key0+c1, qs, qe, ks, ke)) {
+            if (mask_visible(ptyp, qidx0, key0+c1, pqs, pqe, pks, pke)) {
                 p01 = __expf(score[4*g+1] * softmax_scale - nm0);
                 sum0 += p01;
             }
-            if (mask_visible(typ, qidx1, key0+c0, qs, qe, ks, ke)) {
+            if (mask_visible(ptyp, qidx1, key0+c0, pqs, pqe, pks, pke)) {
                 p10 = __expf(score[4*g+2] * softmax_scale - nm1);
                 sum1 += p10;
             }
-            if (mask_visible(typ, qidx1, key0+c1, qs, qe, ks, ke)) {
+            if (mask_visible(ptyp, qidx1, key0+c1, pqs, pqe, pks, pke)) {
                 p11 = __expf(score[4*g+3] * softmax_scale - nm1);
                 sum1 += p11;
             }
@@ -373,7 +394,7 @@ void partition_wgmma_fwd(
         if (HD == 128) rescale32(out1, a0, a1);
 
         __syncthreads();
-        stage_vt<HD>(v, kv_s, key0, ke, kvh, Hkv);
+        stage_vt<HD>(v, kv_s, key0, pke, kvh, Hkv);
         __syncthreads();
 
         fence();
@@ -402,7 +423,8 @@ void partition_wgmma_fwd(
             wait_group<0>();
         }
 
-        __syncthreads();
+            __syncthreads();
+        }
     }
 
     if (qidx0 < qe) {
@@ -479,6 +501,9 @@ inline void launch_partition_wgmma(
         grid_x = (128 + token_M - 1) / token_M
                + (128 + token_M - 1) / token_M
                + (256 + token_M - 1) / token_M;
+    } else if (special_mode == 2) {
+        // Seven base slices partition Q; final slice is folded into each base CTA.
+        grid_x = (S + token_M - 1) / token_M + (NumSlices - 1);
     }
     dim3 grid(grid_x, Hkv, 1);
     partition_wgmma_fwd<HD><<<grid, 128>>>(
