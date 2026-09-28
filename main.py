@@ -453,6 +453,16 @@ def packgqa_g8_kernel(
     )
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=3),
+    ],
+    key=["q_len", "k_len", "head_dim", "ATTN_TYPE"],
+)
 @triton.jit
 def single_slice_fwd_kernel(
     Q, K, V, Out, sink_ptr,
@@ -2380,7 +2390,7 @@ def run_kernel(
     global _G8M_META_SRC, _G8M_Q0, _G8M_QE, _G8M_KS, _G8M_KLEN, _G8M_R0, _G8M_LO, _G8M_HI, _G8M_BSTART, _G8M_BEND, _G8M_TILES
     global _OV8_META_SRC, _OV8_Q0, _OV8_QE, _OV8_KS, _OV8_KLEN, _OV8_R0, _OV8_DELTA, _OV8_BEND, _OV8_FULL
     if not _PRINTED_BUILD:
-        print("BUILD MASK_FRONTIER_FASTPATH_V54")
+        print("BUILD MASK_FRONTIER_FASTPATH_FIX9_V55")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
