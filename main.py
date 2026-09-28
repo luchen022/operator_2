@@ -969,6 +969,93 @@ def build_prefix_meta_kernel(
 
 
 @triton.jit
+def prefix_packgqa_full_kernel(
+    Q, K, V, Out,
+    Q0_META, Q1_META, KE_META,
+    SINK_LSE,
+    softmax_scale,
+    stride_qz, stride_qh,
+    stride_kz, stride_kh,
+    stride_vz, stride_vh,
+    stride_oz, stride_oh,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid_t = tl.program_id(0)
+    pid_kv = tl.program_id(1)
+
+    q0 = tl.load(Q0_META + pid_t).to(tl.int32)
+    q1 = tl.load(Q1_META + pid_t).to(tl.int32)
+    ke = tl.load(KE_META + pid_t).to(tl.int32)
+
+    packed = tl.arange(0, 128)
+    tok_local = packed // GROUP_SIZE
+    gh = packed - tok_local * GROUP_SIZE
+    qh = pid_kv * GROUP_SIZE + gh
+
+    offs_m = q0 + tok_local
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_m = offs_m < q1
+
+    q = tl.load(
+        Q + offs_m[:, None] * stride_qz + qh[:, None] * stride_qh + offs_d[None, :],
+        mask=mask_m[:, None],
+        other=0.0,
+    )
+
+    m_i = tl.zeros([128], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([128], dtype=tl.float32)
+    acc = tl.zeros([128, BLOCK_D], dtype=tl.float32)
+
+    for start_n in range(0, ke, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < ke
+
+        k = tl.load(
+            K + offs_n[:, None] * stride_kz + pid_kv * stride_kh + offs_d[None, :],
+            mask=mask_n[:, None],
+            other=0.0,
+        )
+        qk = tl.dot(q, tl.trans(k)) * softmax_scale
+        vis = mask_m[:, None] & mask_n[None, :]
+        qk = tl.where(vis, qk, -float("inf"))
+
+        m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+        alpha = tl.where(
+            m_i > -float("inf"),
+            tl.exp2((m_i - m_new) * 1.4426950408889634),
+            0.0,
+        )
+        p = tl.where(
+            vis,
+            tl.exp2((qk - m_new[:, None]) * 1.4426950408889634),
+            0.0,
+        )
+
+        vv = tl.load(
+            V + offs_n[:, None] * stride_vz + pid_kv * stride_vh + offs_d[None, :],
+            mask=mask_n[:, None],
+            other=0.0,
+        )
+
+        acc = acc * alpha[:, None]
+        acc = tl.dot(p.to(tl.bfloat16), vv, acc)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_new
+
+    sink_lse = tl.load(SINK_LSE + qh, mask=mask_m, other=-float("inf")).to(tl.float32)
+    denom = l_i + tl.exp2((sink_lse - m_i) * 1.4426950408889634)
+    acc = acc / denom[:, None]
+
+    tl.store(
+        Out + offs_m[:, None] * stride_oz + qh[:, None] * stride_oh + offs_d[None, :],
+        acc.to(tl.bfloat16),
+        mask=mask_m[:, None],
+    )
+
+
+@triton.jit
 def prefix_full_fwd_kernel(
     Q, K, V, Out,
     Q0_META, Q1_META, KE_META,
@@ -1244,7 +1331,7 @@ def run_kernel(
     global _PREFIX_META_SRC, _PREFIX_Q0, _PREFIX_Q1, _PREFIX_KE, _PREFIX_BM, _PREFIX_TILES
     global _PREFIX_SINK_SRC, _PREFIX_SINK_LSE
     if not _PRINTED_BUILD:
-        print("BUILD PACKGQA_G8_V14")
+        print("BUILD PREFIX_PACKGQA_V15")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
@@ -1391,8 +1478,15 @@ def run_kernel(
                 i += 1
 
         if prefix_full:
-            # Low-head case needs more CTAs; high-head case favors a larger M tile.
-            bm = 32 if Hq <= 8 else 64
+            G = Hq // Hkv
+            use_prefix_packgqa = (G == 4 or G == 8)
+
+            if use_prefix_packgqa:
+                # Keep the packed M tile at 128 rows.
+                bm = 128 // G
+            else:
+                bm = 32 if Hq <= 8 else 64
+
             if _PREFIX_META_SRC is not q_ranges or _PREFIX_BM != bm:
                 tile_count = 0
                 i = 0
@@ -1431,23 +1525,41 @@ def run_kernel(
                 )
                 _PREFIX_SINK_SRC = sink
 
-            bn = 64 if Hq <= 8 else 128
-            prefix_full_fwd_kernel[(_PREFIX_TILES, Hq)](
-                q, k, v, output,
-                _PREFIX_Q0, _PREFIX_Q1, _PREFIX_KE,
-                _PREFIX_SINK_LSE,
-                scale,
-                Hq, Hkv,
-                Hq * D, D,
-                Hkv * D, D,
-                Hkv * D, D,
-                Hq * D, D,
-                BLOCK_M=bm,
-                BLOCK_N=bn,
-                BLOCK_D=D,
-                num_warps=4 if bm == 32 else 8,
-                num_stages=4 if bn == 64 else 3,
-            )
+            if use_prefix_packgqa:
+                bn = 64 if G == 4 else 128
+                prefix_packgqa_full_kernel[(_PREFIX_TILES, Hkv)](
+                    q, k, v, output,
+                    _PREFIX_Q0, _PREFIX_Q1, _PREFIX_KE,
+                    _PREFIX_SINK_LSE,
+                    scale,
+                    Hq * D, D,
+                    Hkv * D, D,
+                    Hkv * D, D,
+                    Hq * D, D,
+                    GROUP_SIZE=G,
+                    BLOCK_N=bn,
+                    BLOCK_D=D,
+                    num_warps=8,
+                    num_stages=4 if bn == 64 else 3,
+                )
+            else:
+                bn = 64 if Hq <= 8 else 128
+                prefix_full_fwd_kernel[(_PREFIX_TILES, Hq)](
+                    q, k, v, output,
+                    _PREFIX_Q0, _PREFIX_Q1, _PREFIX_KE,
+                    _PREFIX_SINK_LSE,
+                    scale,
+                    Hq, Hkv,
+                    Hq * D, D,
+                    Hkv * D, D,
+                    Hkv * D, D,
+                    Hq * D, D,
+                    BLOCK_M=bm,
+                    BLOCK_N=bn,
+                    BLOCK_D=D,
+                    num_warps=4 if bm == 32 else 8,
+                    num_stages=4 if bn == 64 else 3,
+                )
             return
 
         use_fused_partition = False
