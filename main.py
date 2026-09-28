@@ -27,6 +27,15 @@ _PREFIX_BM = 0
 _PREFIX_TILES = 0
 _PREFIX_SINK_SRC = None
 _PREFIX_SINK_LSE = None
+_SCHED_META_SRC = None
+_SCHED_BM = 0
+_SCHED_TILES = 0
+_SCHED_Q0 = None
+_SCHED_QS = None
+_SCHED_QE = None
+_SCHED_KS = None
+_SCHED_KE = None
+_SCHED_TYP = None
 
 
 @triton.jit
@@ -1055,6 +1064,186 @@ def build_sink_lse_kernel(
 
 
 @triton.jit
+def build_sched_meta_kernel(
+    q_ranges_ptr, k_ranges_ptr, attn_type_map_ptr,
+    Q0_META, QS_META, QE_META, KS_META, KE_META, T_META,
+    BLOCK_M: tl.constexpr,
+    NUM_SLICES: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    prefix = 0
+    q0_sel = 0
+    qs_sel = 0
+    qe_sel = 0
+    ks_sel = 0
+    ke_sel = 0
+    t_sel = 0
+
+    for sidx in tl.static_range(0, NUM_SLICES):
+        qs = tl.load(q_ranges_ptr + sidx * 2).to(tl.int32)
+        qe = tl.load(q_ranges_ptr + sidx * 2 + 1).to(tl.int32)
+        ks = tl.load(k_ranges_ptr + sidx * 2).to(tl.int32)
+        ke = tl.load(k_ranges_ptr + sidx * 2 + 1).to(tl.int32)
+        typ = tl.load(attn_type_map_ptr + sidx).to(tl.int32)
+
+        nblocks = tl.cdiv(qe - qs, BLOCK_M)
+        hit = (pid >= prefix) & (pid < prefix + nblocks)
+        local = pid - prefix
+        q0 = qs + local * BLOCK_M
+
+        q0_sel = tl.where(hit, q0, q0_sel)
+        qs_sel = tl.where(hit, qs, qs_sel)
+        qe_sel = tl.where(hit, qe, qe_sel)
+        ks_sel = tl.where(hit, ks, ks_sel)
+        ke_sel = tl.where(hit, ke, ke_sel)
+        t_sel = tl.where(hit, typ, t_sel)
+        prefix += nblocks
+
+    tl.store(Q0_META + pid, q0_sel)
+    tl.store(QS_META + pid, qs_sel)
+    tl.store(QE_META + pid, qe_sel)
+    tl.store(KS_META + pid, ks_sel)
+    tl.store(KE_META + pid, ke_sel)
+    tl.store(T_META + pid, t_sel)
+
+
+@triton.jit
+def persistent_packgqa_sched_kernel(
+    Q, K, V, Out, sink_ptr,
+    Q0_META, QS_META, QE_META, KS_META, KE_META, T_META,
+    softmax_scale, num_sink, total_tasks,
+    stride_qz, stride_qh,
+    stride_kz, stride_kh,
+    stride_vz, stride_vh,
+    stride_oz, stride_oh,
+    stride_sink_s, stride_sink_h,
+    HKV: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    task = tl.program_id(0)
+    task_stride = tl.num_programs(0)
+    offs_d = tl.arange(0, BLOCK_D)
+    packed = tl.arange(0, 128)
+    tok_local = packed // GROUP_SIZE
+    gh = packed - tok_local * GROUP_SIZE
+
+    while task < total_tasks:
+        pid_t = task // HKV
+        pid_kv = task - pid_t * HKV
+
+        q0 = tl.load(Q0_META + pid_t).to(tl.int32)
+        qs = tl.load(QS_META + pid_t).to(tl.int32)
+        qe = tl.load(QE_META + pid_t).to(tl.int32)
+        ks = tl.load(KS_META + pid_t).to(tl.int32)
+        ke = tl.load(KE_META + pid_t).to(tl.int32)
+        typ = tl.load(T_META + pid_t).to(tl.int32)
+
+        q_len = qe - qs
+        k_len = ke - ks
+        r0 = q0 - qs
+        r = r0 + tok_local
+        offs_m = q0 + tok_local
+        mask_m = offs_m < qe
+        qh = pid_kv * GROUP_SIZE + gh
+
+        q = tl.load(
+            Q + offs_m[:, None] * stride_qz + qh[:, None] * stride_qh + offs_d[None, :],
+            mask=mask_m[:, None],
+            other=0.0,
+        )
+
+        m_i = tl.zeros([128], dtype=tl.float32) - float("inf")
+        l_i = tl.zeros([128], dtype=tl.float32)
+        acc = tl.zeros([128, BLOCK_D], dtype=tl.float32)
+
+        num_k_blocks = tl.cdiv(k_len, 64)
+        r_last = tl.minimum(r0 + BLOCK_M, q_len) - 1
+
+        causal_limit = r_last + (k_len - q_len)
+        b_end_causal = tl.cdiv(causal_limit + 1, 64)
+        b_end_causal = tl.maximum(0, tl.minimum(b_end_causal, num_k_blocks))
+        b_start_inv = tl.maximum(0, tl.minimum(r0 // 64, num_k_blocks))
+
+        is_causal = (typ == 1) | (typ == 3)
+        is_inv = (typ == 2) | (typ == 3)
+        b_start = tl.where(is_inv, b_start_inv, 0)
+        b_end = tl.where(is_causal, b_end_causal, num_k_blocks)
+
+        for b in range(b_start, b_end):
+            u = b * 64 + tl.arange(0, 64)
+            offs_n = ks + u
+            mask_n = u < k_len
+
+            kk = tl.load(
+                K + offs_n[:, None] * stride_kz + pid_kv * stride_kh + offs_d[None, :],
+                mask=mask_n[:, None],
+                other=0.0,
+            )
+            qk = tl.dot(q, tl.trans(kk)) * softmax_scale
+
+            causal_ok = u[None, :] <= (r[:, None] + (k_len - q_len))
+            inv_ok = u[None, :] >= r[:, None]
+            type_ok = (
+                (typ == 0)
+                | ((typ == 1) & causal_ok)
+                | ((typ == 2) & inv_ok)
+                | ((typ == 3) & causal_ok & inv_ok)
+            )
+            vis = mask_m[:, None] & mask_n[None, :] & type_ok
+            qk = tl.where(vis, qk, -float("inf"))
+
+            m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+            alpha = tl.where(
+                m_i > -float("inf"),
+                tl.exp2((m_i - m_new) * 1.4426950408889634),
+                0.0,
+            )
+            p = tl.where(
+                vis,
+                tl.exp2((qk - m_new[:, None]) * 1.4426950408889634),
+                0.0,
+            )
+
+            vv = tl.load(
+                V + offs_n[:, None] * stride_vz + pid_kv * stride_vh + offs_d[None, :],
+                mask=mask_n[:, None],
+                other=0.0,
+            )
+
+            acc = acc * alpha[:, None]
+            acc = tl.dot(p.to(tl.bfloat16), vv, acc)
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            m_i = m_new
+
+        s = tl.arange(0, 16)
+        smask = s[None, :] < num_sink
+        sv = tl.load(
+            sink_ptr + s[None, :] * stride_sink_s + qh[:, None] * stride_sink_h,
+            mask=mask_m[:, None] & smask,
+            other=-float("inf"),
+        )
+        smax = tl.max(sv, axis=1)
+        ssum = tl.sum(
+            tl.exp2((sv - smax[:, None]) * 1.4426950408889634),
+            axis=1,
+        )
+        slse = smax + tl.log2(ssum) * 0.6931471805599453
+        denom = l_i + tl.exp2((slse - m_i) * 1.4426950408889634)
+        acc = acc / denom[:, None]
+
+        tl.store(
+            Out + offs_m[:, None] * stride_oz + qh[:, None] * stride_oh + offs_d[None, :],
+            acc.to(tl.bfloat16),
+            mask=mask_m[:, None],
+        )
+
+        task += task_stride
+
+
+@triton.jit
 def build_prefix_meta_kernel(
     q_ranges_ptr,
     k_ranges_ptr,
@@ -1777,8 +1966,10 @@ def run_kernel(
     global _V_FP8_SRC, _V_FP8, _V_SCALE, _PRINTED_BUILD
     global _PREFIX_META_SRC, _PREFIX_Q0, _PREFIX_Q1, _PREFIX_KE, _PREFIX_BM, _PREFIX_TILES
     global _PREFIX_SINK_SRC, _PREFIX_SINK_LSE
+    global _SCHED_META_SRC, _SCHED_BM, _SCHED_TILES
+    global _SCHED_Q0, _SCHED_QS, _SCHED_QE, _SCHED_KS, _SCHED_KE, _SCHED_TYP
     if not _PRINTED_BUILD:
-        print("BUILD STABLE_88_25_V34")
+        print("BUILD PERSISTENT_SCHED_V35")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
@@ -1813,6 +2004,62 @@ def run_kernel(
         _META_BLOCKS128 = b128
 
     if _META_PARTITION:
+        G = Hq // Hkv
+
+        # Broad Hopper experiment: one persistent PackGQA scheduler for all
+        # disjoint D128 GQA families (#1/#2/#3/#6/#7/#8/#11/#12).
+        if D == 128 and (G == 4 or G == 8 or G == 128):
+            bm = 128 // G
+            if _SCHED_META_SRC is not q_ranges or _SCHED_BM != bm:
+                tile_count = 0
+                i = 0
+                while i < N:
+                    qlen = int(_META_Q[i][1]) - int(_META_Q[i][0])
+                    tile_count += (qlen + bm - 1) // bm
+                    i += 1
+
+                _SCHED_Q0 = torch.empty((tile_count,), dtype=torch.int32, device=q.device)
+                _SCHED_QS = torch.empty((tile_count,), dtype=torch.int32, device=q.device)
+                _SCHED_QE = torch.empty((tile_count,), dtype=torch.int32, device=q.device)
+                _SCHED_KS = torch.empty((tile_count,), dtype=torch.int32, device=q.device)
+                _SCHED_KE = torch.empty((tile_count,), dtype=torch.int32, device=q.device)
+                _SCHED_TYP = torch.empty((tile_count,), dtype=torch.int32, device=q.device)
+
+                build_sched_meta_kernel[(tile_count,)](
+                    q_ranges, k_ranges, attn_type_map,
+                    _SCHED_Q0, _SCHED_QS, _SCHED_QE,
+                    _SCHED_KS, _SCHED_KE, _SCHED_TYP,
+                    BLOCK_M=bm,
+                    NUM_SLICES=N,
+                    num_warps=1,
+                )
+                _SCHED_META_SRC = q_ranges
+                _SCHED_BM = bm
+                _SCHED_TILES = tile_count
+
+            total_tasks = _SCHED_TILES * Hkv
+            # H800 has 114 SMs. The PackGQA CTA is register-heavy, so start
+            # with one resident persistent CTA per SM.
+            persistent_ctas = min(total_tasks, 114)
+            persistent_packgqa_sched_kernel[(persistent_ctas,)](
+                q, k, v, output, sink,
+                _SCHED_Q0, _SCHED_QS, _SCHED_QE,
+                _SCHED_KS, _SCHED_KE, _SCHED_TYP,
+                scale, Ns, total_tasks,
+                Hq * D, D,
+                Hkv * D, D,
+                Hkv * D, D,
+                Hq * D, D,
+                Hq, 1,
+                HKV=Hkv,
+                GROUP_SIZE=G,
+                BLOCK_M=bm,
+                BLOCK_D=D,
+                num_warps=8,
+                num_stages=4,
+            )
+            return
+
         if N == 1:
             qs = int(_META_Q[0][0])
             qe = int(_META_Q[0][1])
