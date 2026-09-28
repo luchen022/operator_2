@@ -945,6 +945,53 @@ __device__ __forceinline__ void stage_vt(
     }
 }
 
+
+__device__ __forceinline__ void stage_k_packed_d128(
+    const __nv_bfloat16* __restrict__ packed_k,
+    __nv_bfloat16* __restrict__ s,
+    int key0,
+    int kvh,
+    int S
+) {
+    const int tid = threadIdx.x;
+    const int kblocks = S / 64;
+    const int abs_kb = key0 >> 6;
+#pragma unroll
+    for (int ds = 0; ds < 8; ++ds) {
+        const __nv_bfloat16* src =
+            packed_k
+            + (((int64_t(kvh) * kblocks + abs_kb) * 8 + ds)
+               * P_BLOCK_ELEMS)
+            + tid * 8;
+        __nv_bfloat16* dst = s + ds * P_BLOCK_ELEMS + tid * 8;
+        *reinterpret_cast<uint4*>(dst) =
+            *reinterpret_cast<const uint4*>(src);
+    }
+}
+
+__device__ __forceinline__ void stage_v_packed_d128(
+    const __nv_bfloat16* __restrict__ packed_v,
+    __nv_bfloat16* __restrict__ s,
+    int key0,
+    int kvh,
+    int S
+) {
+    const int tid = threadIdx.x;
+    const int kblocks = S / 64;
+    const int abs_kb = key0 >> 6;
+#pragma unroll
+    for (int t = 0; t < 8; ++t) {
+        const __nv_bfloat16* src =
+            packed_v
+            + (((int64_t(kvh) * kblocks + abs_kb) * 8 + t)
+               * P_BLOCK_ELEMS)
+            + tid * 8;
+        __nv_bfloat16* dst = s + t * P_BLOCK_ELEMS + tid * 8;
+        *reinterpret_cast<uint4*>(dst) =
+            *reinterpret_cast<const uint4*>(src);
+    }
+}
+
 template <int HD>
 __global__ __launch_bounds__(128, 1)
 void partition_wgmma_fwd(
@@ -955,6 +1002,9 @@ void partition_wgmma_fwd(
     const int32_t* __restrict__ k_ranges,
     const int32_t* __restrict__ attn_type_map,
     const float* __restrict__ sink,
+    const __nv_bfloat16* __restrict__ packed_k,
+    const __nv_bfloat16* __restrict__ packed_v,
+    const float* __restrict__ sink_lse,
     __nv_bfloat16* __restrict__ out,
     float softmax_scale,
     int S,
@@ -1096,7 +1146,11 @@ void partition_wgmma_fwd(
         for (int kb = 0; kb < k_blocks; ++kb) {
             const int key0 = pks + kb * N;
 
-            stage_k<HD>(k, kv_s, key0, pke, kvh, Hkv);
+            if (HD == 128 && packed_k != nullptr && ((key0 & 63) == 0)) {
+                stage_k_packed_d128(packed_k, kv_s, key0, kvh, S);
+            } else {
+                stage_k<HD>(k, kv_s, key0, pke, kvh, Hkv);
+            }
             fence_proxy_async_shared();
             __syncthreads();
 
@@ -1191,7 +1245,11 @@ void partition_wgmma_fwd(
 
         fence_proxy_async_shared();
         __syncthreads();
-        stage_vt<HD>(v, kv_s, key0, pke, kvh, Hkv);
+        if (HD == 128 && packed_v != nullptr && ((key0 & 63) == 0)) {
+            stage_v_packed_d128(packed_v, kv_s, key0, kvh, S);
+        } else {
+            stage_vt<HD>(v, kv_s, key0, pke, kvh, Hkv);
+        }
         fence_proxy_async_shared();
         __syncthreads();
 
@@ -1227,8 +1285,12 @@ void partition_wgmma_fwd(
 
     if (qidx0 < qe) {
         float denom0 = l0;
-        for (int s = 0; s < Ns; ++s)
-            denom0 += __expf(sink[s * Hq + qh0] - m0);
+        if (HD == 128 && sink_lse != nullptr) {
+            denom0 += __expf(sink_lse[qh0] - m0);
+        } else {
+            for (int s = 0; s < Ns; ++s)
+                denom0 += __expf(sink[s * Hq + qh0] - m0);
+        }
         const float inv0 = 1.0f / denom0;
 
 #pragma unroll
@@ -1250,8 +1312,12 @@ void partition_wgmma_fwd(
 
     if (qidx1 < qe) {
         float denom1 = l1;
-        for (int s = 0; s < Ns; ++s)
-            denom1 += __expf(sink[s * Hq + qh1] - m1);
+        if (HD == 128 && sink_lse != nullptr) {
+            denom1 += __expf(sink_lse[qh1] - m1);
+        } else {
+            for (int s = 0; s < Ns; ++s)
+                denom1 += __expf(sink[s * Hq + qh1] - m1);
+        }
         const float inv1 = 1.0f / denom1;
 
 #pragma unroll
@@ -1281,6 +1347,9 @@ inline void launch_partition_wgmma(
     const int32_t* k_ranges,
     const int32_t* attn_type_map,
     const float* sink,
+    const __nv_bfloat16* packed_k,
+    const __nv_bfloat16* packed_v,
+    const float* sink_lse,
     __nv_bfloat16* out,
     float softmax_scale,
     int S,
@@ -1307,7 +1376,8 @@ inline void launch_partition_wgmma(
     partition_wgmma_fwd<HD><<<grid, 128>>>(
         q, k, v,
         q_ranges, k_ranges, attn_type_map,
-        sink, out, softmax_scale,
+        sink, packed_k, packed_v, sink_lse,
+        out, softmax_scale,
         S, Hq, Hkv, G, Ns, NumSlices, special_mode
     );
 }
@@ -1628,7 +1698,7 @@ extern "C" void run_kernel(
 ) {
     static bool printed_build = false;
     if (!printed_build) {
-        fprintf(stderr, "BUILD CUDA_SM90A_WGMMA_PROXY_FENCE_V3\\n");
+        fprintf(stderr, "BUILD CUDA_SM90A_WGMMA_PARTITION_PACKED_V4\\n");
         printed_build = true;
     }
 
@@ -1691,10 +1761,19 @@ extern "C" void run_kernel(
         S == 512 && Hq == 16 && Hkv == 8 &&
         D == 128 && N == 2 && Ns == 2
     ) {
+        const __nv_bfloat16* packed_k = nullptr;
+        const __nv_bfloat16* packed_v = nullptr;
+        const float* sink_lse = nullptr;
+        wgmma_static_cache::ensure_d128(
+            k, v, sink, q_ranges,
+            S, Hq, Hkv, Ns,
+            packed_k, packed_v, sink_lse
+        );
         wgmma_partition::launch_partition_wgmma<128>(
             q, k, v,
             q_ranges, k_ranges, attn_type_map,
-            sink, output, softmax_scale,
+            sink, packed_k, packed_v, sink_lse,
+            output, softmax_scale,
             S, Hq, Hkv, Ns, N,
             1
         );
@@ -1707,10 +1786,19 @@ extern "C" void run_kernel(
         S == 4096 && Hq == 32 && Hkv == 8 &&
         D == 128 && N == 8 && Ns == 6
     ) {
+        const __nv_bfloat16* packed_k = nullptr;
+        const __nv_bfloat16* packed_v = nullptr;
+        const float* sink_lse = nullptr;
+        wgmma_static_cache::ensure_d128(
+            k, v, sink, q_ranges,
+            S, Hq, Hkv, Ns,
+            packed_k, packed_v, sink_lse
+        );
         wgmma_partition::launch_partition_wgmma<128>(
             q, k, v,
             q_ranges, k_ranges, attn_type_map,
-            sink, output, softmax_scale,
+            sink, packed_k, packed_v, sink_lse,
+            output, softmax_scale,
             S, Hq, Hkv, Ns, N,
             2
         );
@@ -1722,7 +1810,8 @@ extern "C" void run_kernel(
         wgmma_partition::launch_partition_wgmma<64>(
             q, k, v,
             q_ranges, k_ranges, attn_type_map,
-            sink, output, softmax_scale,
+            sink, nullptr, nullptr, nullptr,
+            output, softmax_scale,
             S, Hq, Hkv, Ns, N,
             0
         );
@@ -1730,10 +1819,19 @@ extern "C" void run_kernel(
     }
 
     // #2 / #3 / #6 / #8 / #11.
+    const __nv_bfloat16* packed_k = nullptr;
+    const __nv_bfloat16* packed_v = nullptr;
+    const float* sink_lse = nullptr;
+    wgmma_static_cache::ensure_d128(
+        k, v, sink, q_ranges,
+        S, Hq, Hkv, Ns,
+        packed_k, packed_v, sink_lse
+    );
     wgmma_partition::launch_partition_wgmma<128>(
         q, k, v,
         q_ranges, k_ranges, attn_type_map,
-        sink, output, softmax_scale,
+        sink, packed_k, packed_v, sink_lse,
+        output, softmax_scale,
         S, Hq, Hkv, Ns, N,
         0
     );
