@@ -5,6 +5,7 @@ import tilelang.language as T
 # Generic correctness path for all scored shapes; Python-level JIT specializes
 # S/Hq/Hkv/D/N/Ns/scale for each testcase.
 _KERNEL_CACHE = {}
+_PRINTED_BUILD = False
 
 _LOG2E = 1.4426950408889634
 
@@ -256,6 +257,11 @@ def run_kernel(
     N = int(num_slices)
     Ns = int(num_sink)
     scale = float(softmax_scale)
+
+    global _PRINTED_BUILD
+    if not _PRINTED_BUILD:
+        print("BUILD TILELANG_GENERIC_FA_V1")
+        _PRINTED_BUILD = True
 
     kernel = _get_kernel(S, Hq, Hkv, D, N, Ns, scale)
     kernel(
