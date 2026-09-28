@@ -227,10 +227,24 @@ def single_slice_fp8_qk_kernel(
     q_ptrs = Q + offs_m[:, None] * stride_qz + pid_h * stride_qh + offs_d[None, :]
     q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
 
+    # Q-only top-1 outlier isolation. Across judge groups only Q changes,
+    # so keep K on the fast per-token FP8 path and correct the largest Q
+    # component explicitly.
     q_abs = tl.abs(q)
-    q_amax = tl.max(q_abs, axis=1)
-    q_scale = tl.maximum(q_amax / 448.0, 1e-8)
-    q8 = (q / q_scale[:, None]).to(tl.float8e4nv)
+    q_top_idx = tl.argmax(q_abs, axis=1)
+    q_is_top = offs_d[None, :] == q_top_idx[:, None]
+    q_second = tl.max(tl.where(q_is_top, 0.0, q_abs), axis=1)
+    q_scale = tl.maximum(q_second / 448.0, 1e-8)
+
+    q_clip = tl.minimum(
+        tl.maximum(q, -q_second[:, None]),
+        q_second[:, None],
+    )
+    q8 = (q_clip / q_scale[:, None]).to(tl.float8e4nv)
+
+    q_top = tl.sum(tl.where(q_is_top, q, 0.0), axis=1)
+    q_top_clip = tl.minimum(tl.maximum(q_top, -q_second), q_second)
+    q_residual = q_top - q_top_clip
 
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
@@ -272,13 +286,25 @@ def single_slice_fp8_qk_kernel(
             other=1.0,
         )
 
-        qk = tl.dot(
-            q8,
-            tl.trans(k8),
-            max_num_imprecise_acc=0,
-            out_dtype=tl.float32,
+        qk = tl.dot(q8, tl.trans(k8))
+        qk = qk * q_scale[:, None] * ks[None, :]
+
+        # Add back the clipped top-Q component using the dequantized K value
+        # at that dynamic dimension. This is one scalar correction per score.
+        k_top_ptrs = (
+            K8
+            + offs_n[None, :] * stride_kz8
+            + pid_kv * stride_kh8
+            + q_top_idx[:, None]
         )
-        qk = qk * q_scale[:, None] * ks[None, :] * softmax_scale
+        k_top8 = tl.load(
+            k_top_ptrs,
+            mask=mask_m[:, None] & mask_n[None, :],
+            other=0.0,
+        )
+        k_top = k_top8.to(tl.float32) * ks[None, :]
+        qk += q_residual[:, None] * k_top
+        qk *= softmax_scale
 
         if ATTN_TYPE == 0:
             vis = mask_m[:, None] & mask_n[None, :]
@@ -710,7 +736,7 @@ def run_kernel(
     global _META_BLOCKS32, _META_BLOCKS64, _META_BLOCKS128
     global _K_FP8_SRC, _K_FP8, _K_SCALE, _PRINTED_BUILD
     if not _PRINTED_BUILD:
-        print("BUILD FP8_PRECISE_ACC_V3")
+        print("BUILD FP8_Q_TOP1_CORR_V4")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
