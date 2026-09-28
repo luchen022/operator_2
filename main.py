@@ -148,7 +148,7 @@ def packgqa_full_g128_half_kernel(
         n = b * 64 + tl.arange(0, 64)
 
         kk = tl.load(
-            K + n[:, None] * stride_kz + d[None, :] * stride_kh
+            K + n[:, None] * stride_kz + d[None, :]
         )
         qk = tl.dot(q, tl.trans(kk))
 
@@ -161,7 +161,7 @@ def packgqa_full_g128_half_kernel(
         p = tl.exp2(qk - m_new[:, None])
 
         vv = tl.load(
-            V + n[:, None] * stride_vz + d[None, :] * stride_vh
+            V + n[:, None] * stride_vz + d[None, :]
         )
 
         acc = acc * alpha[:, None]
