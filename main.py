@@ -27,6 +27,139 @@ _PREFIX_BM = 0
 _PREFIX_TILES = 0
 _PREFIX_SINK_SRC = None
 _PREFIX_SINK_LSE = None
+_SDPA_LSE = None
+_SDPA_LSE_SHAPE = None
+_SDPA_SINK_SRC = None
+_SDPA_SINK_LSE = None
+
+
+@triton.jit
+def packgqa_lse_only_kernel(
+    Q, K, LSE,
+    softmax_scale,
+    q_start, q_len, k_start, k_len,
+    stride_qz, stride_qh,
+    stride_kz, stride_kh,
+    stride_lse_z, stride_lse_h,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    ATTN_TYPE: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_kv = tl.program_id(1)
+
+    packed = pid_m * 128 + tl.arange(0, 128)
+    tok = packed // GROUP_SIZE
+    gh = packed - tok * GROUP_SIZE
+    qh = pid_kv * GROUP_SIZE + gh
+    offs_m = q_start + tok
+    d = tl.arange(0, BLOCK_D)
+    mask_m = tok < q_len
+
+    q = tl.load(
+        Q + offs_m[:, None] * stride_qz + qh[:, None] * stride_qh + d[None, :],
+        mask=mask_m[:, None],
+        other=0.0,
+    )
+
+    m_i = tl.zeros([128], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([128], dtype=tl.float32)
+
+    tok_first = pid_m * (128 // GROUP_SIZE)
+    tok_last = tl.minimum(tok_first + (128 // GROUP_SIZE), q_len) - 1
+    num_k_blocks = tl.cdiv(k_len, 64)
+
+    if ATTN_TYPE == 0:
+        b_start = 0
+        b_end = num_k_blocks
+    else:
+        b_start = 0
+        causal_limit = tok_last + (k_len - q_len)
+        b_end = tl.cdiv(causal_limit + 1, 64)
+        b_end = tl.maximum(0, tl.minimum(b_end, num_k_blocks))
+
+    for b in range(b_start, b_end):
+        u = b * 64 + tl.arange(0, 64)
+        offs_n = k_start + u
+        mask_n = u < k_len
+
+        kk = tl.load(
+            K + offs_n[:, None] * stride_kz + pid_kv * stride_kh + d[None, :],
+            mask=mask_n[:, None],
+            other=0.0,
+        )
+        qk = tl.dot(q, tl.trans(kk)) * softmax_scale
+
+        if ATTN_TYPE == 0:
+            vis = mask_m[:, None] & mask_n[None, :]
+        else:
+            vis = mask_m[:, None] & mask_n[None, :] & (
+                u[None, :] <= (tok[:, None] + (k_len - q_len))
+            )
+
+        qk = tl.where(vis, qk, -float("inf"))
+        m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+        alpha = tl.where(
+            m_i > -float("inf"),
+            tl.exp2((m_i - m_new) * 1.4426950408889634),
+            0.0,
+        )
+        p = tl.where(
+            vis,
+            tl.exp2((qk - m_new[:, None]) * 1.4426950408889634),
+            0.0,
+        )
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_new
+
+    token_lse = m_i + tl.log2(tl.maximum(l_i, 1e-20)) * 0.6931471805599453
+    tl.store(
+        LSE + offs_m * stride_lse_z + qh * stride_lse_h,
+        token_lse,
+        mask=mask_m,
+    )
+
+
+@triton.jit
+def sdpa_sink_epilogue_kernel(
+    FAO, TOKEN_LSE, SINK_LSE, OUT,
+    S: tl.constexpr,
+    HQ: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
+    z = rows // HQ
+    h = rows - z * HQ
+    mask_r = rows < S * HQ
+    d = tl.arange(0, D)
+
+    # FAO is contiguous [1, H, S, D].
+    x = tl.load(
+        FAO + (h[:, None] * S + z[:, None]) * D + d[None, :],
+        mask=mask_r[:, None],
+        other=0.0,
+    )
+    token_lse = tl.load(
+        TOKEN_LSE + z * HQ + h,
+        mask=mask_r,
+        other=-float("inf"),
+    )
+    sink_lse = tl.load(
+        SINK_LSE + h,
+        mask=mask_r,
+        other=-float("inf"),
+    )
+
+    sink_scale = 1.0 / (
+        1.0 + tl.exp2((sink_lse - token_lse) * 1.4426950408889634)
+    )
+
+    tl.store(
+        OUT + rows[:, None] * D + d[None, :],
+        (x * sink_scale[:, None]).to(tl.bfloat16),
+        mask=mask_r[:, None],
+    )
 
 
 @triton.jit
@@ -1777,8 +1910,9 @@ def run_kernel(
     global _V_FP8_SRC, _V_FP8, _V_SCALE, _PRINTED_BUILD
     global _PREFIX_META_SRC, _PREFIX_Q0, _PREFIX_Q1, _PREFIX_KE, _PREFIX_BM, _PREFIX_TILES
     global _PREFIX_SINK_SRC, _PREFIX_SINK_LSE
+    global _SDPA_LSE, _SDPA_LSE_SHAPE, _SDPA_SINK_SRC, _SDPA_SINK_LSE
     if not _PRINTED_BUILD:
-        print("BUILD STABLE_88_25_V38")
+        print("BUILD PUBLIC_SDPA_LSE_V39")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
@@ -1823,6 +1957,78 @@ def run_kernel(
             k_len = ke - ks
 
             G = Hq // Hkv
+
+            # Public PyTorch SDPA experiment for dense full-sequence N=1 cases.
+            # SDPA computes O; a lightweight QK-only kernel computes LSE so the
+            # denominator-only sink can be restored exactly.
+            if (
+                D == 128 and qs == 0 and ks == 0
+                and q_len == S and k_len == S
+                and (typ == 0 or typ == 1)
+            ):
+                lse_shape = (S, Hq)
+                if _SDPA_LSE is None or _SDPA_LSE_SHAPE != lse_shape:
+                    _SDPA_LSE = torch.empty(
+                        lse_shape,
+                        dtype=torch.float32,
+                        device=q.device,
+                    )
+                    _SDPA_LSE_SHAPE = lse_shape
+
+                if _SDPA_SINK_SRC is not sink:
+                    _SDPA_SINK_LSE = torch.empty(
+                        (Hq,),
+                        dtype=torch.float32,
+                        device=sink.device,
+                    )
+                    build_sink_lse_kernel[(Hq,)](
+                        sink,
+                        _SDPA_SINK_LSE,
+                        HQ=Hq,
+                        NSINK=Ns,
+                        num_warps=1,
+                    )
+                    _SDPA_SINK_SRC = sink
+
+                packgqa_lse_only_kernel[(triton.cdiv(S * G, 128), Hkv)](
+                    q, k, _SDPA_LSE,
+                    scale,
+                    0, S, 0, S,
+                    Hq * D, D,
+                    Hkv * D, D,
+                    Hq, 1,
+                    GROUP_SIZE=G,
+                    BLOCK_D=D,
+                    ATTN_TYPE=typ,
+                    num_warps=8,
+                    num_stages=4,
+                )
+
+                q4 = q.permute(1, 0, 2).unsqueeze(0)
+                k4 = k.permute(1, 0, 2).unsqueeze(0)
+                v4 = v.permute(1, 0, 2).unsqueeze(0)
+                fa_out = torch.nn.functional.scaled_dot_product_attention(
+                    q4,
+                    k4,
+                    v4,
+                    dropout_p=0.0,
+                    is_causal=(typ == 1),
+                    scale=scale,
+                    enable_gqa=(G != 1),
+                )
+
+                sdpa_sink_epilogue_kernel[(triton.cdiv(S * Hq, 16),)](
+                    fa_out,
+                    _SDPA_LSE,
+                    _SDPA_SINK_LSE,
+                    output,
+                    S=S,
+                    HQ=Hq,
+                    D=D,
+                    BLOCK_R=16,
+                    num_warps=4,
+                )
+                return
             if typ == 0 and D == 128 and Hkv == 1 and G == 128 and q_len == S and k_len == S:
                 packgqa_full_128_kernel[(triton.cdiv(q_len * G, 128), Hkv)](
                     q, k, v, output, sink,
