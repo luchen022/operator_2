@@ -31,6 +31,25 @@ _K128_LOG2_SRC = None
 _K128_LOG2 = None
 _K128_LOG2_SCALE = None
 
+_D64_META_SRC = None
+_D64_Q0 = None
+_D64_QE = None
+_D64_KS = None
+_D64_KLEN = None
+_D64_R0 = None
+_D64_DELTA = None
+_D64_BEND = None
+
+_OV8_META_SRC = None
+_OV8_Q0 = None
+_OV8_QE = None
+_OV8_KS = None
+_OV8_KLEN = None
+_OV8_R0 = None
+_OV8_DELTA = None
+_OV8_BEND = None
+_OV8_FULL = None
+
 
 @triton.jit
 def prescale_k128_log2_kernel(
@@ -754,53 +773,35 @@ def single_slice_fp8_qk_kernel(
 @triton.jit
 def partition_packgqa_causal_d64_kernel(
     Q, K, V, Out,
-    q_ranges_ptr, k_ranges_ptr, sink_ptr,
+    Q0_META, QE_META, KS_META, KLEN_META,
+    R0_META, DELTA_META, BEND_META,
+    sink_ptr,
     softmax_scale,
-    num_sink,
     stride_qz, stride_qh,
     stride_kz, stride_kh,
     stride_vz, stride_vh,
     stride_oz, stride_oh,
-    stride_sink_s, stride_sink_h,
     GROUP_SIZE: tl.constexpr,
-    NUM_SLICES: tl.constexpr,
 ):
     pid_tile = tl.program_id(0)
     pid_kv = tl.program_id(1)
 
-    prefix = 0
-    qs_sel = 0
-    qe_sel = 0
-    ks_sel = 0
-    ke_sel = 0
-    local_block = 0
-
-    for sidx in tl.static_range(0, NUM_SLICES):
-        qs = tl.load(q_ranges_ptr + sidx * 2)
-        qe = tl.load(q_ranges_ptr + sidx * 2 + 1)
-        ks = tl.load(k_ranges_ptr + sidx * 2)
-        ke = tl.load(k_ranges_ptr + sidx * 2 + 1)
-        qlen = qe - qs
-        nblocks = tl.cdiv(qlen, 32)
-        hit = (pid_tile >= prefix) & (pid_tile < prefix + nblocks)
-
-        qs_sel = tl.where(hit, qs, qs_sel)
-        qe_sel = tl.where(hit, qe, qe_sel)
-        ks_sel = tl.where(hit, ks, ks_sel)
-        ke_sel = tl.where(hit, ke, ke_sel)
-        local_block = tl.where(hit, pid_tile - prefix, local_block)
-        prefix += nblocks
+    q0 = tl.load(Q0_META + pid_tile).to(tl.int32)
+    qe = tl.load(QE_META + pid_tile).to(tl.int32)
+    ks = tl.load(KS_META + pid_tile).to(tl.int32)
+    k_len = tl.load(KLEN_META + pid_tile).to(tl.int32)
+    r0 = tl.load(R0_META + pid_tile).to(tl.int32)
+    delta = tl.load(DELTA_META + pid_tile).to(tl.int32)
+    b_end = tl.load(BEND_META + pid_tile).to(tl.int32)
 
     packed = tl.arange(0, 128)
     tok_local = packed // GROUP_SIZE
     gh = packed - tok_local * GROUP_SIZE
     qh = pid_kv * GROUP_SIZE + gh
 
-    q_len = qe_sel - qs_sel
-    k_len = ke_sel - ks_sel
-    r = local_block * 32 + tok_local
-    offs_m = qs_sel + r
-    mask_m = r < q_len
+    r = r0 + tok_local
+    offs_m = q0 + tok_local
+    mask_m = offs_m < qe
     d = tl.arange(0, 64)
 
     q = tl.load(
@@ -812,14 +813,9 @@ def partition_packgqa_causal_d64_kernel(
     l_i = tl.zeros([128], dtype=tl.float32)
     acc = tl.zeros([128, 64], dtype=tl.float32)
 
-    r_last = tl.minimum(local_block * 32 + 32, q_len) - 1
-    causal_limit = r_last + (k_len - q_len)
-    b_end = tl.cdiv(causal_limit + 1, 64)
-    b_end = tl.maximum(0, tl.minimum(b_end, tl.cdiv(k_len, 64)))
-
     for b in range(0, b_end):
         u = b * 64 + tl.arange(0, 64)
-        offs_n = ks_sel + u
+        offs_n = ks + u
         mask_n = u < k_len
 
         k = tl.load(
@@ -829,21 +825,13 @@ def partition_packgqa_causal_d64_kernel(
         qk = tl.dot(q, tl.trans(k)) * (softmax_scale * 1.4426950408889634)
 
         vis = mask_m[:, None] & mask_n[None, :] & (
-            u[None, :] <= (r[:, None] + (k_len - q_len))
+            u[None, :] <= (r[:, None] + delta)
         )
         qk = tl.where(vis, qk, -float("inf"))
 
         m_new = tl.maximum(m_i, tl.max(qk, axis=1))
-        alpha = tl.where(
-            m_i > -float("inf"),
-            tl.exp2(m_i - m_new),
-            0.0,
-        )
-        p = tl.where(
-            vis,
-            tl.exp2(qk - m_new[:, None]),
-            0.0,
-        )
+        alpha = tl.where(m_i > -float("inf"), tl.exp2(m_i - m_new), 0.0)
+        p = tl.where(vis, tl.exp2(qk - m_new[:, None]), 0.0)
 
         vv = tl.load(
             V + offs_n[:, None] * stride_vz + pid_kv * stride_vh + d[None, :],
@@ -855,12 +843,7 @@ def partition_packgqa_causal_d64_kernel(
         l_i = l_i * alpha + tl.sum(p, axis=1)
         m_i = m_new
 
-    # sink_ptr points to precomputed per-Q-head sink logsumexp.
-    slse = tl.load(
-        sink_ptr + qh,
-        mask=mask_m,
-        other=-float("inf"),
-    )
+    slse = tl.load(sink_ptr + qh, mask=mask_m, other=-float("inf"))
     denom = l_i + tl.exp2(slse * 1.4426950408889634 - m_i)
     acc = acc / denom[:, None]
 
@@ -871,16 +854,6 @@ def partition_packgqa_causal_d64_kernel(
     )
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=4),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=3),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=4),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=8, num_stages=3),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=3),
-    ],
-    key=["seqlen", "head_dim", "NUM_SLICES"],
-)
 @triton.jit
 def partition_fwd_kernel(
     Q, K, V, Out,
@@ -1052,6 +1025,125 @@ def build_sink_lse_kernel(
     x_sum = tl.sum(tl.exp2((x - x_max) * 1.4426950408889634), axis=0)
     lse = x_max + tl.log2(x_sum) * 0.6931471805599453
     tl.store(SINK_LSE + h, lse)
+
+
+@triton.jit
+def build_partition_tile_meta_kernel(
+    q_ranges_ptr, k_ranges_ptr,
+    Q0_META, QE_META, KS_META, KLEN_META,
+    R0_META, DELTA_META, BEND_META,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_SLICES: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    prefix = 0
+    q0_sel = 0
+    qe_sel = 0
+    ks_sel = 0
+    klen_sel = 0
+    r0_sel = 0
+    delta_sel = 0
+    bend_sel = 0
+
+    for sidx in tl.static_range(0, NUM_SLICES):
+        qs = tl.load(q_ranges_ptr + sidx * 2).to(tl.int32)
+        qe = tl.load(q_ranges_ptr + sidx * 2 + 1).to(tl.int32)
+        ks = tl.load(k_ranges_ptr + sidx * 2).to(tl.int32)
+        ke = tl.load(k_ranges_ptr + sidx * 2 + 1).to(tl.int32)
+
+        qlen = qe - qs
+        klen = ke - ks
+        nblocks = tl.cdiv(qlen, BLOCK_M)
+        hit = (pid >= prefix) & (pid < prefix + nblocks)
+        local = pid - prefix
+        r0 = local * BLOCK_M
+        q0 = qs + r0
+        delta = klen - qlen
+
+        r_last = tl.minimum(r0 + BLOCK_M, qlen) - 1
+        bend = tl.cdiv(r_last + delta + 1, BLOCK_N)
+        bend = tl.maximum(0, tl.minimum(bend, tl.cdiv(klen, BLOCK_N)))
+
+        q0_sel = tl.where(hit, q0, q0_sel)
+        qe_sel = tl.where(hit, qe, qe_sel)
+        ks_sel = tl.where(hit, ks, ks_sel)
+        klen_sel = tl.where(hit, klen, klen_sel)
+        r0_sel = tl.where(hit, r0, r0_sel)
+        delta_sel = tl.where(hit, delta, delta_sel)
+        bend_sel = tl.where(hit, bend, bend_sel)
+        prefix += nblocks
+
+    tl.store(Q0_META + pid, q0_sel)
+    tl.store(QE_META + pid, qe_sel)
+    tl.store(KS_META + pid, ks_sel)
+    tl.store(KLEN_META + pid, klen_sel)
+    tl.store(R0_META + pid, r0_sel)
+    tl.store(DELTA_META + pid, delta_sel)
+    tl.store(BEND_META + pid, bend_sel)
+
+
+@triton.jit
+def build_overlap8_tile_meta_kernel(
+    q_ranges_ptr, k_ranges_ptr,
+    Q0_META, QE_META, KS_META, KLEN_META,
+    R0_META, DELTA_META, BEND_META, FULL_META,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_BASE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    prefix = 0
+    q0_sel = 0
+    qe_sel = 0
+    ks_sel = 0
+    klen_sel = 0
+    r0_sel = 0
+    delta_sel = 0
+    bend_sel = 0
+    full_sel = 0
+
+    for sidx in tl.static_range(0, NUM_BASE):
+        qs = tl.load(q_ranges_ptr + sidx * 2).to(tl.int32)
+        qe = tl.load(q_ranges_ptr + sidx * 2 + 1).to(tl.int32)
+        ks = tl.load(k_ranges_ptr + sidx * 2).to(tl.int32)
+        ke = tl.load(k_ranges_ptr + sidx * 2 + 1).to(tl.int32)
+
+        qlen = qe - qs
+        klen = ke - ks
+        nblocks = tl.cdiv(qlen, BLOCK_M)
+        hit = (pid >= prefix) & (pid < prefix + nblocks)
+        local = pid - prefix
+        r0 = local * BLOCK_M
+        q0 = qs + r0
+        delta = klen - qlen
+        is_full = sidx == 0
+
+        r_last = tl.minimum(r0 + BLOCK_M, qlen) - 1
+        bend_causal = tl.cdiv(r_last + delta + 1, BLOCK_N)
+        bend_causal = tl.maximum(0, tl.minimum(bend_causal, tl.cdiv(klen, BLOCK_N)))
+        bend = tl.where(is_full, tl.cdiv(klen, BLOCK_N), bend_causal)
+
+        q0_sel = tl.where(hit, q0, q0_sel)
+        qe_sel = tl.where(hit, qe, qe_sel)
+        ks_sel = tl.where(hit, ks, ks_sel)
+        klen_sel = tl.where(hit, klen, klen_sel)
+        r0_sel = tl.where(hit, r0, r0_sel)
+        delta_sel = tl.where(hit, delta, delta_sel)
+        bend_sel = tl.where(hit, bend, bend_sel)
+        full_sel = tl.where(hit, is_full, full_sel)
+        prefix += nblocks
+
+    tl.store(Q0_META + pid, q0_sel)
+    tl.store(QE_META + pid, qe_sel)
+    tl.store(KS_META + pid, ks_sel)
+    tl.store(KLEN_META + pid, klen_sel)
+    tl.store(R0_META + pid, r0_sel)
+    tl.store(DELTA_META + pid, delta_sel)
+    tl.store(BEND_META + pid, bend_sel)
+    tl.store(FULL_META + pid, full_sel)
 
 
 @triton.jit
@@ -1262,51 +1354,37 @@ def prefix_full_fwd_kernel(
 @triton.jit
 def overlap8_g4_special_kernel(
     Q, K, V, Out,
-    q_ranges_ptr, k_ranges_ptr, sink_ptr,
-    softmax_scale, num_sink,
+    Q0_META, QE_META, KS_META, KLEN_META,
+    R0_META, DELTA_META, BEND_META, FULL_META,
+    sink_ptr,
+    prefix_ks, prefix_len,
+    softmax_scale,
     stride_qz, stride_qh,
     stride_kz, stride_kh,
     stride_vz, stride_vh,
     stride_oz, stride_oh,
-    stride_sink_s, stride_sink_h,
     GROUP_SIZE: tl.constexpr,
-    NUM_BASE: tl.constexpr,
 ):
     pid_tile = tl.program_id(0)
     pid_kv = tl.program_id(1)
 
-    prefix_tiles = 0
-    qs_sel = 0
-    qe_sel = 0
-    ks_sel = 0
-    ke_sel = 0
-    local_block = 0
-    seg_sel = 0
-
-    for sidx in tl.static_range(0, NUM_BASE):
-        qs = tl.load(q_ranges_ptr + sidx * 2)
-        qe = tl.load(q_ranges_ptr + sidx * 2 + 1)
-        ks = tl.load(k_ranges_ptr + sidx * 2)
-        ke = tl.load(k_ranges_ptr + sidx * 2 + 1)
-        nblocks = tl.cdiv(qe - qs, 32)
-        hit = (pid_tile >= prefix_tiles) & (pid_tile < prefix_tiles + nblocks)
-        qs_sel = tl.where(hit, qs, qs_sel)
-        qe_sel = tl.where(hit, qe, qe_sel)
-        ks_sel = tl.where(hit, ks, ks_sel)
-        ke_sel = tl.where(hit, ke, ke_sel)
-        local_block = tl.where(hit, pid_tile - prefix_tiles, local_block)
-        seg_sel = tl.where(hit, sidx, seg_sel)
-        prefix_tiles += nblocks
+    q0 = tl.load(Q0_META + pid_tile).to(tl.int32)
+    qe = tl.load(QE_META + pid_tile).to(tl.int32)
+    ks = tl.load(KS_META + pid_tile).to(tl.int32)
+    k_len = tl.load(KLEN_META + pid_tile).to(tl.int32)
+    r0 = tl.load(R0_META + pid_tile).to(tl.int32)
+    delta = tl.load(DELTA_META + pid_tile).to(tl.int32)
+    b_end = tl.load(BEND_META + pid_tile).to(tl.int32)
+    is_full = tl.load(FULL_META + pid_tile).to(tl.int32)
 
     packed = tl.arange(0, 128)
     tok_local = packed // GROUP_SIZE
     gh = packed - tok_local * GROUP_SIZE
     qh = pid_kv * GROUP_SIZE + gh
 
-    q_len = qe_sel - qs_sel
-    r = local_block * 32 + tok_local
-    offs_m = qs_sel + r
-    mask_m = r < q_len
+    r = r0 + tok_local
+    offs_m = q0 + tok_local
+    mask_m = offs_m < qe
     d = tl.arange(0, 128)
 
     q = tl.load(
@@ -1318,17 +1396,11 @@ def overlap8_g4_special_kernel(
     l_i = tl.zeros([128], dtype=tl.float32)
     acc = tl.zeros([128, 128], dtype=tl.float32)
 
-    # Extra overlapping FULL prefix is the last slice, and only applies to
-    # base segments after segment 0.
-    pks = tl.load(k_ranges_ptr + NUM_BASE * 2)
-    pke = tl.load(k_ranges_ptr + NUM_BASE * 2 + 1)
-
-    if seg_sel > 0:
-        plen = pke - pks
-        for pb in range(0, tl.cdiv(plen, 64)):
+    if is_full == 0:
+        for pb in range(0, tl.cdiv(prefix_len, 64)):
             pu = pb * 64 + tl.arange(0, 64)
-            pn = pks + pu
-            pmask = pu < plen
+            pn = prefix_ks + pu
+            pmask = pu < prefix_len
 
             pk = tl.load(
                 K + pn[:, None] * stride_kz + pid_kv * stride_kh + d[None, :],
@@ -1339,16 +1411,8 @@ def overlap8_g4_special_kernel(
             qk = tl.where(vis, qk, -float("inf"))
 
             m_new = tl.maximum(m_i, tl.max(qk, axis=1))
-            alpha = tl.where(
-                m_i > -float("inf"),
-                tl.exp2(m_i - m_new),
-                0.0,
-            )
-            p = tl.where(
-                vis,
-                tl.exp2(qk - m_new[:, None]),
-                0.0,
-            )
+            alpha = tl.where(m_i > -float("inf"), tl.exp2(m_i - m_new), 0.0)
+            p = tl.where(vis, tl.exp2(qk - m_new[:, None]), 0.0)
             pv = tl.load(
                 V + pn[:, None] * stride_vz + pid_kv * stride_vh + d[None, :],
                 mask=pmask[:, None], other=0.0,
@@ -1358,19 +1422,9 @@ def overlap8_g4_special_kernel(
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new
 
-    # Base segment: first one is FULL, remaining six are CAUSAL.
-    k_len = ke_sel - ks_sel
-    if seg_sel == 0:
-        b_end = tl.cdiv(k_len, 64)
-    else:
-        r_last = tl.minimum(local_block * 32 + 32, q_len) - 1
-        causal_limit = r_last + (k_len - q_len)
-        b_end = tl.cdiv(causal_limit + 1, 64)
-        b_end = tl.maximum(0, tl.minimum(b_end, tl.cdiv(k_len, 64)))
-
     for b in range(0, b_end):
         u = b * 64 + tl.arange(0, 64)
-        n = ks_sel + u
+        n = ks + u
         nmask = u < k_len
         kk = tl.load(
             K + n[:, None] * stride_kz + pid_kv * stride_kh + d[None, :],
@@ -1378,25 +1432,15 @@ def overlap8_g4_special_kernel(
         )
         qk = tl.dot(q, tl.trans(kk)) * (softmax_scale * 1.4426950408889634)
 
-        if seg_sel == 0:
-            vis = mask_m[:, None] & nmask[None, :]
-        else:
-            vis = mask_m[:, None] & nmask[None, :] & (
-                u[None, :] <= (r[:, None] + (k_len - q_len))
-            )
+        causal_ok = u[None, :] <= (r[:, None] + delta)
+        vis = mask_m[:, None] & nmask[None, :] & (
+            (is_full != 0) | causal_ok
+        )
 
         qk = tl.where(vis, qk, -float("inf"))
         m_new = tl.maximum(m_i, tl.max(qk, axis=1))
-        alpha = tl.where(
-            m_i > -float("inf"),
-            tl.exp2(m_i - m_new),
-            0.0,
-        )
-        p = tl.where(
-            vis,
-            tl.exp2(qk - m_new[:, None]),
-            0.0,
-        )
+        alpha = tl.where(m_i > -float("inf"), tl.exp2(m_i - m_new), 0.0)
+        p = tl.where(vis, tl.exp2(qk - m_new[:, None]), 0.0)
         vv = tl.load(
             V + n[:, None] * stride_vz + pid_kv * stride_vh + d[None, :],
             mask=nmask[:, None], other=0.0,
@@ -1406,12 +1450,7 @@ def overlap8_g4_special_kernel(
         l_i = l_i * alpha + tl.sum(p, axis=1)
         m_i = m_new
 
-    # sink_ptr points to precomputed per-Q-head sink logsumexp.
-    slse = tl.load(
-        sink_ptr + qh,
-        mask=mask_m,
-        other=-float("inf"),
-    )
+    slse = tl.load(sink_ptr + qh, mask=mask_m, other=-float("inf"))
     denom = l_i + tl.exp2(slse * 1.4426950408889634 - m_i)
     acc = acc / denom[:, None]
 
@@ -1766,8 +1805,10 @@ def run_kernel(
     global _PREFIX_META_SRC, _PREFIX_Q0, _PREFIX_Q1, _PREFIX_KE, _PREFIX_BM, _PREFIX_TILES
     global _PREFIX_SINK_SRC, _PREFIX_SINK_LSE
     global _K128_LOG2_SRC, _K128_LOG2, _K128_LOG2_SCALE
+    global _D64_META_SRC, _D64_Q0, _D64_QE, _D64_KS, _D64_KLEN, _D64_R0, _D64_DELTA, _D64_BEND
+    global _OV8_META_SRC, _OV8_Q0, _OV8_QE, _OV8_KS, _OV8_KLEN, _OV8_R0, _OV8_DELTA, _OV8_BEND, _OV8_FULL
     if not _PRINTED_BUILD:
-        print("BUILD HYBRID_K128_V44")
+        print("BUILD STATIC_TILE_META_V45")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
@@ -2055,18 +2096,37 @@ def run_kernel(
 
         G = Hq // Hkv
         if D == 64 and N == 10 and all_causal and G == 4:
+            if _D64_META_SRC is not q_ranges:
+                tc = _META_BLOCKS32
+                _D64_Q0 = torch.empty((tc,), dtype=torch.int32, device=q.device)
+                _D64_QE = torch.empty((tc,), dtype=torch.int32, device=q.device)
+                _D64_KS = torch.empty((tc,), dtype=torch.int32, device=q.device)
+                _D64_KLEN = torch.empty((tc,), dtype=torch.int32, device=q.device)
+                _D64_R0 = torch.empty((tc,), dtype=torch.int32, device=q.device)
+                _D64_DELTA = torch.empty((tc,), dtype=torch.int32, device=q.device)
+                _D64_BEND = torch.empty((tc,), dtype=torch.int32, device=q.device)
+                build_partition_tile_meta_kernel[(tc,)](
+                    q_ranges, k_ranges,
+                    _D64_Q0, _D64_QE, _D64_KS, _D64_KLEN,
+                    _D64_R0, _D64_DELTA, _D64_BEND,
+                    BLOCK_M=32,
+                    BLOCK_N=64,
+                    NUM_SLICES=N,
+                    num_warps=1,
+                )
+                _D64_META_SRC = q_ranges
+
             partition_packgqa_causal_d64_kernel[(_META_BLOCKS32, Hkv)](
                 q, k, v, output,
-                q_ranges, k_ranges, _PREFIX_SINK_LSE,
+                _D64_Q0, _D64_QE, _D64_KS, _D64_KLEN,
+                _D64_R0, _D64_DELTA, _D64_BEND,
+                _PREFIX_SINK_LSE,
                 scale,
-                Ns,
                 Hq * D, D,
                 Hkv * D, D,
                 Hkv * D, D,
                 Hq * D, D,
-                Hq, 1,
                 GROUP_SIZE=G,
-                NUM_SLICES=N,
                 num_warps=8,
                 num_stages=4,
             )
@@ -2159,17 +2219,40 @@ def run_kernel(
             base_tiles += (qlen + 31) // 32
             i += 1
 
+        if _OV8_META_SRC is not q_ranges:
+            _OV8_Q0 = torch.empty((base_tiles,), dtype=torch.int32, device=q.device)
+            _OV8_QE = torch.empty((base_tiles,), dtype=torch.int32, device=q.device)
+            _OV8_KS = torch.empty((base_tiles,), dtype=torch.int32, device=q.device)
+            _OV8_KLEN = torch.empty((base_tiles,), dtype=torch.int32, device=q.device)
+            _OV8_R0 = torch.empty((base_tiles,), dtype=torch.int32, device=q.device)
+            _OV8_DELTA = torch.empty((base_tiles,), dtype=torch.int32, device=q.device)
+            _OV8_BEND = torch.empty((base_tiles,), dtype=torch.int32, device=q.device)
+            _OV8_FULL = torch.empty((base_tiles,), dtype=torch.int32, device=q.device)
+            build_overlap8_tile_meta_kernel[(base_tiles,)](
+                q_ranges, k_ranges,
+                _OV8_Q0, _OV8_QE, _OV8_KS, _OV8_KLEN,
+                _OV8_R0, _OV8_DELTA, _OV8_BEND, _OV8_FULL,
+                BLOCK_M=32,
+                BLOCK_N=64,
+                NUM_BASE=7,
+                num_warps=1,
+            )
+            _OV8_META_SRC = q_ranges
+
+        prefix_ks = int(_META_K[7][0])
+        prefix_len = int(_META_K[7][1]) - prefix_ks
         overlap8_g4_special_kernel[(base_tiles, Hkv)](
             q, k, v, output,
-            q_ranges, k_ranges, sink,
-            scale, Ns,
+            _OV8_Q0, _OV8_QE, _OV8_KS, _OV8_KLEN,
+            _OV8_R0, _OV8_DELTA, _OV8_BEND, _OV8_FULL,
+            _PREFIX_SINK_LSE,
+            prefix_ks, prefix_len,
+            scale,
             Hq * D, D,
             Hkv * D, D,
             Hkv * D, D,
             Hq * D, D,
-            Hq, 1,
             GROUP_SIZE=G,
-            NUM_BASE=7,
             num_warps=8,
             num_stages=4,
         )
