@@ -466,6 +466,67 @@ def packgqa_g8_kernel(
     key=["q_len", "k_len", "head_dim", "ATTN_TYPE"],
 )
 @triton.jit
+def single_full_g1_d128_fast_kernel(
+    Q, K, V, Out, SINK_LSE,
+    softmax_scale,
+    stride_qz, stride_qh,
+    stride_kz, stride_kh,
+    stride_vz, stride_vh,
+    stride_oz, stride_oh,
+):
+    pid_m = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    # Exact #9 shape: S=2048, G=1, D=128, FULL.
+    # 2048 is divisible by both M=128 and N=64, so the entire numerical
+    # mainloop is mask-free.
+    offs_m = pid_m * 128 + tl.arange(0, 128)
+    d = tl.arange(0, 128)
+
+    q = tl.load(
+        Q + offs_m[:, None] * stride_qz + pid_h * stride_qh + d[None, :]
+    )
+
+    m_i = tl.zeros([128], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([128], dtype=tl.float32)
+    acc = tl.zeros([128, 128], dtype=tl.float32)
+
+    for b in range(0, 32):
+        n = b * 64 + tl.arange(0, 64)
+
+        kk = tl.load(
+            K + n[:, None] * stride_kz + pid_h * stride_kh + d[None, :]
+        )
+        qk = tl.dot(q, tl.trans(kk)) * (softmax_scale * 1.4426950408889634)
+
+        m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+        alpha = tl.where(
+            m_i > -float("inf"),
+            tl.exp2(m_i - m_new),
+            0.0,
+        )
+        p = tl.exp2(qk - m_new[:, None])
+
+        vv = tl.load(
+            V + n[:, None] * stride_vz + pid_h * stride_vh + d[None, :]
+        )
+
+        acc = acc * alpha[:, None]
+        acc = tl.dot(p.to(tl.bfloat16), vv, acc)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_new
+
+    slse = tl.load(SINK_LSE + pid_h).to(tl.float32)
+    denom = l_i + tl.exp2(slse * 1.4426950408889634 - m_i)
+    acc = acc / denom[:, None]
+
+    tl.store(
+        Out + offs_m[:, None] * stride_oz + pid_h * stride_oh + d[None, :],
+        acc.to(tl.bfloat16),
+    )
+
+
+@triton.jit
 def single_slice_fwd_kernel(
     Q, K, V, Out, sink_ptr,
     softmax_scale,
@@ -2529,7 +2590,7 @@ def run_kernel(
     global _G8M_META_SRC, _G8M_Q0, _G8M_QE, _G8M_KS, _G8M_KLEN, _G8M_R0, _G8M_LO, _G8M_HI, _G8M_BSTART, _G8M_BEND, _G8M_FSTART, _G8M_FEND, _G8M_TILES
     global _OV8_META_SRC, _OV8_Q0, _OV8_QE, _OV8_KS, _OV8_KLEN, _OV8_R0, _OV8_DELTA, _OV8_BEND, _OV8_FULL
     if not _PRINTED_BUILD:
-        print("BUILD STATIC_CAUSAL_FRONTIER_V58")
+        print("BUILD G1_FULL_FASTPATH_V59")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
@@ -2641,6 +2702,24 @@ def run_kernel(
                     GROUP_SIZE=G,
                     BLOCK_D=D,
                     ATTN_TYPE=typ,
+                    num_warps=8,
+                    num_stages=4,
+                )
+                return
+
+            if (
+                typ == 0 and D == 128 and G == 1
+                and S == 2048 and Hq == 8 and Hkv == 8
+                and qs == 0 and ks == 0
+                and q_len == 2048 and k_len == 2048
+            ):
+                single_full_g1_d128_fast_kernel[(16, Hq)](
+                    q, k, v, output, _PREFIX_SINK_LSE,
+                    scale,
+                    Hq * D, D,
+                    Hkv * D, D,
+                    Hkv * D, D,
+                    Hq * D, D,
                     num_warps=8,
                     num_stages=4,
                 )
