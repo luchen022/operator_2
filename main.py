@@ -2686,7 +2686,7 @@ def run_kernel(
     global _G8M_META_SRC, _G8M_Q0, _G8M_QE, _G8M_KS, _G8M_KLEN, _G8M_R0, _G8M_LO, _G8M_HI, _G8M_BSTART, _G8M_BEND, _G8M_FSTART, _G8M_FEND, _G8M_TILES
     global _OV8_META_SRC, _OV8_Q0, _OV8_QE, _OV8_KS, _OV8_KLEN, _OV8_R0, _OV8_DELTA, _OV8_BEND, _OV8_FULL
     if not _PRINTED_BUILD:
-        print("BUILD PREFIX_G4_4WARPS_V67")
+        print("BUILD STABLE_94_33_V68")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
@@ -2955,7 +2955,6 @@ def run_kernel(
 
             if use_prefix_packgqa:
                 bn = 64 if G == 4 else 128
-                nw = 4 if (G == 4 and Hq == 8 and Hkv == 2) else 8
                 prefix_packgqa_full_kernel[(_PREFIX_TILES, Hkv)](
                     q, k, v, output,
                     _PREFIX_Q0, _PREFIX_Q1, _PREFIX_KE,
@@ -2968,7 +2967,7 @@ def run_kernel(
                     GROUP_SIZE=G,
                     BLOCK_N=bn,
                     BLOCK_D=D,
-                    num_warps=nw,
+                    num_warps=8,
                     num_stages=4 if bn == 64 else 3,
                 )
             else:
