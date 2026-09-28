@@ -1611,7 +1611,7 @@ def run_kernel(
     global _PREFIX_META_SRC, _PREFIX_Q0, _PREFIX_Q1, _PREFIX_KE, _PREFIX_BM, _PREFIX_TILES
     global _PREFIX_SINK_SRC, _PREFIX_SINK_LSE
     if not _PRINTED_BUILD:
-        print("BUILD D64_G4_PACKGQA_V26")
+        print("BUILD PREFIX_G4_BN128_V27")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
@@ -1826,7 +1826,9 @@ def run_kernel(
                 _PREFIX_SINK_SRC = sink
 
             if use_prefix_packgqa:
-                bn = 64 if G == 4 else 128
+                # Try a wider K tile for the G=4 prefix-FULL family (#8).
+                # G=8 already uses BN128 successfully.
+                bn = 128
                 prefix_packgqa_full_kernel[(_PREFIX_TILES, Hkv)](
                     q, k, v, output,
                     _PREFIX_Q0, _PREFIX_Q1, _PREFIX_KE,
