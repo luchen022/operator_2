@@ -99,18 +99,18 @@ def packgqa_full_128_kernel(
             K + offs_n[:, None] * stride_kz + pid_kv * stride_kh + offs_d[None, :],
             mask=mask_n[:, None], other=0.0,
         )
-        qk = tl.dot(q, tl.trans(k)) * softmax_scale
+        qk = tl.dot(q, tl.trans(k)) * (softmax_scale * 1.4426950408889634)
         vis = mask_m[:, None] & mask_n[None, :]
         qk = tl.where(vis, qk, -float("inf"))
         m_new = tl.maximum(m_i, tl.max(qk, axis=1))
         alpha = tl.where(
             m_i > -float("inf"),
-            tl.exp2((m_i - m_new) * 1.4426950408889634),
+            tl.exp2(m_i - m_new),
             0.0,
         )
         p = tl.where(
             vis,
-            tl.exp2((qk - m_new[:, None]) * 1.4426950408889634),
+            tl.exp2(qk - m_new[:, None]),
             0.0,
         )
         vv = tl.load(
@@ -128,7 +128,7 @@ def packgqa_full_128_kernel(
         mask=mask_m,
         other=-float("inf"),
     )
-    denom = l_i + tl.exp2((slse - m_i) * 1.4426950408889634)
+    denom = l_i + tl.exp2(slse * 1.4426950408889634 - m_i)
     acc = acc / denom[:, None]
 
     tl.store(
@@ -205,7 +205,7 @@ def packgqa_g8_kernel(
             other=0.0,
         )
 
-        qk = tl.dot(q, tl.trans(k)) * softmax_scale
+        qk = tl.dot(q, tl.trans(k)) * (softmax_scale * 1.4426950408889634)
         if ATTN_TYPE == 0:
             vis = mask_m[:, None] & mask_n[None, :]
         elif ATTN_TYPE == 1:
@@ -227,12 +227,12 @@ def packgqa_g8_kernel(
         m_new = tl.maximum(m_i, tl.max(qk, axis=1))
         alpha = tl.where(
             m_i > -float("inf"),
-            tl.exp2((m_i - m_new) * 1.4426950408889634),
+            tl.exp2(m_i - m_new),
             0.0,
         )
         p = tl.where(
             vis,
-            tl.exp2((qk - m_new[:, None]) * 1.4426950408889634),
+            tl.exp2(qk - m_new[:, None]),
             0.0,
         )
 
@@ -253,7 +253,7 @@ def packgqa_g8_kernel(
         mask=mask_m,
         other=-float("inf"),
     )
-    denom = l_i + tl.exp2((slse - m_i) * 1.4426950408889634)
+    denom = l_i + tl.exp2(slse * 1.4426950408889634 - m_i)
     acc = acc / denom[:, None]
 
     tl.store(
@@ -811,7 +811,7 @@ def partition_packgqa_causal_d64_kernel(
             K + offs_n[:, None] * stride_kz + pid_kv * stride_kh + d[None, :],
             mask=mask_n[:, None], other=0.0,
         )
-        qk = tl.dot(q, tl.trans(k)) * softmax_scale
+        qk = tl.dot(q, tl.trans(k)) * (softmax_scale * 1.4426950408889634)
 
         vis = mask_m[:, None] & mask_n[None, :] & (
             u[None, :] <= (r[:, None] + (k_len - q_len))
@@ -821,12 +821,12 @@ def partition_packgqa_causal_d64_kernel(
         m_new = tl.maximum(m_i, tl.max(qk, axis=1))
         alpha = tl.where(
             m_i > -float("inf"),
-            tl.exp2((m_i - m_new) * 1.4426950408889634),
+            tl.exp2(m_i - m_new),
             0.0,
         )
         p = tl.where(
             vis,
-            tl.exp2((qk - m_new[:, None]) * 1.4426950408889634),
+            tl.exp2(qk - m_new[:, None]),
             0.0,
         )
 
@@ -846,7 +846,7 @@ def partition_packgqa_causal_d64_kernel(
         mask=mask_m,
         other=-float("inf"),
     )
-    denom = l_i + tl.exp2((slse - m_i) * 1.4426950408889634)
+    denom = l_i + tl.exp2(slse * 1.4426950408889634 - m_i)
     acc = acc / denom[:, None]
 
     tl.store(
@@ -1126,19 +1126,19 @@ def prefix_packgqa_full_kernel(
             mask=mask_n[:, None],
             other=0.0,
         )
-        qk = tl.dot(q, tl.trans(k)) * softmax_scale
+        qk = tl.dot(q, tl.trans(k)) * (softmax_scale * 1.4426950408889634)
         vis = mask_m[:, None] & mask_n[None, :]
         qk = tl.where(vis, qk, -float("inf"))
 
         m_new = tl.maximum(m_i, tl.max(qk, axis=1))
         alpha = tl.where(
             m_i > -float("inf"),
-            tl.exp2((m_i - m_new) * 1.4426950408889634),
+            tl.exp2(m_i - m_new),
             0.0,
         )
         p = tl.where(
             vis,
-            tl.exp2((qk - m_new[:, None]) * 1.4426950408889634),
+            tl.exp2(qk - m_new[:, None]),
             0.0,
         )
 
@@ -1154,7 +1154,7 @@ def prefix_packgqa_full_kernel(
         m_i = m_new
 
     sink_lse = tl.load(SINK_LSE + qh, mask=mask_m, other=-float("inf")).to(tl.float32)
-    denom = l_i + tl.exp2((sink_lse - m_i) * 1.4426950408889634)
+    denom = l_i + tl.exp2(sink_lse * 1.4426950408889634 - m_i)
     acc = acc / denom[:, None]
 
     tl.store(
@@ -1319,19 +1319,19 @@ def overlap8_g4_special_kernel(
                 K + pn[:, None] * stride_kz + pid_kv * stride_kh + d[None, :],
                 mask=pmask[:, None], other=0.0,
             )
-            qk = tl.dot(q, tl.trans(pk)) * softmax_scale
+            qk = tl.dot(q, tl.trans(pk)) * (softmax_scale * 1.4426950408889634)
             vis = mask_m[:, None] & pmask[None, :]
             qk = tl.where(vis, qk, -float("inf"))
 
             m_new = tl.maximum(m_i, tl.max(qk, axis=1))
             alpha = tl.where(
                 m_i > -float("inf"),
-                tl.exp2((m_i - m_new) * 1.4426950408889634),
+                tl.exp2(m_i - m_new),
                 0.0,
             )
             p = tl.where(
                 vis,
-                tl.exp2((qk - m_new[:, None]) * 1.4426950408889634),
+                tl.exp2(qk - m_new[:, None]),
                 0.0,
             )
             pv = tl.load(
@@ -1361,7 +1361,7 @@ def overlap8_g4_special_kernel(
             K + n[:, None] * stride_kz + pid_kv * stride_kh + d[None, :],
             mask=nmask[:, None], other=0.0,
         )
-        qk = tl.dot(q, tl.trans(kk)) * softmax_scale
+        qk = tl.dot(q, tl.trans(kk)) * (softmax_scale * 1.4426950408889634)
 
         if seg_sel == 0:
             vis = mask_m[:, None] & nmask[None, :]
@@ -1374,12 +1374,12 @@ def overlap8_g4_special_kernel(
         m_new = tl.maximum(m_i, tl.max(qk, axis=1))
         alpha = tl.where(
             m_i > -float("inf"),
-            tl.exp2((m_i - m_new) * 1.4426950408889634),
+            tl.exp2(m_i - m_new),
             0.0,
         )
         p = tl.where(
             vis,
-            tl.exp2((qk - m_new[:, None]) * 1.4426950408889634),
+            tl.exp2(qk - m_new[:, None]),
             0.0,
         )
         vv = tl.load(
@@ -1397,7 +1397,7 @@ def overlap8_g4_special_kernel(
         mask=mask_m,
         other=-float("inf"),
     )
-    denom = l_i + tl.exp2((slse - m_i) * 1.4426950408889634)
+    denom = l_i + tl.exp2(slse * 1.4426950408889634 - m_i)
     acc = acc / denom[:, None]
 
     tl.store(
@@ -1492,7 +1492,7 @@ def generic_packgqa_fwd_kernel(
                 other=0.0,
             )
 
-            qk = tl.dot(q, tl.trans(k)) * softmax_scale
+            qk = tl.dot(q, tl.trans(k)) * (softmax_scale * 1.4426950408889634)
 
             r = tok - qs
             u = offs_n - ks
@@ -1519,12 +1519,12 @@ def generic_packgqa_fwd_kernel(
 
             alpha = tl.where(
                 m_i > -float("inf"),
-                tl.exp2((m_i - m_new) * 1.4426950408889634),
+                tl.exp2(m_i - m_new),
                 0.0,
             )
             p = tl.where(
                 vis,
-                tl.exp2((qk - m_new[:, None]) * 1.4426950408889634),
+                tl.exp2(qk - m_new[:, None]),
                 0.0,
             )
 
@@ -1545,7 +1545,7 @@ def generic_packgqa_fwd_kernel(
         mask=mask_m,
         other=-float("inf"),
     )
-    denom = l_i + tl.exp2((slse - m_i) * 1.4426950408889634)
+    denom = l_i + tl.exp2(slse * 1.4426950408889634 - m_i)
     acc = acc / denom[:, None]
 
     tl.store(
@@ -1751,7 +1751,7 @@ def run_kernel(
     global _PREFIX_META_SRC, _PREFIX_Q0, _PREFIX_Q1, _PREFIX_KE, _PREFIX_BM, _PREFIX_TILES
     global _PREFIX_SINK_SRC, _PREFIX_SINK_LSE
     if not _PRINTED_BUILD:
-        print("BUILD GLOBAL_SINK_LSE_V41")
+        print("BUILD LOG2_SOFTMAX_V42")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
