@@ -30,6 +30,9 @@ def _build_ffa_kernel(
 ):
     G = Hq // Hkv
     scale_log2 = softmax_scale * _LOG2E
+    # Finite masking sentinel avoids (-inf)-(-inf) in online softmax when a
+    # Q row has no visible keys in an early K tile (e.g. shifted/full slices).
+    neg_large = -1.0e30
 
     q_shape = (S, Hq, D)
     kv_shape = (S, Hkv, D)
@@ -85,7 +88,7 @@ def _build_ffa_kernel(
 
             T.fill(acc_o, 0.0)
             T.fill(logsum, 0.0)
-            T.fill(scores_max, -T.infinity(acc_s.dtype))
+            T.fill(scores_max, neg_large)
 
             for kb in T.Pipelined(T.ceildiv(S, block_N), num_stages=num_stages):
                 T.copy(
@@ -128,7 +131,7 @@ def _build_ffa_kernel(
                     acc_s[i, j] = T.if_then_else(
                         mult[i, j] > 0.0,
                         0.0,
-                        -T.infinity(acc_s.dtype),
+                        neg_large,
                     )
 
                 T.gemm(
@@ -260,7 +263,7 @@ def run_kernel(
 
     global _PRINTED_BUILD
     if not _PRINTED_BUILD:
-        print("BUILD TILELANG_GENERIC_FA_V1")
+        print("BUILD TILELANG_GENERIC_FA_V2_FINITE_MASK")
         _PRINTED_BUILD = True
 
     kernel = _get_kernel(S, Hq, Hkv, D, N, Ns, scale)
