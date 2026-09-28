@@ -25,6 +25,8 @@ _PREFIX_Q1 = None
 _PREFIX_KE = None
 _PREFIX_BM = 0
 _PREFIX_TILES = 0
+_PREFIX_SINK_SRC = None
+_PREFIX_SINK_LSE = None
 
 
 @triton.jit
@@ -228,7 +230,6 @@ def single_slice_fp8_pv_kernel(
     stride_vz8, stride_vh8,
     stride_vsz, stride_vsh,
     stride_oz, stride_oh,
-    stride_sink_s, stride_sink_h,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -699,6 +700,23 @@ def partition_fwd_kernel(
 
 
 @triton.jit
+def build_sink_lse_kernel(
+    SINK,
+    SINK_LSE,
+    HQ: tl.constexpr,
+    NSINK: tl.constexpr,
+):
+    h = tl.program_id(0)
+    offs = tl.arange(0, 16)
+    mask = offs < NSINK
+    x = tl.load(SINK + offs * HQ + h, mask=mask, other=-float("inf"))
+    x_max = tl.max(x, axis=0)
+    x_sum = tl.sum(tl.exp2((x - x_max) * 1.4426950408889634), axis=0)
+    lse = x_max + tl.log2(x_sum) * 0.6931471805599453
+    tl.store(SINK_LSE + h, lse)
+
+
+@triton.jit
 def build_prefix_meta_kernel(
     q_ranges_ptr,
     k_ranges_ptr,
@@ -740,9 +758,9 @@ def build_prefix_meta_kernel(
 def prefix_full_fwd_kernel(
     Q, K, V, Out,
     Q0_META, Q1_META, KE_META,
-    sink_ptr,
+    SINK_LSE,
     softmax_scale,
-    num_q_heads, num_kv_heads, num_sink,
+    num_q_heads, num_kv_heads,
     stride_qz, stride_qh,
     stride_kz, stride_kh,
     stride_vz, stride_vh,
@@ -806,29 +824,12 @@ def prefix_full_fwd_kernel(
         l_i = l_i * alpha + tl.sum(p, 1)
         m_i = m_new
 
-    has_keys = l_i > 0.0
-    acc = acc / tl.where(has_keys[:, None], l_i[:, None], 1.0)
-    acc = tl.where(has_keys[:, None], acc, 0.0)
-
-    # Keep sink handling identical to the proven BF16 path.
-    if num_sink > 0:
-        offs_sink = tl.arange(0, 16)
-        mask_sink = offs_sink < num_sink
-        sink_vals = tl.load(
-            sink_ptr + offs_sink * stride_sink_s + pid_h * stride_sink_h,
-            mask=mask_sink,
-            other=-float("inf"),
-        )
-        sink_max = tl.max(sink_vals, 0)
-        sink_sum = tl.sum(tl.math.exp(sink_vals - sink_max), 0)
-        sink_lse = sink_max + tl.math.log(sink_sum)
-
-        token_lse = m_i + tl.math.log(tl.maximum(l_i, 1e-20))
-        m_final = tl.maximum(token_lse, sink_lse)
-        num = tl.math.exp(token_lse - m_final)
-        den = num + tl.math.exp(sink_lse - m_final)
-        sink_scale = num / den
-        acc = acc * tl.where(has_keys[:, None], sink_scale[:, None], 0.0)
+    # Fold Attention Sink directly into the online-softmax denominator:
+    # final = acc / (l_i + exp(sink_lse - m_i)).
+    sink_lse = tl.load(SINK_LSE + pid_h).to(tl.float32)
+    sink_term = tl.exp2((sink_lse - m_i) * 1.4426950408889634)
+    denom = l_i + sink_term
+    acc = acc / denom[:, None]
 
     out_ptrs = Out + offs_m[:, None] * stride_oz + pid_h * stride_oh + offs_d[None, :]
     tl.store(out_ptrs, acc.to(tl.bfloat16), mask=mask_m[:, None])
@@ -1028,8 +1029,9 @@ def run_kernel(
     global _K_FP8_SRC, _K_FP8, _K_SCALE
     global _V_FP8_SRC, _V_FP8, _V_SCALE, _PRINTED_BUILD
     global _PREFIX_META_SRC, _PREFIX_Q0, _PREFIX_Q1, _PREFIX_KE, _PREFIX_BM, _PREFIX_TILES
+    global _PREFIX_SINK_SRC, _PREFIX_SINK_LSE
     if not _PRINTED_BUILD:
-        print("BUILD PREFIX_FULL_SANDBOX_V9")
+        print("BUILD PREFIX_FULL_SINK_V10")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
@@ -1186,22 +1188,33 @@ def run_kernel(
                 _PREFIX_BM = bm
                 _PREFIX_TILES = tile_count
 
+            if _PREFIX_SINK_SRC is not sink:
+                _PREFIX_SINK_LSE = torch.empty((Hq,), dtype=torch.float32, device=q.device)
+                build_sink_lse_kernel[(Hq,)](
+                    sink,
+                    _PREFIX_SINK_LSE,
+                    HQ=Hq,
+                    NSINK=Ns,
+                    num_warps=1,
+                )
+                _PREFIX_SINK_SRC = sink
+
+            bn = 64 if Hq <= 8 else 128
             prefix_full_fwd_kernel[(_PREFIX_TILES, Hq)](
                 q, k, v, output,
                 _PREFIX_Q0, _PREFIX_Q1, _PREFIX_KE,
-                sink,
+                _PREFIX_SINK_LSE,
                 scale,
-                Hq, Hkv, Ns,
+                Hq, Hkv,
                 Hq * D, D,
                 Hkv * D, D,
                 Hkv * D, D,
                 Hq * D, D,
-                Hq, 1,
                 BLOCK_M=bm,
-                BLOCK_N=64,
+                BLOCK_N=bn,
                 BLOCK_D=D,
                 num_warps=4 if bm == 32 else 8,
-                num_stages=4,
+                num_stages=4 if bn == 64 else 3,
             )
             return
 
