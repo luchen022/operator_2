@@ -27,6 +27,21 @@ _PREFIX_BM = 0
 _PREFIX_TILES = 0
 _PREFIX_SINK_SRC = None
 _PREFIX_SINK_LSE = None
+_K_LOG2_SRC = None
+_K_LOG2 = None
+_K_LOG2_SCALE = None
+
+
+@triton.jit
+def prescale_k_log2_kernel(
+    K, K_LOG2,
+    factor,
+    D: tl.constexpr,
+):
+    row = tl.program_id(0)
+    d = tl.arange(0, D)
+    x = tl.load(K + row * D + d)
+    tl.store(K_LOG2 + row * D + d, (x * factor).to(tl.bfloat16))
 
 
 @triton.jit
@@ -99,7 +114,7 @@ def packgqa_full_128_kernel(
             K + offs_n[:, None] * stride_kz + pid_kv * stride_kh + offs_d[None, :],
             mask=mask_n[:, None], other=0.0,
         )
-        qk = tl.dot(q, tl.trans(k)) * (softmax_scale * 1.4426950408889634)
+        qk = tl.dot(q, tl.trans(k))
         vis = mask_m[:, None] & mask_n[None, :]
         qk = tl.where(vis, qk, -float("inf"))
         m_new = tl.maximum(m_i, tl.max(qk, axis=1))
@@ -205,7 +220,7 @@ def packgqa_g8_kernel(
             other=0.0,
         )
 
-        qk = tl.dot(q, tl.trans(k)) * (softmax_scale * 1.4426950408889634)
+        qk = tl.dot(q, tl.trans(k))
         if ATTN_TYPE == 0:
             vis = mask_m[:, None] & mask_n[None, :]
         elif ATTN_TYPE == 1:
@@ -811,7 +826,7 @@ def partition_packgqa_causal_d64_kernel(
             K + offs_n[:, None] * stride_kz + pid_kv * stride_kh + d[None, :],
             mask=mask_n[:, None], other=0.0,
         )
-        qk = tl.dot(q, tl.trans(k)) * (softmax_scale * 1.4426950408889634)
+        qk = tl.dot(q, tl.trans(k))
 
         vis = mask_m[:, None] & mask_n[None, :] & (
             u[None, :] <= (r[:, None] + (k_len - q_len))
@@ -1126,7 +1141,7 @@ def prefix_packgqa_full_kernel(
             mask=mask_n[:, None],
             other=0.0,
         )
-        qk = tl.dot(q, tl.trans(k)) * (softmax_scale * 1.4426950408889634)
+        qk = tl.dot(q, tl.trans(k))
         vis = mask_m[:, None] & mask_n[None, :]
         qk = tl.where(vis, qk, -float("inf"))
 
@@ -1319,7 +1334,7 @@ def overlap8_g4_special_kernel(
                 K + pn[:, None] * stride_kz + pid_kv * stride_kh + d[None, :],
                 mask=pmask[:, None], other=0.0,
             )
-            qk = tl.dot(q, tl.trans(pk)) * (softmax_scale * 1.4426950408889634)
+            qk = tl.dot(q, tl.trans(pk))
             vis = mask_m[:, None] & pmask[None, :]
             qk = tl.where(vis, qk, -float("inf"))
 
@@ -1361,7 +1376,7 @@ def overlap8_g4_special_kernel(
             K + n[:, None] * stride_kz + pid_kv * stride_kh + d[None, :],
             mask=nmask[:, None], other=0.0,
         )
-        qk = tl.dot(q, tl.trans(kk)) * (softmax_scale * 1.4426950408889634)
+        qk = tl.dot(q, tl.trans(kk))
 
         if seg_sel == 0:
             vis = mask_m[:, None] & nmask[None, :]
@@ -1492,7 +1507,7 @@ def generic_packgqa_fwd_kernel(
                 other=0.0,
             )
 
-            qk = tl.dot(q, tl.trans(k)) * (softmax_scale * 1.4426950408889634)
+            qk = tl.dot(q, tl.trans(k))
 
             r = tok - qs
             u = offs_n - ks
@@ -1750,8 +1765,9 @@ def run_kernel(
     global _V_FP8_SRC, _V_FP8, _V_SCALE, _PRINTED_BUILD
     global _PREFIX_META_SRC, _PREFIX_Q0, _PREFIX_Q1, _PREFIX_KE, _PREFIX_BM, _PREFIX_TILES
     global _PREFIX_SINK_SRC, _PREFIX_SINK_LSE
+    global _K_LOG2_SRC, _K_LOG2, _K_LOG2_SCALE
     if not _PRINTED_BUILD:
-        print("BUILD LOG2_SOFTMAX_V42")
+        print("BUILD PRESCALED_K_LOG2_V43")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
@@ -1800,6 +1816,26 @@ def run_kernel(
         )
         _PREFIX_SINK_SRC = sink
 
+    k_log2_factor = scale * 1.4426950408889634
+    if (
+        _K_LOG2_SRC is not k
+        or _K_LOG2_SCALE != k_log2_factor
+    ):
+        _K_LOG2 = torch.empty(
+            (S, Hkv, D),
+            dtype=torch.bfloat16,
+            device=k.device,
+        )
+        prescale_k_log2_kernel[(S * Hkv,)](
+            k,
+            _K_LOG2,
+            k_log2_factor,
+            D=D,
+            num_warps=4,
+        )
+        _K_LOG2_SRC = k
+        _K_LOG2_SCALE = k_log2_factor
+
     if _META_PARTITION:
         if N == 1:
             qs = int(_META_Q[0][0])
@@ -1813,7 +1849,7 @@ def run_kernel(
             G = Hq // Hkv
             if typ == 0 and D == 128 and Hkv == 1 and G == 128 and q_len == S and k_len == S:
                 packgqa_full_128_kernel[(triton.cdiv(q_len * G, 128), Hkv)](
-                    q, k, v, output, _PREFIX_SINK_LSE,
+                    q, _K_LOG2, v, output, _PREFIX_SINK_LSE,
                     scale,
                     qs, q_len, ks, k_len, Ns,
                     Hq * D, D,
@@ -1832,7 +1868,7 @@ def run_kernel(
             # mask-capable kernel. One CTA covers 32 tokens x 4 Q heads.
             if D == 128 and G == 4:
                 packgqa_g8_kernel[(triton.cdiv(q_len * G, 128), Hkv)](
-                    q, k, v, output, _PREFIX_SINK_LSE,
+                    q, _K_LOG2, v, output, _PREFIX_SINK_LSE,
                     scale,
                     qs, q_len, ks, k_len, Ns,
                     Hq * D, D,
@@ -1983,7 +2019,7 @@ def run_kernel(
             if use_prefix_packgqa:
                 bn = 64 if G == 4 else 128
                 prefix_packgqa_full_kernel[(_PREFIX_TILES, Hkv)](
-                    q, k, v, output,
+                    q, _K_LOG2, v, output,
                     _PREFIX_Q0, _PREFIX_Q1, _PREFIX_KE,
                     _PREFIX_SINK_LSE,
                     scale,
@@ -2020,7 +2056,7 @@ def run_kernel(
         G = Hq // Hkv
         if D == 64 and N == 10 and all_causal and G == 4:
             partition_packgqa_causal_d64_kernel[(_META_BLOCKS32, Hkv)](
-                q, k, v, output,
+                q, _K_LOG2, v, output,
                 q_ranges, k_ranges, _PREFIX_SINK_LSE,
                 scale,
                 Ns,
@@ -2079,7 +2115,7 @@ def run_kernel(
 
             if D == 128 and G == 8:
                 packgqa_g8_kernel[(triton.cdiv(q_len * G, 128), Hkv)](
-                    q, k, v, output, _PREFIX_SINK_LSE,
+                    q, _K_LOG2, v, output, _PREFIX_SINK_LSE,
                     scale,
                     qs, q_len, ks, k_len, Ns,
                     Hq * D, D,
@@ -2124,7 +2160,7 @@ def run_kernel(
             i += 1
 
         overlap8_g4_special_kernel[(base_tiles, Hkv)](
-            q, k, v, output,
+            q, _K_LOG2, v, output,
             q_ranges, k_ranges, sink,
             scale, Ns,
             Hq * D, D,
@@ -2141,7 +2177,7 @@ def run_kernel(
 
     if D == 128 and (G == 2 or G == 4):
         generic_packgqa_fwd_kernel[(triton.cdiv(S * G, 128), Hkv)](
-            q, k, v, output,
+            q, _K_LOG2, v, output,
             q_ranges, k_ranges, attn_type_map, _PREFIX_SINK_LSE,
             scale,
             S, Ns,
