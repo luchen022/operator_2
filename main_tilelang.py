@@ -144,7 +144,7 @@ def _build_ffa_kernel(
 
                 # Online softmax.
                 T.copy(scores_max, scores_max_prev)
-                T.fill(scores_max, -T.infinity(acc_s.dtype))
+                T.fill(scores_max, neg_large)
                 T.reduce_max(acc_s, scores_max, dim=1, clear=False)
 
                 for i in T.Parallel(block_M):
