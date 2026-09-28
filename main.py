@@ -1487,7 +1487,7 @@ def run_kernel(
     global _PREFIX_META_SRC, _PREFIX_Q0, _PREFIX_Q1, _PREFIX_KE, _PREFIX_BM, _PREFIX_TILES
     global _PREFIX_SINK_SRC, _PREFIX_SINK_LSE
     if not _PRINTED_BUILD:
-        print("BUILD G4_WARPS4_V22")
+        print("BUILD G4_STAGES3_V23")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
@@ -1564,8 +1564,8 @@ def run_kernel(
                     GROUP_SIZE=G,
                     BLOCK_D=D,
                     ATTN_TYPE=typ,
-                    num_warps=4,
-                    num_stages=4,
+                    num_warps=8,
+                    num_stages=3,
                 )
                 return
 
