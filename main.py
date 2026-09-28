@@ -393,7 +393,6 @@ def single_slice_fp8_qk_kernel(
     stride_ksz, stride_ksh,
     stride_vz, stride_vh,
     stride_oz, stride_oh,
-    stride_sink_s, stride_sink_h,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -1031,7 +1030,7 @@ def run_kernel(
     global _PREFIX_META_SRC, _PREFIX_Q0, _PREFIX_Q1, _PREFIX_KE, _PREFIX_BM, _PREFIX_TILES
     global _PREFIX_SINK_SRC, _PREFIX_SINK_LSE
     if not _PRINTED_BUILD:
-        print("BUILD PREFIX_FULL_SINK_V10")
+        print("BUILD PREFIX_FULL_SINK_V11")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
