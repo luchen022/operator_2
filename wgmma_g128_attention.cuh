@@ -45,12 +45,11 @@ void g128_full_wgmma_fwd(
     __nv_bfloat16* __restrict__ out,
     float softmax_scale
 ) {
-    // Two independent Q/P tiles, one per warpgroup.
-    __shared__ __align__(128) __nv_bfloat16 q_s[2 * QK_SLICES * BLOCK_ELEMS];
-    __shared__ __align__(128) __nv_bfloat16 p_s[2 * PV_SLICES * BLOCK_ELEMS];
-
-    // Shared once by both warpgroups: K then reused as V^T.
-    __shared__ __align__(128) __nv_bfloat16 kv_s[QK_SLICES * BLOCK_ELEMS];
+    // 64 KiB total, so use opt-in dynamic shared memory (>48 KiB).
+    extern __shared__ __align__(128) unsigned char smem_raw[];
+    __nv_bfloat16* q_s = reinterpret_cast<__nv_bfloat16*>(smem_raw);
+    __nv_bfloat16* p_s = q_s + 2 * QK_SLICES * BLOCK_ELEMS;
+    __nv_bfloat16* kv_s = p_s + 2 * PV_SLICES * BLOCK_ELEMS;
 
     const int wg = threadIdx.x >> 7;      // 0 / 1
     const int wtid = threadIdx.x & 127;   // 0..127 within warpgroup
@@ -278,7 +277,18 @@ inline void launch_g128_wgmma(
     __nv_bfloat16* out,
     float softmax_scale
 ) {
-    g128_full_wgmma_fwd<<<S12, 256>>>(
+    constexpr int smem_bytes =
+        (2 * QK_SLICES * BLOCK_ELEMS
+       + 2 * PV_SLICES * BLOCK_ELEMS
+       +     QK_SLICES * BLOCK_ELEMS) * sizeof(__nv_bfloat16);
+
+    cudaFuncSetAttribute(
+        g128_full_wgmma_fwd,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        smem_bytes
+    );
+
+    g128_full_wgmma_fwd<<<S12, 256, smem_bytes>>>(
         q, k, v, sink, out, softmax_scale
     );
 }
