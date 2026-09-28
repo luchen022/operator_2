@@ -91,7 +91,7 @@ def packgqa_full_128_kernel(
     l_i = tl.zeros([128], tl.float32)
     acc = tl.zeros([128, BLOCK_D], tl.float32)
 
-    for start_n in tl.range(0, k_len, 64, warp_specialize=True):
+    for start_n in range(0, k_len, 64):
         offs_u = start_n + tl.arange(0, 64)
         offs_n = k_start + offs_u
         mask_n = offs_u < k_len
@@ -198,7 +198,7 @@ def packgqa_g8_kernel(
         b_end = tl.cdiv(causal_limit + 1, 64)
         b_end = tl.maximum(0, tl.minimum(b_end, num_k_blocks))
 
-    for b in tl.range(b_start, b_end, warp_specialize=True):
+    for b in range(b_start, b_end):
         offs_u = b * 64 + tl.arange(0, 64)
         offs_n = k_start + offs_u
         mask_n = offs_u < k_len
@@ -813,7 +813,7 @@ def partition_packgqa_causal_d64_kernel(
     b_end = tl.cdiv(causal_limit + 1, 64)
     b_end = tl.maximum(0, tl.minimum(b_end, tl.cdiv(k_len, 64)))
 
-    for b in tl.range(0, b_end, warp_specialize=True):
+    for b in range(0, b_end):
         u = b * 64 + tl.arange(0, 64)
         offs_n = ks_sel + u
         mask_n = u < k_len
@@ -1325,7 +1325,7 @@ def overlap8_g4_special_kernel(
 
     if seg_sel > 0:
         plen = pke - pks
-        for pb in tl.range(0, tl.cdiv(plen, 64), warp_specialize=True):
+        for pb in range(0, tl.cdiv(plen, 64)):
             pu = pb * 64 + tl.arange(0, 64)
             pn = pks + pu
             pmask = pu < plen
@@ -1368,7 +1368,7 @@ def overlap8_g4_special_kernel(
         b_end = tl.cdiv(causal_limit + 1, 64)
         b_end = tl.maximum(0, tl.minimum(b_end, tl.cdiv(k_len, 64)))
 
-    for b in tl.range(0, b_end, warp_specialize=True):
+    for b in range(0, b_end):
         u = b * 64 + tl.arange(0, 64)
         n = ks_sel + u
         nmask = u < k_len
@@ -1501,7 +1501,7 @@ def generic_packgqa_fwd_kernel(
         b_start = tl.where(has_q_overlap, b_start, 0)
         b_end = tl.where(has_q_overlap, b_end, 0)
 
-        for b in tl.range(b_start, b_end, warp_specialize=True):
+        for b in range(b_start, b_end):
             offs_n = ks + b * BLOCK_N + tl.arange(0, BLOCK_N)
             mask_n = offs_n < ke
 
@@ -1778,7 +1778,7 @@ def run_kernel(
     global _PREFIX_META_SRC, _PREFIX_Q0, _PREFIX_Q1, _PREFIX_KE, _PREFIX_BM, _PREFIX_TILES
     global _PREFIX_SINK_SRC, _PREFIX_SINK_LSE
     if not _PRINTED_BUILD:
-        print("BUILD PACKGQA_WARPSPEC_V33")
+        print("BUILD STABLE_88_25_V34")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
