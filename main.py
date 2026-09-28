@@ -1891,7 +1891,7 @@ def run_kernel(
                 )
             else:
                 single_slice_fwd_kernel[grid](
-                    q, k, v, output, _PREFIX_SINK_LSE,
+                    q, k, v, output, sink,
                     scale,
                     qs, q_len, ks, k_len,
                     Hq, Hkv, D, Ns,
@@ -2096,7 +2096,7 @@ def run_kernel(
             else:
                 grid = lambda META: (triton.cdiv(q_len, META["BLOCK_M"]), Hq)
                 single_slice_fwd_kernel[grid](
-                    q, k, v, output, _PREFIX_SINK_LSE,
+                    q, k, v, output, sink,
                     scale,
                     qs, q_len, ks, k_len,
                     Hq, Hkv, D, Ns,
@@ -2162,7 +2162,7 @@ def run_kernel(
 
         generic_fwd_kernel[grid](
             q, k, v, output,
-            q_ranges, k_ranges, attn_type_map, _PREFIX_SINK_LSE,
+            q_ranges, k_ranges, attn_type_map, sink,
             scale,
             S, Hq, Hkv, D, Ns,
             Hq * D, D, 1,
