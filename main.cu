@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <stdio.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <mma.h>
@@ -1635,6 +1636,12 @@ extern "C" void run_kernel(
     int64_t num_slices,
     int64_t num_sink
 ) {
+    static bool printed_build = false;
+    if (!printed_build) {
+        fprintf(stderr, "BUILD CUDA_PACKGQA_ONLINE_ALL12_V1\\n");
+        printed_build = true;
+    }
+
     const int S = int(seqlen);
     const int Hq = int(num_q_heads);
     const int Hkv = int(num_kv_heads);
