@@ -699,6 +699,44 @@ def partition_fwd_kernel(
 
 
 @triton.jit
+def build_prefix_meta_kernel(
+    q_ranges_ptr,
+    k_ranges_ptr,
+    Q0_META,
+    Q1_META,
+    KE_META,
+    BLOCK_M: tl.constexpr,
+    NUM_SLICES: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    prefix = 0
+    q0_sel = 0
+    q1_sel = 0
+    ke_sel = 0
+
+    for s in tl.static_range(0, NUM_SLICES):
+        qs = tl.load(q_ranges_ptr + s * 2 + 0).to(tl.int32)
+        qe = tl.load(q_ranges_ptr + s * 2 + 1).to(tl.int32)
+        ke = tl.load(k_ranges_ptr + s * 2 + 1).to(tl.int32)
+
+        nblocks = tl.cdiv(qe - qs, BLOCK_M)
+        hit = (pid >= prefix) & (pid < prefix + nblocks)
+        local = pid - prefix
+        q0 = qs + local * BLOCK_M
+        q1 = tl.minimum(q0 + BLOCK_M, qe)
+
+        q0_sel = tl.where(hit, q0, q0_sel)
+        q1_sel = tl.where(hit, q1, q1_sel)
+        ke_sel = tl.where(hit, ke, ke_sel)
+        prefix += nblocks
+
+    tl.store(Q0_META + pid, q0_sel)
+    tl.store(Q1_META + pid, q1_sel)
+    tl.store(KE_META + pid, ke_sel)
+
+
+@triton.jit
 def prefix_full_fwd_kernel(
     Q, K, V, Out,
     Q0_META, Q1_META, KE_META,
@@ -991,7 +1029,7 @@ def run_kernel(
     global _V_FP8_SRC, _V_FP8, _V_SCALE, _PRINTED_BUILD
     global _PREFIX_META_SRC, _PREFIX_Q0, _PREFIX_Q1, _PREFIX_KE, _PREFIX_BM, _PREFIX_TILES
     if not _PRINTED_BUILD:
-        print("BUILD PREFIX_FULL_V8")
+        print("BUILD PREFIX_FULL_SANDBOX_V9")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
@@ -1122,31 +1160,31 @@ def run_kernel(
             # Low-head case needs more CTAs; high-head case favors a larger M tile.
             bm = 32 if Hq <= 8 else 64
             if _PREFIX_META_SRC is not q_ranges or _PREFIX_BM != bm:
-                q0_list = []
-                q1_list = []
-                ke_list = []
+                tile_count = 0
                 i = 0
                 while i < N:
-                    qs = int(_META_Q[i][0])
-                    qe = int(_META_Q[i][1])
-                    ke = int(_META_K[i][1])
-                    x = qs
-                    while x < qe:
-                        y = x + bm
-                        if y > qe:
-                            y = qe
-                        q0_list.append(x)
-                        q1_list.append(y)
-                        ke_list.append(ke)
-                        x += bm
+                    qlen = int(_META_Q[i][1]) - int(_META_Q[i][0])
+                    tile_count += (qlen + bm - 1) // bm
                     i += 1
 
-                _PREFIX_Q0 = torch.tensor(q0_list, dtype=torch.int32, device=q.device)
-                _PREFIX_Q1 = torch.tensor(q1_list, dtype=torch.int32, device=q.device)
-                _PREFIX_KE = torch.tensor(ke_list, dtype=torch.int32, device=q.device)
+                _PREFIX_Q0 = torch.empty((tile_count,), dtype=torch.int32, device=q.device)
+                _PREFIX_Q1 = torch.empty((tile_count,), dtype=torch.int32, device=q.device)
+                _PREFIX_KE = torch.empty((tile_count,), dtype=torch.int32, device=q.device)
+
+                build_prefix_meta_kernel[(tile_count,)](
+                    q_ranges,
+                    k_ranges,
+                    _PREFIX_Q0,
+                    _PREFIX_Q1,
+                    _PREFIX_KE,
+                    BLOCK_M=bm,
+                    NUM_SLICES=N,
+                    num_warps=1,
+                )
+
                 _PREFIX_META_SRC = q_ranges
                 _PREFIX_BM = bm
-                _PREFIX_TILES = len(q0_list)
+                _PREFIX_TILES = tile_count
 
             prefix_full_fwd_kernel[(_PREFIX_TILES, Hq)](
                 q, k, v, output,
