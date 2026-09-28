@@ -886,7 +886,7 @@ def run_kernel(
     global _K_FP8_SRC, _K_FP8, _K_SCALE
     global _V_FP8_SRC, _V_FP8, _V_SCALE, _PRINTED_BUILD
     if not _PRINTED_BUILD:
-        print("BUILD HYBRID_MQA_FP8_PV_V6")
+        print("BUILD SHAPE_ROUTER_BF16_V7")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
@@ -931,12 +931,10 @@ def run_kernel(
             k_len = ke - ks
             grid = lambda META: (triton.cdiv(q_len, META["BLOCK_M"]), Hq)
 
-            # FP8 P@V is accurate but too expensive for ordinary GQA.
-            # Only use it when a single V head is reused by a very large Q-head
-            # group, where the static V quantization/cache has the best chance
-            # to amortize and reduce bandwidth pressure.
-            G = Hq // Hkv
-            use_fp8 = (D == 128 and S >= 4096 and Hkv == 1 and G >= 32)
+            # FP8 experiments were accurate but slower on the scored shapes.
+            # Keep N=1 on the BF16 fast path until we have a lower-overhead FP8
+            # implementation.
+            use_fp8 = False
             if use_fp8:
                 if _V_FP8_SRC is not v:
                     _V_FP8_SRC = v
@@ -988,9 +986,32 @@ def run_kernel(
                 )
             return
 
-        # Low-head partition cases (#3/#8) benefit from one fused launch;
-        # high-head cases were faster with per-slice specialized launches.
+        # Route by slice structure, not only by head count.
+        # Empirically:
+        #   * many FULL prefix slices (#3/#8) benefit from one fused launch;
+        #   * D=64, N=10 local CAUSAL (#10) also benefits from one fused launch;
+        #   * other high-head partitioned cases (#2/#6/#11) are faster with
+        #     per-slice specialized launches.
+        all_full = True
+        all_causal = True
+        i = 0
+        while i < N:
+            t = int(_META_T[i])
+            if t != 0:
+                all_full = False
+            if t != 1:
+                all_causal = False
+            i += 1
+
+        use_fused_partition = False
+        if N >= 7 and all_full:
+            use_fused_partition = True
+        if D == 64 and N == 10 and all_causal:
+            use_fused_partition = True
         if Hq <= 16:
+            use_fused_partition = True
+
+        if use_fused_partition:
             grid = lambda META: (
                 _META_BLOCKS128 if META["BLOCK_M"] == 128 else (
                     _META_BLOCKS64 if META["BLOCK_M"] == 64 else _META_BLOCKS32
