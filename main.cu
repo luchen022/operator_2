@@ -70,6 +70,10 @@ __device__ __forceinline__ void canonical_vec_coord(
     kvec = in_group >> 3;
 }
 
+__device__ __forceinline__ void fence_proxy_async_shared() {
+    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+}
+
 __device__ __forceinline__ void fence() {
     asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
 }
@@ -547,6 +551,7 @@ void dense_wgmma_fwd(
     const int token0 = tile * token_M;
 
     stage_q64_d128(q, q_s, token0, kvh, Hq, G);
+    fence_proxy_async_shared();
     __syncthreads();
 
     float out0[32];
@@ -579,6 +584,7 @@ void dense_wgmma_fwd(
         const int key0 = kb * N;
 
         stage_k64_d128_packed(packed_k, kv_s, kb, kvh, S / N);
+        fence_proxy_async_shared();
         __syncthreads();
 
         float score[32];
@@ -687,10 +693,14 @@ void dense_wgmma_fwd(
         rescale_fragment(out0, alpha0, alpha1);
         rescale_fragment(out1, alpha0, alpha1);
 
-        // P stores must be visible before WGMMA reads.
+        // Plain shared-memory stores are in the generic proxy, while WGMMA
+        // reads shared memory through the async proxy.  A CTA barrier alone
+        // is not sufficient: publish the P tile to the async proxy first.
+        fence_proxy_async_shared();
         __syncthreads();
 
         stage_vt64_d128_packed(packed_v, kv_s, kb, kvh, S / N);
+        fence_proxy_async_shared();
         __syncthreads();
 
         // P @ V[:, 0:64]
@@ -1050,6 +1060,7 @@ void partition_wgmma_fwd(
     const int kvh = blockIdx.y;
 
     stage_q<HD>(q, q_s, q0, qe, kvh, Hq, G);
+    fence_proxy_async_shared();
     __syncthreads();
 
     float out0[32];
@@ -1086,6 +1097,7 @@ void partition_wgmma_fwd(
             const int key0 = pks + kb * N;
 
             stage_k<HD>(k, kv_s, key0, pke, kvh, Hkv);
+            fence_proxy_async_shared();
             __syncthreads();
 
         float score[32];
@@ -1177,8 +1189,10 @@ void partition_wgmma_fwd(
         rescale32(out0, a0, a1);
         if (HD == 128) rescale32(out1, a0, a1);
 
+        fence_proxy_async_shared();
         __syncthreads();
         stage_vt<HD>(v, kv_s, key0, pke, kvh, Hkv);
+        fence_proxy_async_shared();
         __syncthreads();
 
         fence();
@@ -1375,6 +1389,7 @@ void g128_full_wgmma_fwd(
         *reinterpret_cast<uint4*>(dst) =
             *reinterpret_cast<const uint4*>(src);
     }
+    fence_proxy_async_shared();
     __syncthreads();
 
     float out0[32];
@@ -1410,6 +1425,7 @@ void g128_full_wgmma_fwd(
                     *reinterpret_cast<const uint4*>(src);
             }
         }
+        fence_proxy_async_shared();
         __syncthreads();
 
         float score[32];
@@ -1481,6 +1497,7 @@ void g128_full_wgmma_fwd(
         rescale32(out0, a0, a1);
         rescale32(out1, a0, a1);
 
+        fence_proxy_async_shared();
         __syncthreads();
 
         // V^T is also prepacked during warmup, removing the scalar gather/
@@ -1499,6 +1516,7 @@ void g128_full_wgmma_fwd(
                     *reinterpret_cast<const uint4*>(src);
             }
         }
+        fence_proxy_async_shared();
         __syncthreads();
 
         fence();
@@ -1610,7 +1628,7 @@ extern "C" void run_kernel(
 ) {
     static bool printed_build = false;
     if (!printed_build) {
-        fprintf(stderr, "BUILD CUDA_SM90A_WGMMA_STATIC_KV_V2\\n");
+        fprintf(stderr, "BUILD CUDA_SM90A_WGMMA_PROXY_FENCE_V3\\n");
         printed_build = true;
     }
 
