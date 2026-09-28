@@ -1143,7 +1143,46 @@ void partition_wgmma_fwd(
 
         const int k_blocks = (pke - pks + N - 1) / N;
 
-        for (int kb = 0; kb < k_blocks; ++kb) {
+        // Skip 64-key tiles that are provably invisible for every query row
+        // in this CTA.  We still retain the elementwise mask on the two
+        // frontier tiles, so this is semantics-preserving for all four masks.
+        int kb_begin = 0;
+        int kb_end = k_blocks;
+
+        const int q_first = (q0 > pqs) ? q0 : pqs;
+        const int q_tile_end = q0 + token_M;
+        const int q_clip_end = (q_tile_end < pqe) ? q_tile_end : pqe;
+        const int q_last = q_clip_end - 1;
+
+        if (q_first > q_last) {
+            kb_begin = 0;
+            kb_end = 0;
+        } else {
+            const int Lq = pqe - pqs;
+            const int Lk = pke - pks;
+
+            if (ptyp == 2 || ptyp == 3) {
+                const int r_min = q_first - pqs;
+                kb_begin = r_min / N;
+                if (kb_begin < 0) kb_begin = 0;
+                if (kb_begin > k_blocks) kb_begin = k_blocks;
+            }
+
+            if (ptyp == 1 || ptyp == 3) {
+                const int r_max = q_last - pqs;
+                const int max_u = r_max + (Lk - Lq);
+                if (max_u < 0) {
+                    kb_end = 0;
+                } else {
+                    kb_end = (max_u + 1 + N - 1) / N;
+                    if (kb_end > k_blocks) kb_end = k_blocks;
+                }
+            }
+
+            if (kb_begin > kb_end) kb_begin = kb_end;
+        }
+
+        for (int kb = kb_begin; kb < kb_end; ++kb) {
             const int key0 = pks + kb * N;
 
             if (HD == 128 && packed_k != nullptr && ((key0 & 63) == 0)) {
@@ -1698,7 +1737,7 @@ extern "C" void run_kernel(
 ) {
     static bool printed_build = false;
     if (!printed_build) {
-        fprintf(stderr, "BUILD CUDA_SM90A_WGMMA_PARTITION_PACKED_V4\\n");
+        fprintf(stderr, "BUILD CUDA_SM90A_WGMMA_MASK_FRONTIER_V5\\n");
         printed_build = true;
     }
 
