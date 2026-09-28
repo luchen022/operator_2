@@ -135,7 +135,7 @@ struct FragCoord {
 };
 
 __device__ __forceinline__ FragCoord frag_coord() {
-    const int warp = threadIdx.x >> 5;
+    const int warp = (threadIdx.x >> 5) & 3;
     const int lane = threadIdx.x & 31;
     FragCoord c;
     c.row0 = warp * 16 + (lane >> 2);
