@@ -27,6 +27,78 @@ _PREFIX_BM = 0
 _PREFIX_TILES = 0
 _PREFIX_SINK_SRC = None
 _PREFIX_SINK_LSE = None
+_SDPA_K_SRC = None
+_SDPA_V_SRC = None
+_SDPA_HQ = 0
+_SDPA_K_EXP = None
+_SDPA_V_EXP = None
+_SDPA_SINK_SRC = None
+_SDPA_SINK_LSE = None
+
+
+@triton.jit
+def expand_kv_to_qheads_kernel(
+    K, V, KEXP, VEXP,
+    S: tl.constexpr,
+    HQ: tl.constexpr,
+    HKV: tl.constexpr,
+    D: tl.constexpr,
+    G: tl.constexpr,
+):
+    row = tl.program_id(0)
+    z = row // HQ
+    hq = row - z * HQ
+    hk = hq // G
+    d = tl.arange(0, D)
+
+    k = tl.load(K + z * HKV * D + hk * D + d)
+    v = tl.load(V + z * HKV * D + hk * D + d)
+
+    dst = z * HQ * D + hq * D + d
+    tl.store(KEXP + dst, k)
+    tl.store(VEXP + dst, v)
+
+
+@triton.jit
+def flash_sink_epilogue_kernel(
+    FAO, LSE, SINK_LSE, OUT,
+    S: tl.constexpr,
+    HQ: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
+    h = rows % HQ
+    z = rows // HQ
+    mask_r = rows < S * HQ
+    d = tl.arange(0, D)
+
+    x = tl.load(
+        FAO + rows[:, None] * D + d[None, :],
+        mask=mask_r[:, None],
+        other=0.0,
+    )
+
+    # PyTorch FlashAttention returns LSE as [B, H, S].
+    token_lse = tl.load(
+        LSE + h * S + z,
+        mask=mask_r,
+        other=-float("inf"),
+    )
+    sink_lse = tl.load(
+        SINK_LSE + h,
+        mask=mask_r,
+        other=-float("inf"),
+    )
+    scale = 1.0 / (
+        1.0 + tl.exp2((sink_lse - token_lse) * 1.4426950408889634)
+    )
+
+    tl.store(
+        OUT + rows[:, None] * D + d[None, :],
+        (x * scale[:, None]).to(tl.bfloat16),
+        mask=mask_r[:, None],
+    )
 
 
 @triton.jit
@@ -1777,8 +1849,10 @@ def run_kernel(
     global _V_FP8_SRC, _V_FP8, _V_SCALE, _PRINTED_BUILD
     global _PREFIX_META_SRC, _PREFIX_Q0, _PREFIX_Q1, _PREFIX_KE, _PREFIX_BM, _PREFIX_TILES
     global _PREFIX_SINK_SRC, _PREFIX_SINK_LSE
+    global _SDPA_K_SRC, _SDPA_V_SRC, _SDPA_HQ, _SDPA_K_EXP, _SDPA_V_EXP
+    global _SDPA_SINK_SRC, _SDPA_SINK_LSE
     if not _PRINTED_BUILD:
-        print("BUILD STABLE_88_25_V36")
+        print("BUILD TORCH_FLASH_N1_V37")
         _PRINTED_BUILD = True
     if q_ranges is not _META_Q_RANGES:
         _META_Q_RANGES = q_ranges
@@ -1823,6 +1897,92 @@ def run_kernel(
             k_len = ke - ks
 
             G = Hq // Hkv
+
+            # Broad backend experiment: delegate dense single-slice FULL/CAUSAL
+            # attention to PyTorch's CUDA FlashAttention implementation. The
+            # returned LSE lets us restore the denominator-only sink exactly.
+            if (
+                D == 128 and qs == 0 and ks == 0
+                and q_len == S and k_len == S
+                and (typ == 0 or typ == 1)
+            ):
+                if (
+                    _SDPA_K_SRC is not k
+                    or _SDPA_V_SRC is not v
+                    or _SDPA_HQ != Hq
+                ):
+                    _SDPA_K_SRC = k
+                    _SDPA_V_SRC = v
+                    _SDPA_HQ = Hq
+
+                    if G == 1:
+                        _SDPA_K_EXP = k
+                        _SDPA_V_EXP = v
+                    else:
+                        _SDPA_K_EXP = torch.empty(
+                            (S, Hq, D),
+                            dtype=torch.bfloat16,
+                            device=k.device,
+                        )
+                        _SDPA_V_EXP = torch.empty(
+                            (S, Hq, D),
+                            dtype=torch.bfloat16,
+                            device=v.device,
+                        )
+                        expand_kv_to_qheads_kernel[(S * Hq,)](
+                            k, v, _SDPA_K_EXP, _SDPA_V_EXP,
+                            S=S,
+                            HQ=Hq,
+                            HKV=Hkv,
+                            D=D,
+                            G=G,
+                            num_warps=4,
+                        )
+
+                if _SDPA_SINK_SRC is not sink:
+                    _SDPA_SINK_LSE = torch.empty(
+                        (Hq,),
+                        dtype=torch.float32,
+                        device=sink.device,
+                    )
+                    build_sink_lse_kernel[(Hq,)](
+                        sink,
+                        _SDPA_SINK_LSE,
+                        HQ=Hq,
+                        NSINK=Ns,
+                        num_warps=1,
+                    )
+                    _SDPA_SINK_SRC = sink
+
+                q4 = q.permute(1, 0, 2).unsqueeze(0)
+                k4 = _SDPA_K_EXP.permute(1, 0, 2).unsqueeze(0)
+                v4 = _SDPA_V_EXP.permute(1, 0, 2).unsqueeze(0)
+
+                fa = torch.ops.aten._scaled_dot_product_flash_attention.default(
+                    q4,
+                    k4,
+                    v4,
+                    0.0,
+                    typ == 1,
+                    False,
+                    scale=scale,
+                )
+                fa_out = fa[0]
+                fa_lse = fa[1]
+
+                flash_sink_epilogue_kernel[(triton.cdiv(S * Hq, 16),)](
+                    fa_out,
+                    fa_lse,
+                    _SDPA_SINK_LSE,
+                    output,
+                    S=S,
+                    HQ=Hq,
+                    D=D,
+                    BLOCK_R=16,
+                    num_warps=4,
+                )
+                return
+
             if typ == 0 and D == 128 and Hkv == 1 and G == 128 and q_len == S and k_len == S:
                 packgqa_full_128_kernel[(triton.cdiv(q_len * G, 128), Hkv)](
                     q, k, v, output, sink,
