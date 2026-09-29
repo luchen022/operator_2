@@ -2489,6 +2489,370 @@ inline void launch_g128_fa3(
 } // namespace wgmma_fa3_exp
 
 
+
+namespace wgmma_fa3_2tok {
+
+using namespace wgmma_sm90;
+
+constexpr int S12 = 8192;
+constexpr int HQ12 = 128;
+constexpr int HD12 = 128;
+constexpr int N = 64;
+constexpr int BLOCK_ELEMS = 64 * 16;
+constexpr int QK_SLICES = 8;
+constexpr int PV_SLICES = 4;
+constexpr int KV_STAGE_ELEMS = QK_SLICES * BLOCK_ELEMS;
+constexpr int KV_STAGE_BYTES = KV_STAGE_ELEMS * sizeof(__nv_bfloat16);
+constexpr int TX_BYTES = 2 * KV_STAGE_BYTES;
+
+__device__ __forceinline__ void wg_barrier4(int wg) {
+    if (wg == 0) {
+        asm volatile("bar.sync 1, 128;\n" ::: "memory");
+    } else if (wg == 1) {
+        asm volatile("bar.sync 2, 128;\n" ::: "memory");
+    } else if (wg == 2) {
+        asm volatile("bar.sync 3, 128;\n" ::: "memory");
+    } else {
+        asm volatile("bar.sync 4, 128;\n" ::: "memory");
+    }
+}
+
+__device__ __forceinline__ void zero32(float (&x)[32]) {
+#pragma unroll
+    for (int i = 0; i < 32; ++i) x[i] = 0.0f;
+}
+
+__device__ __forceinline__ void rescale32(
+    float (&x)[32], float a0, float a1
+) {
+#pragma unroll
+    for (int g = 0; g < 8; ++g) {
+        x[4*g+0] *= a0;
+        x[4*g+1] *= a0;
+        x[4*g+2] *= a1;
+        x[4*g+3] *= a1;
+    }
+}
+
+// Two query tokens share one K/V stream.  Four WGMMA warpgroups cover
+// 2 tokens x 128 Q heads; one producer warp owns async K/V movement.
+__global__ __launch_bounds__(544, 1)
+void g128_fa3_2tok_fwd(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ packed_k,
+    const __nv_bfloat16* __restrict__ packed_v,
+    const float* __restrict__ sink_lse,
+    __nv_bfloat16* __restrict__ out,
+    float softmax_scale
+) {
+    extern __shared__ __align__(128) unsigned char smem_raw[];
+    __shared__ __align__(8) uint64_t full_bar[2];
+    __shared__ __align__(8) uint64_t empty_bar[2];
+
+    // Q: 4 WG x 16 KiB = 64 KiB
+    // P: 4 WG x  8 KiB = 32 KiB
+    // K/V double buffers: 32 + 32 KiB
+    // Total dynamic shared memory = 160 KiB.
+    __nv_bfloat16* q_s =
+        reinterpret_cast<__nv_bfloat16*>(smem_raw);
+    __nv_bfloat16* p_s =
+        q_s + 4 * QK_SLICES * BLOCK_ELEMS;
+    __nv_bfloat16* k_stage =
+        p_s + 4 * PV_SLICES * BLOCK_ELEMS;
+    __nv_bfloat16* v_stage =
+        k_stage + 2 * KV_STAGE_ELEMS;
+
+    const int tid = threadIdx.x;
+    const bool consumer = tid < 512;
+    const bool producer_lane0 = tid == 512;
+
+    const int wg = tid >> 7;       // consumers: 0..3
+    const int wtid = tid & 127;
+
+    if (producer_lane0) {
+        wgmma_fa3_exp::mbarrier_init_count(&full_bar[0], 1);
+        wgmma_fa3_exp::mbarrier_init_count(&full_bar[1], 1);
+        wgmma_fa3_exp::mbarrier_init_count(&empty_bar[0], 4);
+        wgmma_fa3_exp::mbarrier_init_count(&empty_bar[1], 4);
+    }
+    __syncthreads();
+
+    int token = 0;
+    int qh_base = 0;
+    __nv_bfloat16* my_q = nullptr;
+    __nv_bfloat16* my_p = nullptr;
+
+    if (consumer) {
+        const int token_in_cta = wg >> 1;  // wg0/1 -> token0, wg2/3 -> token1
+        token = int(blockIdx.x) * 2 + token_in_cta;
+        qh_base = (wg & 1) * 64;
+
+        my_q = q_s + wg * QK_SLICES * BLOCK_ELEMS;
+        my_p = p_s + wg * PV_SLICES * BLOCK_ELEMS;
+
+#pragma unroll
+        for (int ds = 0; ds < QK_SLICES; ++ds) {
+            int qrow, kvec;
+            canonical_vec_coord(wtid, qrow, kvec);
+            const int qh = qh_base + qrow;
+            const int d0 = ds * 16 + kvec * 8;
+
+            const __nv_bfloat16* srcq =
+                q + (int64_t(token) * HQ12 + qh) * HD12 + d0;
+            __nv_bfloat16* dst =
+                my_q + ds * BLOCK_ELEMS + wtid * 8;
+
+            *reinterpret_cast<uint4*>(dst) =
+                *reinterpret_cast<const uint4*>(srcq);
+        }
+        fence_proxy_async_shared();
+    }
+    __syncthreads();
+
+    if (producer_lane0) {
+        wgmma_fa3_exp::issue_kv_stage(
+            0, 0, packed_k, packed_v,
+            k_stage, v_stage, full_bar
+        );
+        wgmma_fa3_exp::issue_kv_stage(
+            1, 1, packed_k, packed_v,
+            k_stage, v_stage, full_bar
+        );
+    }
+
+    float out0[32];
+    float out1[32];
+    float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F;
+    float l0 = 0.0f, l1 = 0.0f;
+
+    int qh0 = 0, qh1 = 0, row0 = 0, row1 = 0;
+
+    if (consumer) {
+        zero32(out0);
+        zero32(out1);
+
+        const FragCoord fc = frag_coord();
+        row0 = fc.row0;
+        row1 = fc.row1;
+        qh0 = qh_base + row0;
+        qh1 = qh_base + row1;
+    }
+
+    constexpr int KBLOCKS = S12 / N;
+
+    for (int kb = 0; kb < KBLOCKS; ++kb) {
+        const int stage = kb & 1;
+        const int parity = (kb >> 1) & 1;
+
+        if (consumer) {
+            wgmma_fa3_exp::mbarrier_wait_phase(
+                &full_bar[stage], parity
+            );
+
+            __nv_bfloat16* my_k =
+                k_stage + stage * KV_STAGE_ELEMS;
+            __nv_bfloat16* my_v =
+                v_stage + stage * KV_STAGE_ELEMS;
+
+            float score[32];
+            zero32(score);
+
+            fence();
+#pragma unroll
+            for (int ds = 0; ds < QK_SLICES; ++ds) {
+                mma_m64n64k16_bf16(
+                    score,
+                    make_kmajor_64x16_desc(
+                        my_q + ds * BLOCK_ELEMS),
+                    make_kmajor_64x16_desc(
+                        my_k + ds * BLOCK_ELEMS)
+                );
+            }
+            commit_group();
+            wait_group<0>();
+
+            float local_max0 = -CUDART_INF_F;
+            float local_max1 = -CUDART_INF_F;
+
+#pragma unroll
+            for (int g = 0; g < 8; ++g) {
+                local_max0 = fmaxf(
+                    local_max0, score[4*g+0] * softmax_scale);
+                local_max0 = fmaxf(
+                    local_max0, score[4*g+1] * softmax_scale);
+                local_max1 = fmaxf(
+                    local_max1, score[4*g+2] * softmax_scale);
+                local_max1 = fmaxf(
+                    local_max1, score[4*g+3] * softmax_scale);
+            }
+
+            const float tm0 = row4_max(local_max0);
+            const float tm1 = row4_max(local_max1);
+            const float nm0 = fmaxf(m0, tm0);
+            const float nm1 = fmaxf(m1, tm1);
+            const float a0 =
+                (m0 == -CUDART_INF_F) ? 0.0f : __expf(m0 - nm0);
+            const float a1 =
+                (m1 == -CUDART_INF_F) ? 0.0f : __expf(m1 - nm1);
+
+            float sum0 = 0.0f;
+            float sum1 = 0.0f;
+
+#pragma unroll
+            for (int g = 0; g < 8; ++g) {
+                const int c0 = frag_col(g, 0);
+                const int c1 = frag_col(g, 1);
+
+                const float p00 =
+                    __expf(score[4*g+0] * softmax_scale - nm0);
+                const float p01 =
+                    __expf(score[4*g+1] * softmax_scale - nm0);
+                const float p10 =
+                    __expf(score[4*g+2] * softmax_scale - nm1);
+                const float p11 =
+                    __expf(score[4*g+3] * softmax_scale - nm1);
+
+                sum0 += p00 + p01;
+                sum1 += p10 + p11;
+
+                const int s0 = c0 >> 4;
+                const int s1 = c1 >> 4;
+                const int kc0 = c0 & 15;
+                const int kc1 = c1 & 15;
+
+                my_p[s0 * BLOCK_ELEMS
+                     + canonical_kmajor_offset(row0, kc0)] =
+                    __float2bfloat16_rn(p00);
+                my_p[s1 * BLOCK_ELEMS
+                     + canonical_kmajor_offset(row0, kc1)] =
+                    __float2bfloat16_rn(p01);
+                my_p[s0 * BLOCK_ELEMS
+                     + canonical_kmajor_offset(row1, kc0)] =
+                    __float2bfloat16_rn(p10);
+                my_p[s1 * BLOCK_ELEMS
+                     + canonical_kmajor_offset(row1, kc1)] =
+                    __float2bfloat16_rn(p11);
+            }
+
+            l0 = l0 * a0 + row4_sum(sum0);
+            l1 = l1 * a1 + row4_sum(sum1);
+            m0 = nm0;
+            m1 = nm1;
+
+            rescale32(out0, a0, a1);
+            rescale32(out1, a0, a1);
+
+            fence_proxy_async_shared();
+            wg_barrier4(wg);
+
+            fence();
+#pragma unroll
+            for (int ks = 0; ks < PV_SLICES; ++ks) {
+                mma_m64n64k16_bf16(
+                    out0,
+                    make_kmajor_64x16_desc(
+                        my_p + ks * BLOCK_ELEMS),
+                    make_kmajor_64x16_desc(
+                        my_v + ks * BLOCK_ELEMS)
+                );
+            }
+#pragma unroll
+            for (int ks = 0; ks < PV_SLICES; ++ks) {
+                mma_m64n64k16_bf16(
+                    out1,
+                    make_kmajor_64x16_desc(
+                        my_p + ks * BLOCK_ELEMS),
+                    make_kmajor_64x16_desc(
+                        my_v + (PV_SLICES + ks) * BLOCK_ELEMS)
+                );
+            }
+            commit_group();
+            wait_group<0>();
+
+            wg_barrier4(wg);
+            if (wtid == 0) {
+                wgmma_fa3_exp::mbarrier_arrive_release(
+                    &empty_bar[stage]
+                );
+            }
+        }
+
+        if (producer_lane0 && kb + 2 < KBLOCKS) {
+            wgmma_fa3_exp::mbarrier_wait_phase(
+                &empty_bar[stage], parity
+            );
+            wgmma_fa3_exp::issue_kv_stage(
+                kb + 2, stage, packed_k, packed_v,
+                k_stage, v_stage, full_bar
+            );
+        }
+    }
+
+    if (consumer) {
+        const float denom0 =
+            l0 + __expf(sink_lse[qh0] - m0);
+        const float denom1 =
+            l1 + __expf(sink_lse[qh1] - m1);
+        const float inv0 = 1.0f / denom0;
+        const float inv1 = 1.0f / denom1;
+
+#pragma unroll
+        for (int g = 0; g < 8; ++g) {
+            const int c0 = frag_col(g, 0);
+            const int c1 = frag_col(g, 1);
+
+            out[(int64_t(token) * HQ12 + qh0) * HD12 + c0] =
+                __float2bfloat16_rn(out0[4*g+0] * inv0);
+            out[(int64_t(token) * HQ12 + qh0) * HD12 + c1] =
+                __float2bfloat16_rn(out0[4*g+1] * inv0);
+            out[(int64_t(token) * HQ12 + qh1) * HD12 + c0] =
+                __float2bfloat16_rn(out0[4*g+2] * inv1);
+            out[(int64_t(token) * HQ12 + qh1) * HD12 + c1] =
+                __float2bfloat16_rn(out0[4*g+3] * inv1);
+
+            out[(int64_t(token) * HQ12 + qh0) * HD12 + 64+c0] =
+                __float2bfloat16_rn(out1[4*g+0] * inv0);
+            out[(int64_t(token) * HQ12 + qh0) * HD12 + 64+c1] =
+                __float2bfloat16_rn(out1[4*g+1] * inv0);
+            out[(int64_t(token) * HQ12 + qh1) * HD12 + 64+c0] =
+                __float2bfloat16_rn(out1[4*g+2] * inv1);
+            out[(int64_t(token) * HQ12 + qh1) * HD12 + 64+c1] =
+                __float2bfloat16_rn(out1[4*g+3] * inv1);
+        }
+    }
+}
+
+inline void launch_g128_fa3_2tok(
+    const __nv_bfloat16* q,
+    const __nv_bfloat16* packed_k,
+    const __nv_bfloat16* packed_v,
+    const float* sink_lse,
+    __nv_bfloat16* out,
+    float softmax_scale
+) {
+    constexpr int smem_bytes =
+        (4 * QK_SLICES * BLOCK_ELEMS
+       + 4 * PV_SLICES * BLOCK_ELEMS
+       + 4 * KV_STAGE_ELEMS) * sizeof(__nv_bfloat16);
+
+    static bool configured = false;
+    if (!configured) {
+        cudaFuncSetAttribute(
+            g128_fa3_2tok_fwd,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            smem_bytes
+        );
+        configured = true;
+    }
+
+    g128_fa3_2tok_fwd<<<S12 / 2, 544, smem_bytes>>>(
+        q, packed_k, packed_v, sink_lse, out, softmax_scale
+    );
+}
+
+} // namespace wgmma_fa3_2tok
+
+
 extern "C" void run_kernel(
     const __nv_bfloat16* q,
     const __nv_bfloat16* k,
@@ -2508,7 +2872,7 @@ extern "C" void run_kernel(
 ) {
     static bool printed_build = false;
     if (!printed_build) {
-        fprintf(stderr, "BUILD CUDA_SM90A_FA3_EXP_V3\\n");
+        fprintf(stderr, "BUILD CUDA_SM90A_FA3_2TOK_V4\\n");
         printed_build = true;
     }
 
@@ -2533,7 +2897,7 @@ extern "C" void run_kernel(
             S, Hq, Hkv, Ns,
             packed_k, packed_v, sink_lse
         );
-        wgmma_fa3_exp::launch_g128_fa3(
+        wgmma_fa3_2tok::launch_g128_fa3_2tok(
             q, packed_k, packed_v, sink_lse,
             output, softmax_scale
         );
