@@ -1344,9 +1344,10 @@ namespace wgmma_fp8_cache {
 using namespace wgmma_sm90;
 
 constexpr int HD = 128;
+constexpr int FP8_D = 96;
 constexpr int K8_TILE_BYTES = 64 * 32;   // 2048 B
-constexpr int K8_TILES = HD / 32;        // 4
-constexpr int K8_BLOCK_BYTES = K8_TILES * K8_TILE_BYTES; // 8192 B
+constexpr int K8_TILES = FP8_D / 32;     // 3
+constexpr int K8_BLOCK_BYTES = K8_TILES * K8_TILE_BYTES; // 6144 B
 constexpr float FP8_MAX = 448.0f;
 constexpr float LOG2E = 1.4426950408889634f;
 
@@ -1381,38 +1382,46 @@ void quantize_q_e4m3_rows(
     if (row >= rows) return;
 
     const int d0 = lane * 4;
-    const __nv_bfloat16* src = q + int64_t(row) * HD + d0;
+    float x0 = 0.0f, x1 = 0.0f, x2 = 0.0f, x3 = 0.0f;
 
-    float x0 = __bfloat162float(src[0]);
-    float x1 = __bfloat162float(src[1]);
-    float x2 = __bfloat162float(src[2]);
-    float x3 = __bfloat162float(src[3]);
+    // Only D[0:96] is quantized. D[96:128] stays BF16 in the hybrid QK.
+    if (lane < 24) {
+        const __nv_bfloat16* src =
+            q + int64_t(row) * HD + d0;
+        x0 = __bfloat162float(src[0]);
+        x1 = __bfloat162float(src[1]);
+        x2 = __bfloat162float(src[2]);
+        x3 = __bfloat162float(src[3]);
+    }
 
     float amax = fmaxf(
         fmaxf(fabsf(x0), fabsf(x1)),
         fmaxf(fabsf(x2), fabsf(x3))
     );
 #pragma unroll
-    for (int off = 8; off > 0; off >>= 1) {
+    for (int off = 4; off > 0; off >>= 1) {
         amax = fmaxf(
             amax,
             __shfl_xor_sync(0xffffffffu, amax, off)
         );
     }
 
-    const int sg = lane >> 4;
+    const int sg = lane >> 3;  // one scale per 32 dimensions
     const float scale = fmaxf(amax / FP8_MAX, 1.0e-8f);
     const float inv = 1.0f / scale;
-    if ((lane & 15) == 0)
-        qscale[int64_t(row) * 2 + sg] = scale;
 
-    uint16_t p0 = cvt_e4m3x2(x0 * inv, x1 * inv);
-    uint16_t p1 = cvt_e4m3x2(x2 * inv, x3 * inv);
+    if (lane < 24) {
+        if ((lane & 7) == 0)
+            qscale[int64_t(row) * 3 + sg] = scale;
 
-    uint16_t* dst =
-        reinterpret_cast<uint16_t*>(q8 + int64_t(row) * HD);
-    dst[lane * 2 + 0] = p0;
-    dst[lane * 2 + 1] = p1;
+        const uint16_t p0 = cvt_e4m3x2(x0 * inv, x1 * inv);
+        const uint16_t p1 = cvt_e4m3x2(x2 * inv, x3 * inv);
+
+        uint16_t* dst =
+            reinterpret_cast<uint16_t*>(q8 + int64_t(row) * HD);
+        dst[lane * 2 + 0] = p0;
+        dst[lane * 2 + 1] = p1;
+    }
 }
 
 inline void quantize_q(
@@ -1432,7 +1441,7 @@ inline void quantize_q(
         );
         cudaMalloc(
             reinterpret_cast<void**>(&h_qscale),
-            rows * 2 * sizeof(float)
+            rows * 3 * sizeof(float)
         );
         h_q_rows_cap = rows;
     }
@@ -1482,7 +1491,7 @@ void pack_slice_k_e4m3(
     const int d0 = lane * 4;
     float x0 = 0.0f, x1 = 0.0f, x2 = 0.0f, x3 = 0.0f;
 
-    if (valid) {
+    if (valid && lane < 24) {
         const __nv_bfloat16* src =
             k + (int64_t(key) * Hkv + kvh) * HD + d0;
         x0 = __bfloat162float(src[0]);
@@ -1496,42 +1505,43 @@ void pack_slice_k_e4m3(
         fmaxf(fabsf(x2), fabsf(x3))
     );
 #pragma unroll
-    for (int off = 8; off > 0; off >>= 1) {
+    for (int off = 4; off > 0; off >>= 1) {
         amax = fmaxf(
             amax,
             __shfl_xor_sync(0xffffffffu, amax, off)
         );
     }
 
+    const int sg = lane >> 3;
     const float scale = valid
         ? fmaxf(amax / FP8_MAX, 1.0e-8f)
         : 1.0f;
     const float inv = valid ? (1.0f / scale) : 0.0f;
 
-    const int sg = lane >> 4;
-    if ((lane & 15) == 0) {
-        packed_scale_log2[
-            ((int64_t(kvh) * total_blocks + flat) * 64 + row) * 2 + sg
-        ] = valid ? (scale * factor) : 0.0f;
+    if (lane < 24) {
+        if ((lane & 7) == 0) {
+            packed_scale_log2[
+                ((int64_t(kvh) * total_blocks + flat) * 64 + row) * 3 + sg
+            ] = valid ? (scale * factor) : 0.0f;
+        }
+
+        const uint16_t p0 = cvt_e4m3x2(x0 * inv, x1 * inv);
+        const uint16_t p1 = cvt_e4m3x2(x2 * inv, x3 * inv);
+
+        const int ds = d0 >> 5;
+        const int kc = d0 & 31;
+        const int off = canonical_fp8_offset(row, kc);
+
+        uint8_t* dst =
+            packed_k8
+            + (int64_t(kvh) * total_blocks + flat)
+              * K8_BLOCK_BYTES
+            + ds * K8_TILE_BYTES
+            + off;
+
+        *reinterpret_cast<uint16_t*>(dst + 0) = p0;
+        *reinterpret_cast<uint16_t*>(dst + 2) = p1;
     }
-
-    const uint16_t p0 = cvt_e4m3x2(x0 * inv, x1 * inv);
-    const uint16_t p1 = cvt_e4m3x2(x2 * inv, x3 * inv);
-
-    const int ds = d0 >> 5;
-    const int kc = d0 & 31;
-    const int off =
-        canonical_fp8_offset(row, kc);
-
-    uint8_t* dst =
-        packed_k8
-        + (int64_t(kvh) * total_blocks + flat)
-          * K8_BLOCK_BYTES
-        + ds * K8_TILE_BYTES
-        + off;
-
-    *reinterpret_cast<uint16_t*>(dst + 0) = p0;
-    *reinterpret_cast<uint16_t*>(dst + 2) = p1;
 }
 
 inline void ensure_slice_k8(
@@ -1551,7 +1561,7 @@ inline void ensure_slice_k8(
     const size_t bytes =
         size_t(total_blocks) * size_t(Hkv) * K8_BLOCK_BYTES;
     const size_t scales =
-        size_t(total_blocks) * size_t(Hkv) * 64 * 2;
+        size_t(total_blocks) * size_t(Hkv) * 64 * 3;
 
     if (h_k8_bytes_cap < bytes) {
         if (h_k8) cudaFree(h_k8);
@@ -5024,7 +5034,7 @@ extern "C" void run_kernel(
 ) {
     static bool printed_build = false;
     if (!printed_build) {
-        fprintf(stderr, "BUILD CUDA_SM90A_FP8_GROUP64_V32\\n");
+        fprintf(stderr, "BUILD CUDA_SM90A_HYBRID_PREP_V33\\n");
         printed_build = true;
     }
 
