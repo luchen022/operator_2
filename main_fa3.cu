@@ -2415,7 +2415,7 @@ void g128_fa3_pipeline_fwd(
     const __nv_bfloat16* __restrict__ packed_k,
     const __nv_bfloat16* __restrict__ packed_v,
     const float* __restrict__ sink_lse,
-    __nv_bfloat16* __restrict__ out,
+    __nv_bfloat16* __restrict__ out
 ) {
     extern __shared__ __align__(128) unsigned char smem_raw[];
     __shared__ __align__(8) uint64_t full_bar[2];
@@ -2702,7 +2702,7 @@ inline void launch_g128_fa3(
     const __nv_bfloat16* packed_k,
     const __nv_bfloat16* packed_v,
     const float* sink_lse,
-    __nv_bfloat16* out,
+    __nv_bfloat16* out
 ) {
     constexpr int smem_bytes =
         (2 * QK_SLICES * BLOCK_ELEMS
@@ -4668,7 +4668,7 @@ inline void launch_g4_overlap_async(
     const int32_t* slice_block_offsets,
     int slice_total_blocks,
     const float* sink_lse,
-    __nv_bfloat16* out,
+    __nv_bfloat16* out
 ) {
     constexpr int smem_bytes =
         (QK_SLICES * BLOCK_ELEMS
@@ -5080,7 +5080,7 @@ void d64_causal_async_fwd(
     const int32_t* __restrict__ slice_block_offsets,
     int slice_total_blocks,
     const float* __restrict__ sink_lse,
-    __nv_bfloat16* __restrict__ out,
+    __nv_bfloat16* __restrict__ out
 ) {
     extern __shared__ __align__(128) unsigned char smem_raw[];
     __shared__ __align__(8) uint64_t full_bar[2];
@@ -5401,7 +5401,7 @@ inline void launch_d64_async(
     const int32_t* slice_block_offsets,
     int slice_total_blocks,
     const float* sink_lse,
-    __nv_bfloat16* out,
+    __nv_bfloat16* out
 ) {
     constexpr int smem_bytes =
         (QK_SLICES * BLOCK_ELEMS
@@ -6188,7 +6188,7 @@ void overlap2_g2_async_fwd(
     const __nv_bfloat16* __restrict__ packed_k,
     const __nv_bfloat16* __restrict__ packed_v,
     const float* __restrict__ sink_lse,
-    __nv_bfloat16* __restrict__ out,
+    __nv_bfloat16* __restrict__ out
 ) {
     extern __shared__ __align__(128) unsigned char smem_raw[];
     __shared__ __align__(8) uint64_t full_bar[2];
@@ -6483,7 +6483,7 @@ inline void launch_overlap2_g2_async(
     const __nv_bfloat16* packed_k,
     const __nv_bfloat16* packed_v,
     const float* sink_lse,
-    __nv_bfloat16* out,
+    __nv_bfloat16* out
 ) {
     constexpr int smem_bytes =
         (2 * QK_SLICES * BLOCK_ELEMS
