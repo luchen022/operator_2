@@ -2038,11 +2038,24 @@ __device__ __forceinline__ uint32_t smem_u32(const void* p) {
     return static_cast<uint32_t>(__cvta_generic_to_shared(p));
 }
 
-__device__ __forceinline__ void mbarrier_init_one(uint64_t* bar) {
+__device__ __forceinline__ void mbarrier_init_count(
+    uint64_t* bar, uint32_t count
+) {
     const uint32_t a = smem_u32(bar);
     asm volatile(
-        "mbarrier.init.shared::cta.b64 [%0], 1;\n"
+        "mbarrier.init.shared::cta.b64 [%0], %1;\n"
         :
+        : "r"(a), "r"(count)
+        : "memory"
+    );
+}
+
+__device__ __forceinline__ void mbarrier_arrive_release(uint64_t* bar) {
+    const uint32_t a = smem_u32(bar);
+    uint64_t state;
+    asm volatile(
+        "mbarrier.arrive.release.cta.shared::cta.b64 %0, [%1];\n"
+        : "=l"(state)
         : "r"(a)
         : "memory"
     );
@@ -2165,6 +2178,7 @@ void g128_fa3_pipeline_fwd(
 ) {
     extern __shared__ __align__(128) unsigned char smem_raw[];
     __shared__ __align__(8) uint64_t full_bar[2];
+    __shared__ __align__(8) uint64_t empty_bar[2];
 
     // 32 KiB Q + 16 KiB P + 32 KiB K double buffer + 32 KiB V double buffer
     __nv_bfloat16* q_s =
@@ -2185,8 +2199,12 @@ void g128_fa3_pipeline_fwd(
     const int token = blockIdx.x;
 
     if (producer_lane0) {
-        mbarrier_init_one(&full_bar[0]);
-        mbarrier_init_one(&full_bar[1]);
+        mbarrier_init_count(&full_bar[0], 1);
+        mbarrier_init_count(&full_bar[1], 1);
+        // One completion token from each consumer warpgroup means the stage
+        // is no longer being read and may be refilled by the producer.
+        mbarrier_init_count(&empty_bar[0], 2);
+        mbarrier_init_count(&empty_bar[1], 2);
     }
     __syncthreads();
 
@@ -2384,13 +2402,21 @@ void g128_fa3_pipeline_fwd(
             }
             commit_group();
             wait_group<0>();
+
+            // All four warps in this consumer warpgroup have finished reading
+            // the current K/V stage.  Only one representative arrival is
+            // needed from each warpgroup.
+            warpgroup_barrier(wg);
+            if (wtid == 0) {
+                mbarrier_arrive_release(&empty_bar[stage]);
+            }
         }
 
-        // Stage 'stage' is now dead for this iteration. This is the only
-        // CTA-wide rendezvous in the steady-state loop and protects its reuse.
-        __syncthreads();
-
         if (producer_lane0 && kb + 2 < KBLOCKS) {
+            // Reuse of a double-buffer stage is now producer/consumer
+            // synchronized instead of forcing all 288 CTA threads through a
+            // __syncthreads() every 64 keys.
+            mbarrier_wait_phase(&empty_bar[stage], parity);
             issue_kv_stage(
                 kb + 2, stage, packed_k, packed_v,
                 k_stage, v_stage, full_bar
@@ -2482,7 +2508,7 @@ extern "C" void run_kernel(
 ) {
     static bool printed_build = false;
     if (!printed_build) {
-        fprintf(stderr, "BUILD CUDA_SM90A_FA3_EXP_V2\\n");
+        fprintf(stderr, "BUILD CUDA_SM90A_FA3_EXP_V3\\n");
         printed_build = true;
     }
 
