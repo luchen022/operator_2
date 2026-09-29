@@ -2697,11 +2697,37 @@ void g8_partition_async_fwd(
     float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F;
     float l0 = 0.0f, l1 = 0.0f;
 
+    // CTA-uniform visibility bounds.  Most scored tiles are fully visible:
+    // only the first/last mask frontier needs elementwise checks.
+    const int tile_q_first = q0;
+    const int tile_q_last =
+        ((q0 + TOKEN_M) < qe ? (q0 + TOKEN_M) : qe) - 1;
+    const int r_min_tile = tile_q_first - qs;
+    const int r_max_tile = tile_q_last - qs;
+    const int delta = (ke - ks) - (qe - qs);
+
     for (int i = 0; i < block_count; ++i) {
         const int stage = i & 1;
         const int parity = (i >> 1) & 1;
         const int kb = kb_begin + i;
         const int key0 = ks + kb * N;
+        const int u0 = kb * N;
+        const bool full_tail = (key0 + 63) < ke;
+
+        bool full_block = false;
+        if (full_tail) {
+            if (typ == 0) {
+                full_block = true;
+            } else if (typ == 1) {
+                full_block = (u0 + 63) <= (r_min_tile + delta);
+            } else if (typ == 2) {
+                full_block = u0 >= r_max_tile;
+            } else {
+                full_block =
+                    (u0 >= r_max_tile) &&
+                    ((u0 + 63) <= (r_min_tile + delta));
+            }
+        }
 
         wgmma_fa3_exp::mbarrier_wait_phase(
             &full_bar[stage], parity
@@ -2737,22 +2763,33 @@ void g8_partition_async_fwd(
             const int c0 = frag_col(g, 0);
             const int c1 = frag_col(g, 1);
 
-            if (wgmma_partition::mask_visible(
-                    typ, qidx0, key0+c0, qs, qe, ks, ke))
+            if (full_block) {
                 local_max0 = fmaxf(
                     local_max0, score[4*g+0] * softmax_scale);
-            if (wgmma_partition::mask_visible(
-                    typ, qidx0, key0+c1, qs, qe, ks, ke))
                 local_max0 = fmaxf(
                     local_max0, score[4*g+1] * softmax_scale);
-            if (wgmma_partition::mask_visible(
-                    typ, qidx1, key0+c0, qs, qe, ks, ke))
                 local_max1 = fmaxf(
                     local_max1, score[4*g+2] * softmax_scale);
-            if (wgmma_partition::mask_visible(
-                    typ, qidx1, key0+c1, qs, qe, ks, ke))
                 local_max1 = fmaxf(
                     local_max1, score[4*g+3] * softmax_scale);
+            } else {
+                if (wgmma_partition::mask_visible(
+                        typ, qidx0, key0+c0, qs, qe, ks, ke))
+                    local_max0 = fmaxf(
+                        local_max0, score[4*g+0] * softmax_scale);
+                if (wgmma_partition::mask_visible(
+                        typ, qidx0, key0+c1, qs, qe, ks, ke))
+                    local_max0 = fmaxf(
+                        local_max0, score[4*g+1] * softmax_scale);
+                if (wgmma_partition::mask_visible(
+                        typ, qidx1, key0+c0, qs, qe, ks, ke))
+                    local_max1 = fmaxf(
+                        local_max1, score[4*g+2] * softmax_scale);
+                if (wgmma_partition::mask_visible(
+                        typ, qidx1, key0+c1, qs, qe, ks, ke))
+                    local_max1 = fmaxf(
+                        local_max1, score[4*g+3] * softmax_scale);
+            }
         }
 
         const float tm0 = row4_max(local_max0);
@@ -2774,29 +2811,42 @@ void g8_partition_async_fwd(
             float p00 = 0.0f, p01 = 0.0f;
             float p10 = 0.0f, p11 = 0.0f;
 
-            if (wgmma_partition::mask_visible(
-                    typ, qidx0, key0+c0, qs, qe, ks, ke)) {
+            if (full_block) {
                 p00 = __expf(
                     score[4*g+0] * softmax_scale - nm0);
-                sum0 += p00;
-            }
-            if (wgmma_partition::mask_visible(
-                    typ, qidx0, key0+c1, qs, qe, ks, ke)) {
                 p01 = __expf(
                     score[4*g+1] * softmax_scale - nm0);
-                sum0 += p01;
-            }
-            if (wgmma_partition::mask_visible(
-                    typ, qidx1, key0+c0, qs, qe, ks, ke)) {
                 p10 = __expf(
                     score[4*g+2] * softmax_scale - nm1);
-                sum1 += p10;
-            }
-            if (wgmma_partition::mask_visible(
-                    typ, qidx1, key0+c1, qs, qe, ks, ke)) {
                 p11 = __expf(
                     score[4*g+3] * softmax_scale - nm1);
-                sum1 += p11;
+                sum0 += p00 + p01;
+                sum1 += p10 + p11;
+            } else {
+                if (wgmma_partition::mask_visible(
+                        typ, qidx0, key0+c0, qs, qe, ks, ke)) {
+                    p00 = __expf(
+                        score[4*g+0] * softmax_scale - nm0);
+                    sum0 += p00;
+                }
+                if (wgmma_partition::mask_visible(
+                        typ, qidx0, key0+c1, qs, qe, ks, ke)) {
+                    p01 = __expf(
+                        score[4*g+1] * softmax_scale - nm0);
+                    sum0 += p01;
+                }
+                if (wgmma_partition::mask_visible(
+                        typ, qidx1, key0+c0, qs, qe, ks, ke)) {
+                    p10 = __expf(
+                        score[4*g+2] * softmax_scale - nm1);
+                    sum1 += p10;
+                }
+                if (wgmma_partition::mask_visible(
+                        typ, qidx1, key0+c1, qs, qe, ks, ke)) {
+                    p11 = __expf(
+                        score[4*g+3] * softmax_scale - nm1);
+                    sum1 += p11;
+                }
             }
 
             const int s0 = c0 >> 4, kc0 = c0 & 15;
@@ -4501,7 +4551,7 @@ extern "C" void run_kernel(
 ) {
     static bool printed_build = false;
     if (!printed_build) {
-        fprintf(stderr, "BUILD CUDA_SM90A_D64_ASYNC_V10\\n");
+        fprintf(stderr, "BUILD CUDA_SM90A_G8_INTERIOR_V11\\n");
         printed_build = true;
     }
 
