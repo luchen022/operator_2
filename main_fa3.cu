@@ -1264,6 +1264,151 @@ inline void ensure_slice_d128_log2(
 
 } // namespace wgmma_slice_cache
 
+namespace wgmma_tile_meta_cache {
+
+// 11 int32 values per query tile:
+// [valid=1, q0, qe, qs, ks, ke, typ, sid, kb_begin, kb_end, slice_base]
+static int32_t* h_meta = nullptr;
+static size_t h_capacity_ints = 0;
+static const int32_t* h_last_q_ranges = nullptr;
+static const int32_t* h_last_k_ranges = nullptr;
+static const int32_t* h_last_type = nullptr;
+static int h_last_slices = -1;
+static int h_last_token_m = -1;
+static int h_tile_count = 0;
+
+inline void ensure(
+    const int32_t* q_ranges,
+    const int32_t* k_ranges,
+    const int32_t* attn_type_map,
+    int NumSlices,
+    int token_m,
+    const int32_t*& meta,
+    int& tile_count
+) {
+    const bool changed =
+        h_last_q_ranges != q_ranges ||
+        h_last_k_ranges != k_ranges ||
+        h_last_type != attn_type_map ||
+        h_last_slices != NumSlices ||
+        h_last_token_m != token_m;
+
+    if (changed) {
+        int32_t hq[20] = {0};
+        int32_t hk[20] = {0};
+        int32_t ht[10] = {0};
+        cudaMemcpy(
+            hq, q_ranges, sizeof(int32_t) * 2 * NumSlices,
+            cudaMemcpyDeviceToHost
+        );
+        cudaMemcpy(
+            hk, k_ranges, sizeof(int32_t) * 2 * NumSlices,
+            cudaMemcpyDeviceToHost
+        );
+        cudaMemcpy(
+            ht, attn_type_map, sizeof(int32_t) * NumSlices,
+            cudaMemcpyDeviceToHost
+        );
+
+        int tc = 0;
+        for (int sid = 0; sid < NumSlices; ++sid) {
+            const int qlen = hq[2*sid+1] - hq[2*sid+0];
+            tc += (qlen + token_m - 1) / token_m;
+        }
+
+        const size_t need = size_t(tc) * 11;
+        if (h_capacity_ints < need) {
+            if (h_meta) cudaFree(h_meta);
+            cudaMalloc(
+                reinterpret_cast<void**>(&h_meta),
+                need * sizeof(int32_t)
+            );
+            h_capacity_ints = need;
+        }
+
+        int32_t* hm = new int32_t[need];
+        int out = 0;
+        int slice_base = 0;
+
+        for (int sid = 0; sid < NumSlices; ++sid) {
+            const int qs = hq[2*sid+0];
+            const int qe = hq[2*sid+1];
+            const int ks = hk[2*sid+0];
+            const int ke = hk[2*sid+1];
+            const int typ = ht[sid];
+
+            const int Lq = qe - qs;
+            const int Lk = ke - ks;
+            const int k_blocks = (Lk + 63) / 64;
+            const int nt = (Lq + token_m - 1) / token_m;
+
+            for (int t = 0; t < nt; ++t) {
+                const int q0 = qs + t * token_m;
+                const int q_last =
+                    ((q0 + token_m) < qe ? (q0 + token_m) : qe) - 1;
+
+                int kb_begin = 0;
+                int kb_end = k_blocks;
+
+                if (typ == 2 || typ == 3) {
+                    const int r_min = q0 - qs;
+                    kb_begin = r_min / 64;
+                    if (kb_begin < 0) kb_begin = 0;
+                    if (kb_begin > k_blocks) kb_begin = k_blocks;
+                }
+
+                if (typ == 1 || typ == 3) {
+                    const int r_max = q_last - qs;
+                    const int max_u = r_max + (Lk - Lq);
+                    if (max_u < 0) {
+                        kb_end = 0;
+                    } else {
+                        kb_end = (max_u + 64) / 64;
+                        if (kb_end > k_blocks) kb_end = k_blocks;
+                    }
+                }
+
+                if (kb_begin > kb_end) kb_begin = kb_end;
+
+                int32_t* m = hm + size_t(out) * 11;
+                m[0] = 1;
+                m[1] = q0;
+                m[2] = qe;
+                m[3] = qs;
+                m[4] = ks;
+                m[5] = ke;
+                m[6] = typ;
+                m[7] = sid;
+                m[8] = kb_begin;
+                m[9] = kb_end;
+                m[10] = slice_base;
+                ++out;
+            }
+
+            slice_base += k_blocks;
+        }
+
+        cudaMemcpy(
+            h_meta, hm, need * sizeof(int32_t),
+            cudaMemcpyHostToDevice
+        );
+        delete[] hm;
+
+        h_last_q_ranges = q_ranges;
+        h_last_k_ranges = k_ranges;
+        h_last_type = attn_type_map;
+        h_last_slices = NumSlices;
+        h_last_token_m = token_m;
+        h_tile_count = tc;
+    }
+
+    meta = h_meta;
+    tile_count = h_tile_count;
+}
+
+} // namespace wgmma_tile_meta_cache
+
+
 
 namespace wgmma_partition {
 
@@ -2462,22 +2607,21 @@ void g8_partition_log2_fwd(
     const __nv_bfloat16* __restrict__ q,
     const int32_t* __restrict__ q_ranges,
     const int32_t* __restrict__ k_ranges,
-    const int32_t* __restrict__ attn_type_map,
+    const int32_t* __restrict__ tile_meta,
     const __nv_bfloat16* __restrict__ packed_k,
     const __nv_bfloat16* __restrict__ packed_v,
-    const int32_t* __restrict__ slice_block_offsets,
     int slice_total_blocks,
     const float* __restrict__ sink_lse,
     __nv_bfloat16* __restrict__ out,
     int S,
     int Hq,
     int Hkv,
-    int NumSlices
+    int tile_count
 ) {
     extern __shared__ __align__(128) unsigned char smem_raw[];
     __shared__ __align__(8) uint64_t full_bar[2];
     __shared__ __align__(8) uint64_t empty_bar[2];
-    __shared__ int meta[10];
+    __shared__ int meta[11];
 
     __nv_bfloat16* q_s =
         reinterpret_cast<__nv_bfloat16*>(smem_raw);
@@ -2495,78 +2639,9 @@ void g8_partition_log2_fwd(
     const int kvh = blockIdx.y;
 
     if (tid == 0) {
-        const int pid = blockIdx.x;
-        int prefix = 0;
-        int hit = 0;
-        int q0 = 0, qe = 0, qs = 0, ks = 0, ke = 0, typ = 0;
-        int sid = -1;
-
-        for (int s = 0; s < NumSlices; ++s) {
-            const int sqs = q_ranges[2*s + 0];
-            const int sqe = q_ranges[2*s + 1];
-            const int sks = k_ranges[2*s + 0];
-            const int ske = k_ranges[2*s + 1];
-            const int st = attn_type_map[s];
-            const int nt = (sqe - sqs + TOKEN_M - 1) / TOKEN_M;
-
-            if (!hit && pid >= prefix && pid < prefix + nt) {
-                q0 = sqs + (pid - prefix) * TOKEN_M;
-                qe = sqe;
-                qs = sqs;
-                ks = sks;
-                ke = ske;
-                typ = st;
-                sid = s;
-                hit = 1;
-            }
-            prefix += nt;
-        }
-
-        int kb_begin = 0;
-        int kb_end = 0;
-
-        if (hit) {
-            const int k_blocks = (ke - ks + N - 1) / N;
-            kb_end = k_blocks;
-
-            const int q_first = q0;
-            const int q_clip_end = ((q0 + TOKEN_M) < qe)
-                ? (q0 + TOKEN_M) : qe;
-            const int q_last = q_clip_end - 1;
-            const int Lq = qe - qs;
-            const int Lk = ke - ks;
-
-            if (typ == 2 || typ == 3) {
-                const int r_min = q_first - qs;
-                kb_begin = r_min / N;
-                if (kb_begin < 0) kb_begin = 0;
-                if (kb_begin > k_blocks) kb_begin = k_blocks;
-            }
-
-            if (typ == 1 || typ == 3) {
-                const int r_max = q_last - qs;
-                const int max_u = r_max + (Lk - Lq);
-                if (max_u < 0) {
-                    kb_end = 0;
-                } else {
-                    kb_end = (max_u + 1 + N - 1) / N;
-                    if (kb_end > k_blocks) kb_end = k_blocks;
-                }
-            }
-
-            if (kb_begin > kb_end) kb_begin = kb_end;
-        }
-
-        meta[0] = hit;
-        meta[1] = q0;
-        meta[2] = qe;
-        meta[3] = qs;
-        meta[4] = ks;
-        meta[5] = ke;
-        meta[6] = typ;
-        meta[7] = sid;
-        meta[8] = kb_begin;
-        meta[9] = kb_end;
+        const int32_t* src = tile_meta + int64_t(blockIdx.x) * 11;
+#pragma unroll
+        for (int j = 0; j < 11; ++j) meta[j] = src[j];
     }
 
     if (producer_lane0) {
@@ -2602,7 +2677,7 @@ void g8_partition_log2_fwd(
     // role-split kernel that removed ptxas C7520.
     if (wg >= 1) {
         if (producer_lane0 && block_count > 0) {
-            const int slice_base = slice_block_offsets[sid];
+            const int slice_base = meta[10];
             const __nv_bfloat16* pk =
                 packed_k
                 + (int64_t(kvh) * slice_total_blocks + slice_base)
@@ -2732,22 +2807,22 @@ void g8_partition_log2_fwd(
                 local_max1 = fmaxf(
                     local_max1, score[4*g+3]);
             } else {
-                if (wgmma_partition::mask_visible(
-                        typ, qidx0, key0+c0, qs, qe, ks, ke))
-                    local_max0 = fmaxf(
-                        local_max0, score[4*g+0]);
-                if (wgmma_partition::mask_visible(
-                        typ, qidx0, key0+c1, qs, qe, ks, ke))
-                    local_max0 = fmaxf(
-                        local_max0, score[4*g+1]);
-                if (wgmma_partition::mask_visible(
-                        typ, qidx1, key0+c0, qs, qe, ks, ke))
-                    local_max1 = fmaxf(
-                        local_max1, score[4*g+2]);
-                if (wgmma_partition::mask_visible(
-                        typ, qidx1, key0+c1, qs, qe, ks, ke))
-                    local_max1 = fmaxf(
-                        local_max1, score[4*g+3]);
+                const bool v00 = wgmma_partition::mask_visible(
+                    typ, qidx0, key0+c0, qs, qe, ks, ke);
+                const bool v01 = wgmma_partition::mask_visible(
+                    typ, qidx0, key0+c1, qs, qe, ks, ke);
+                const bool v10 = wgmma_partition::mask_visible(
+                    typ, qidx1, key0+c0, qs, qe, ks, ke);
+                const bool v11 = wgmma_partition::mask_visible(
+                    typ, qidx1, key0+c1, qs, qe, ks, ke);
+                local_max0 = fmaxf(
+                    local_max0, v00 ? score[4*g+0] : -CUDART_INF_F);
+                local_max0 = fmaxf(
+                    local_max0, v01 ? score[4*g+1] : -CUDART_INF_F);
+                local_max1 = fmaxf(
+                    local_max1, v10 ? score[4*g+2] : -CUDART_INF_F);
+                local_max1 = fmaxf(
+                    local_max1, v11 ? score[4*g+3] : -CUDART_INF_F);
             }
         }
 
@@ -2909,10 +2984,9 @@ inline void launch_g8_partition_log2(
     const __nv_bfloat16* q,
     const int32_t* q_ranges,
     const int32_t* k_ranges,
-    const int32_t* attn_type_map,
+    const int32_t* tile_meta,
     const __nv_bfloat16* packed_k,
     const __nv_bfloat16* packed_v,
-    const int32_t* slice_block_offsets,
     int slice_total_blocks,
     const float* sink_lse,
     __nv_bfloat16* out,
@@ -2936,17 +3010,14 @@ inline void launch_g8_partition_log2(
         configured = true;
     }
 
-    const int grid_x =
-        (S + TOKEN_M - 1) / TOKEN_M + NumSlices;
-
-    dim3 grid(grid_x, Hkv, 1);
+    dim3 grid(tile_count, Hkv, 1);
     g8_partition_log2_fwd<<<grid, 160, smem_bytes>>>(
         q,
-        q_ranges, k_ranges, attn_type_map,
+        tile_meta,
         packed_k, packed_v,
-        slice_block_offsets, slice_total_blocks,
+        slice_total_blocks,
         sink_lse, out,
-        S, Hq, Hkv, NumSlices
+        S, Hq, Hkv, tile_count
     );
 }
 
@@ -2973,22 +3044,21 @@ void g4_partition_async_fwd(
     const __nv_bfloat16* __restrict__ q,
     const int32_t* __restrict__ q_ranges,
     const int32_t* __restrict__ k_ranges,
-    const int32_t* __restrict__ attn_type_map,
+    const int32_t* __restrict__ tile_meta,
     const __nv_bfloat16* __restrict__ packed_k,
     const __nv_bfloat16* __restrict__ packed_v,
-    const int32_t* __restrict__ slice_block_offsets,
     int slice_total_blocks,
     const float* __restrict__ sink_lse,
     __nv_bfloat16* __restrict__ out,
     int S,
     int Hq,
     int Hkv,
-    int NumSlices
+    int tile_count
 ) {
     extern __shared__ __align__(128) unsigned char smem_raw[];
     __shared__ __align__(8) uint64_t full_bar[2];
     __shared__ __align__(8) uint64_t empty_bar[2];
-    __shared__ int meta[10];
+    __shared__ int meta[11];
 
     __nv_bfloat16* q_s =
         reinterpret_cast<__nv_bfloat16*>(smem_raw);
@@ -3006,78 +3076,9 @@ void g4_partition_async_fwd(
     const int kvh = blockIdx.y;
 
     if (tid == 0) {
-        const int pid = blockIdx.x;
-        int prefix = 0;
-        int hit = 0;
-        int q0 = 0, qe = 0, qs = 0, ks = 0, ke = 0, typ = 0;
-        int sid = -1;
-
-        for (int s = 0; s < NumSlices; ++s) {
-            const int sqs = q_ranges[2*s + 0];
-            const int sqe = q_ranges[2*s + 1];
-            const int sks = k_ranges[2*s + 0];
-            const int ske = k_ranges[2*s + 1];
-            const int st = attn_type_map[s];
-            const int nt = (sqe - sqs + TOKEN_M - 1) / TOKEN_M;
-
-            if (!hit && pid >= prefix && pid < prefix + nt) {
-                q0 = sqs + (pid - prefix) * TOKEN_M;
-                qe = sqe;
-                qs = sqs;
-                ks = sks;
-                ke = ske;
-                typ = st;
-                sid = s;
-                hit = 1;
-            }
-            prefix += nt;
-        }
-
-        int kb_begin = 0;
-        int kb_end = 0;
-
-        if (hit) {
-            const int k_blocks = (ke - ks + N - 1) / N;
-            kb_end = k_blocks;
-
-            const int q_first = q0;
-            const int q_clip_end = ((q0 + TOKEN_M) < qe)
-                ? (q0 + TOKEN_M) : qe;
-            const int q_last = q_clip_end - 1;
-            const int Lq = qe - qs;
-            const int Lk = ke - ks;
-
-            if (typ == 2 || typ == 3) {
-                const int r_min = q_first - qs;
-                kb_begin = r_min / N;
-                if (kb_begin < 0) kb_begin = 0;
-                if (kb_begin > k_blocks) kb_begin = k_blocks;
-            }
-
-            if (typ == 1 || typ == 3) {
-                const int r_max = q_last - qs;
-                const int max_u = r_max + (Lk - Lq);
-                if (max_u < 0) {
-                    kb_end = 0;
-                } else {
-                    kb_end = (max_u + 1 + N - 1) / N;
-                    if (kb_end > k_blocks) kb_end = k_blocks;
-                }
-            }
-
-            if (kb_begin > kb_end) kb_begin = kb_end;
-        }
-
-        meta[0] = hit;
-        meta[1] = q0;
-        meta[2] = qe;
-        meta[3] = qs;
-        meta[4] = ks;
-        meta[5] = ke;
-        meta[6] = typ;
-        meta[7] = sid;
-        meta[8] = kb_begin;
-        meta[9] = kb_end;
+        const int32_t* src = tile_meta + int64_t(blockIdx.x) * 11;
+#pragma unroll
+        for (int j = 0; j < 11; ++j) meta[j] = src[j];
     }
 
     if (producer_lane0) {
@@ -3111,7 +3112,7 @@ void g4_partition_async_fwd(
     // role-split kernel that removed ptxas C7520.
     if (wg >= 1) {
         if (producer_lane0 && block_count > 0) {
-            const int slice_base = slice_block_offsets[sid];
+            const int slice_base = meta[10];
             const __nv_bfloat16* pk =
                 packed_k
                 + (int64_t(kvh) * slice_total_blocks + slice_base)
@@ -3216,18 +3217,16 @@ void g4_partition_async_fwd(
                 local_max1 = fmaxf(
                     local_max1, score[4*g+3]);
             } else {
-                if (key0 + c0 < ke) {
-                    local_max0 = fmaxf(
-                        local_max0, score[4*g+0]);
-                    local_max1 = fmaxf(
-                        local_max1, score[4*g+2]);
-                }
-                if (key0 + c1 < ke) {
-                    local_max0 = fmaxf(
-                        local_max0, score[4*g+1]);
-                    local_max1 = fmaxf(
-                        local_max1, score[4*g+3]);
-                }
+                const bool v0 = key0 + c0 < ke;
+                const bool v1 = key0 + c1 < ke;
+                local_max0 = fmaxf(
+                    local_max0, v0 ? score[4*g+0] : -CUDART_INF_F);
+                local_max0 = fmaxf(
+                    local_max0, v1 ? score[4*g+1] : -CUDART_INF_F);
+                local_max1 = fmaxf(
+                    local_max1, v0 ? score[4*g+2] : -CUDART_INF_F);
+                local_max1 = fmaxf(
+                    local_max1, v1 ? score[4*g+3] : -CUDART_INF_F);
             }
         }
 
@@ -3375,10 +3374,9 @@ inline void launch_g4_partition_async(
     const __nv_bfloat16* q,
     const int32_t* q_ranges,
     const int32_t* k_ranges,
-    const int32_t* attn_type_map,
+    const int32_t* tile_meta,
     const __nv_bfloat16* packed_k,
     const __nv_bfloat16* packed_v,
-    const int32_t* slice_block_offsets,
     int slice_total_blocks,
     const float* sink_lse,
     __nv_bfloat16* out,
@@ -3402,17 +3400,14 @@ inline void launch_g4_partition_async(
         configured = true;
     }
 
-    const int grid_x =
-        (S + TOKEN_M - 1) / TOKEN_M + NumSlices;
-
-    dim3 grid(grid_x, Hkv, 1);
+    dim3 grid(tile_count, Hkv, 1);
     g4_partition_async_fwd<<<grid, 160, smem_bytes>>>(
         q,
-        q_ranges, k_ranges, attn_type_map,
+        tile_meta,
         packed_k, packed_v,
-        slice_block_offsets, slice_total_blocks,
+        slice_total_blocks,
         sink_lse, out,
-        S, Hq, Hkv, NumSlices
+        S, Hq, Hkv, tile_count
     );
 }
 
@@ -4803,18 +4798,18 @@ void dense_g4_causal_log2_fwd(
                 local_max1 = fmaxf(
                     local_max1, score[4*g+3]);
             } else {
-                if (key0 + c0 <= qidx0)
-                    local_max0 = fmaxf(
-                        local_max0, score[4*g+0]);
-                if (key0 + c1 <= qidx0)
-                    local_max0 = fmaxf(
-                        local_max0, score[4*g+1]);
-                if (key0 + c0 <= qidx1)
-                    local_max1 = fmaxf(
-                        local_max1, score[4*g+2]);
-                if (key0 + c1 <= qidx1)
-                    local_max1 = fmaxf(
-                        local_max1, score[4*g+3]);
+                const bool v00 = key0 + c0 <= qidx0;
+                const bool v01 = key0 + c1 <= qidx0;
+                const bool v10 = key0 + c0 <= qidx1;
+                const bool v11 = key0 + c1 <= qidx1;
+                local_max0 = fmaxf(
+                    local_max0, v00 ? score[4*g+0] : -CUDART_INF_F);
+                local_max0 = fmaxf(
+                    local_max0, v01 ? score[4*g+1] : -CUDART_INF_F);
+                local_max1 = fmaxf(
+                    local_max1, v10 ? score[4*g+2] : -CUDART_INF_F);
+                local_max1 = fmaxf(
+                    local_max1, v11 ? score[4*g+3] : -CUDART_INF_F);
             }
         }
 
@@ -5361,7 +5356,7 @@ extern "C" void run_kernel(
 ) {
     static bool printed_build = false;
     if (!printed_build) {
-        fprintf(stderr, "BUILD CUDA_SM90A_BRANCHLESS_PRUNED_V25\\n");
+        fprintf(stderr, "BUILD CUDA_SM90A_STATIC_META_V26\\n");
         printed_build = true;
     }
 
@@ -5566,13 +5561,20 @@ extern "C" void run_kernel(
             slice_offsets, slice_total_blocks
         );
 
+        const int32_t* tile_meta = nullptr;
+        int tile_count = 0;
+        wgmma_tile_meta_cache::ensure(
+            q_ranges, k_ranges, attn_type_map,
+            N, 8, tile_meta, tile_count
+        );
+
         wgmma_g8_log2::launch_g8_partition_log2(
             q,
-            q_ranges, k_ranges, attn_type_map,
+            tile_meta,
             packed_k_log2, packed_v,
-            slice_offsets, slice_total_blocks,
+            slice_total_blocks,
             sink_lse, output,
-            S, Hq, Hkv, N
+            S, Hq, Hkv, tile_count
         );
         return;
     }
@@ -5596,13 +5598,20 @@ extern "C" void run_kernel(
             slice_offsets, slice_total_blocks
         );
 
+        const int32_t* tile_meta = nullptr;
+        int tile_count = 0;
+        wgmma_tile_meta_cache::ensure(
+            q_ranges, k_ranges, attn_type_map,
+            N, 16, tile_meta, tile_count
+        );
+
         wgmma_g4_async::launch_g4_partition_async(
             q,
-            q_ranges, k_ranges, attn_type_map,
+            tile_meta,
             packed_k_log2, packed_v,
-            slice_offsets, slice_total_blocks,
+            slice_total_blocks,
             sink_lse, output,
-            S, Hq, Hkv, N
+            S, Hq, Hkv, tile_count
         );
         return;
     }
