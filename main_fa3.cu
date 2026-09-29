@@ -485,6 +485,8 @@ namespace wgmma_attention {
 
 using namespace wgmma_sm90;
 
+constexpr float LOG2E = 1.4426950408889634f;
+
 constexpr int HD = 128;
 constexpr int M = 64;
 constexpr int N = 64;
@@ -657,7 +659,6 @@ void dense_wgmma_fwd(
     const __nv_bfloat16* __restrict__ packed_v,
     const float* __restrict__ sink_lse,
     __nv_bfloat16* __restrict__ out,
-    float softmax_scale,
     int S,
     int Hq,
     int Hkv,
@@ -745,17 +746,17 @@ void dense_wgmma_fwd(
             const int c1 = frag_col(g, 1);
 
             if (dense_visible(causal, qtok0, key0 + c0)) {
-                local_max0 = fmaxf(local_max0, score[4 * g + 0] * softmax_scale);
+                local_max0 = fmaxf(local_max0, score[4 * g + 0]);
             }
             if (dense_visible(causal, qtok0, key0 + c1)) {
-                local_max0 = fmaxf(local_max0, score[4 * g + 1] * softmax_scale);
+                local_max0 = fmaxf(local_max0, score[4 * g + 1]);
             }
 
             if (dense_visible(causal, qtok1, key0 + c0)) {
-                local_max1 = fmaxf(local_max1, score[4 * g + 2] * softmax_scale);
+                local_max1 = fmaxf(local_max1, score[4 * g + 2]);
             }
             if (dense_visible(causal, qtok1, key0 + c1)) {
-                local_max1 = fmaxf(local_max1, score[4 * g + 3] * softmax_scale);
+                local_max1 = fmaxf(local_max1, score[4 * g + 3]);
             }
         }
 
@@ -765,9 +766,9 @@ void dense_wgmma_fwd(
         const float new_m1 = fmaxf(m1, tile_m1);
 
         const float alpha0 =
-            (m0 == -CUDART_INF_F) ? 0.0f : __expf(m0 - new_m0);
+            (m0 == -CUDART_INF_F) ? 0.0f : wgmma_sm90::ex2_approx(m0 - new_m0);
         const float alpha1 =
-            (m1 == -CUDART_INF_F) ? 0.0f : __expf(m1 - new_m1);
+            (m1 == -CUDART_INF_F) ? 0.0f : wgmma_sm90::ex2_approx(m1 - new_m1);
 
         float local_sum0 = 0.0f;
         float local_sum1 = 0.0f;
@@ -783,20 +784,20 @@ void dense_wgmma_fwd(
             float p11 = 0.0f;
 
             if (dense_visible(causal, qtok0, key0 + c0)) {
-                p00 = __expf(score[4 * g + 0] * softmax_scale - new_m0);
+                p00 = wgmma_sm90::ex2_approx(score[4 * g + 0] - new_m0);
                 local_sum0 += p00;
             }
             if (dense_visible(causal, qtok0, key0 + c1)) {
-                p01 = __expf(score[4 * g + 1] * softmax_scale - new_m0);
+                p01 = wgmma_sm90::ex2_approx(score[4 * g + 1] - new_m0);
                 local_sum0 += p01;
             }
 
             if (dense_visible(causal, qtok1, key0 + c0)) {
-                p10 = __expf(score[4 * g + 2] * softmax_scale - new_m1);
+                p10 = wgmma_sm90::ex2_approx(score[4 * g + 2] - new_m1);
                 local_sum1 += p10;
             }
             if (dense_visible(causal, qtok1, key0 + c1)) {
-                p11 = __expf(score[4 * g + 3] * softmax_scale - new_m1);
+                p11 = wgmma_sm90::ex2_approx(score[4 * g + 3] - new_m1);
                 local_sum1 += p11;
             }
 
@@ -870,8 +871,8 @@ void dense_wgmma_fwd(
         __syncthreads();
     }
 
-    float denom0 = l0 + __expf(sink_lse[qh0] - m0);
-    float denom1 = l1 + __expf(sink_lse[qh1] - m1);
+    float denom0 = l0 + wgmma_sm90::ex2_approx(sink_lse[qh0] * LOG2E - m0);
+    float denom1 = l1 + wgmma_sm90::ex2_approx(sink_lse[qh1] * LOG2E - m1);
 
     const float inv0 = 1.0f / denom0;
     const float inv1 = 1.0f / denom1;
@@ -912,7 +913,6 @@ inline void launch_dense_wgmma(
     const __nv_bfloat16* packed_v,
     const float* sink_lse,
     __nv_bfloat16* out,
-    float softmax_scale,
     int S,
     int Hq,
     int Hkv,
@@ -923,7 +923,7 @@ inline void launch_dense_wgmma(
     const int token_M = M / G;
     dim3 grid(S / token_M, Hkv, 1);
     dense_wgmma_fwd<<<grid, 128>>>(
-        q, k, v, packed_k, packed_v, sink_lse, out, softmax_scale,
+        q, k, v, packed_k, packed_v, sink_lse, out,
         S, Hq, Hkv, G, Ns, causal
     );
 }
@@ -2416,7 +2416,6 @@ void g128_fa3_pipeline_fwd(
     const __nv_bfloat16* __restrict__ packed_v,
     const float* __restrict__ sink_lse,
     __nv_bfloat16* __restrict__ out,
-    float softmax_scale
 ) {
     extern __shared__ __align__(128) unsigned char smem_raw[];
     __shared__ __align__(8) uint64_t full_bar[2];
@@ -2564,13 +2563,13 @@ void g128_fa3_pipeline_fwd(
 #pragma unroll
             for (int g = 0; g < 8; ++g) {
                 local_max0 = fmaxf(
-                    local_max0, score[4*g+0] * softmax_scale);
+                    local_max0, score[4*g+0]);
                 local_max0 = fmaxf(
-                    local_max0, score[4*g+1] * softmax_scale);
+                    local_max0, score[4*g+1]);
                 local_max1 = fmaxf(
-                    local_max1, score[4*g+2] * softmax_scale);
+                    local_max1, score[4*g+2]);
                 local_max1 = fmaxf(
-                    local_max1, score[4*g+3] * softmax_scale);
+                    local_max1, score[4*g+3]);
             }
 
             const float tm0 = row4_max(local_max0);
@@ -2578,9 +2577,9 @@ void g128_fa3_pipeline_fwd(
             const float nm0 = fmaxf(m0, tm0);
             const float nm1 = fmaxf(m1, tm1);
             const float a0 =
-                (m0 == -CUDART_INF_F) ? 0.0f : __expf(m0 - nm0);
+                (m0 == -CUDART_INF_F) ? 0.0f : wgmma_sm90::ex2_approx(m0 - nm0);
             const float a1 =
-                (m1 == -CUDART_INF_F) ? 0.0f : __expf(m1 - nm1);
+                (m1 == -CUDART_INF_F) ? 0.0f : wgmma_sm90::ex2_approx(m1 - nm1);
 
             float sum0 = 0.0f, sum1 = 0.0f;
 
@@ -2590,13 +2589,13 @@ void g128_fa3_pipeline_fwd(
                 const int c1 = frag_col(g, 1);
 
                 const float p00 =
-                    __expf(score[4*g+0] * softmax_scale - nm0);
+                    wgmma_sm90::ex2_approx(score[4*g+0] - nm0);
                 const float p01 =
-                    __expf(score[4*g+1] * softmax_scale - nm0);
+                    wgmma_sm90::ex2_approx(score[4*g+1] - nm0);
                 const float p10 =
-                    __expf(score[4*g+2] * softmax_scale - nm1);
+                    wgmma_sm90::ex2_approx(score[4*g+2] - nm1);
                 const float p11 =
-                    __expf(score[4*g+3] * softmax_scale - nm1);
+                    wgmma_sm90::ex2_approx(score[4*g+3] - nm1);
 
                 sum0 += p00 + p01;
                 sum1 += p10 + p11;
@@ -2667,9 +2666,9 @@ void g128_fa3_pipeline_fwd(
     }
 
     const float denom0 =
-            l0 + __expf(sink_lse[qh0] - m0);
+            l0 + wgmma_sm90::ex2_approx(sink_lse[qh0] * 1.4426950408889634f - m0);
         const float denom1 =
-            l1 + __expf(sink_lse[qh1] - m1);
+            l1 + wgmma_sm90::ex2_approx(sink_lse[qh1] * 1.4426950408889634f - m1);
         const float inv0 = 1.0f / denom0;
         const float inv1 = 1.0f / denom1;
 
@@ -2704,7 +2703,6 @@ inline void launch_g128_fa3(
     const __nv_bfloat16* packed_v,
     const float* sink_lse,
     __nv_bfloat16* out,
-    float softmax_scale
 ) {
     constexpr int smem_bytes =
         (2 * QK_SLICES * BLOCK_ELEMS
@@ -2722,7 +2720,7 @@ inline void launch_g128_fa3(
     }
 
     g128_fa3_pipeline_fwd<<<S12, 288, smem_bytes>>>(
-        q, packed_k, packed_v, sink_lse, out, softmax_scale
+        q, packed_k, packed_v, sink_lse, out
     );
 }
 
@@ -3762,6 +3760,8 @@ namespace wgmma_g4_async {
 
 using namespace wgmma_sm90;
 
+constexpr float LOG2E = 1.4426950408889634f;
+
 constexpr int G = 4;
 constexpr int HD = 128;
 constexpr int N = 64;
@@ -3783,7 +3783,6 @@ void g4_partition_async_fwd(
     int slice_total_blocks,
     const float* __restrict__ sink_lse,
     __nv_bfloat16* __restrict__ out,
-    float softmax_scale,
     int S,
     int Hq,
     int Hkv,
@@ -4012,25 +4011,25 @@ void g4_partition_async_fwd(
 
             if (full_block) {
                 local_max0 = fmaxf(
-                    local_max0, score[4*g+0] * softmax_scale);
+                    local_max0, score[4*g+0]);
                 local_max0 = fmaxf(
-                    local_max0, score[4*g+1] * softmax_scale);
+                    local_max0, score[4*g+1]);
                 local_max1 = fmaxf(
-                    local_max1, score[4*g+2] * softmax_scale);
+                    local_max1, score[4*g+2]);
                 local_max1 = fmaxf(
-                    local_max1, score[4*g+3] * softmax_scale);
+                    local_max1, score[4*g+3]);
             } else {
                 if (key0 + c0 < ke) {
                     local_max0 = fmaxf(
-                        local_max0, score[4*g+0] * softmax_scale);
+                        local_max0, score[4*g+0]);
                     local_max1 = fmaxf(
-                        local_max1, score[4*g+2] * softmax_scale);
+                        local_max1, score[4*g+2]);
                 }
                 if (key0 + c1 < ke) {
                     local_max0 = fmaxf(
-                        local_max0, score[4*g+1] * softmax_scale);
+                        local_max0, score[4*g+1]);
                     local_max1 = fmaxf(
-                        local_max1, score[4*g+3] * softmax_scale);
+                        local_max1, score[4*g+3]);
                 }
             }
         }
@@ -4040,9 +4039,9 @@ void g4_partition_async_fwd(
         const float nm0 = fmaxf(m0, tm0);
         const float nm1 = fmaxf(m1, tm1);
         const float a0 =
-            (m0 == -CUDART_INF_F) ? 0.0f : __expf(m0 - nm0);
+            (m0 == -CUDART_INF_F) ? 0.0f : wgmma_sm90::ex2_approx(m0 - nm0);
         const float a1 =
-            (m1 == -CUDART_INF_F) ? 0.0f : __expf(m1 - nm1);
+            (m1 == -CUDART_INF_F) ? 0.0f : wgmma_sm90::ex2_approx(m1 - nm1);
 
         float sum0 = 0.0f, sum1 = 0.0f;
 
@@ -4055,30 +4054,30 @@ void g4_partition_async_fwd(
             float p10 = 0.0f, p11 = 0.0f;
 
             if (full_block) {
-                p00 = __expf(
-                    score[4*g+0] * softmax_scale - nm0);
-                p01 = __expf(
-                    score[4*g+1] * softmax_scale - nm0);
-                p10 = __expf(
-                    score[4*g+2] * softmax_scale - nm1);
-                p11 = __expf(
-                    score[4*g+3] * softmax_scale - nm1);
+                p00 = wgmma_sm90::ex2_approx(
+                    score[4*g+0] - nm0);
+                p01 = wgmma_sm90::ex2_approx(
+                    score[4*g+1] - nm0);
+                p10 = wgmma_sm90::ex2_approx(
+                    score[4*g+2] - nm1);
+                p11 = wgmma_sm90::ex2_approx(
+                    score[4*g+3] - nm1);
                 sum0 += p00 + p01;
                 sum1 += p10 + p11;
             } else {
                 if (key0 + c0 < ke) {
-                    p00 = __expf(
-                        score[4*g+0] * softmax_scale - nm0);
-                    p10 = __expf(
-                        score[4*g+2] * softmax_scale - nm1);
+                    p00 = wgmma_sm90::ex2_approx(
+                        score[4*g+0] - nm0);
+                    p10 = wgmma_sm90::ex2_approx(
+                        score[4*g+2] - nm1);
                     sum0 += p00;
                     sum1 += p10;
                 }
                 if (key0 + c1 < ke) {
-                    p01 = __expf(
-                        score[4*g+1] * softmax_scale - nm0);
-                    p11 = __expf(
-                        score[4*g+3] * softmax_scale - nm1);
+                    p01 = wgmma_sm90::ex2_approx(
+                        score[4*g+1] - nm0);
+                    p11 = wgmma_sm90::ex2_approx(
+                        score[4*g+3] - nm1);
                     sum0 += p01;
                     sum1 += p11;
                 }
@@ -4146,7 +4145,7 @@ void g4_partition_async_fwd(
 
     if (qidx0 < qe) {
         const float denom0 =
-            l0 + __expf(sink_lse[qh0] - m0);
+            l0 + wgmma_sm90::ex2_approx(sink_lse[qh0] * LOG2E - m0);
         const float inv0 = 1.0f / denom0;
 
 #pragma unroll
@@ -4166,7 +4165,7 @@ void g4_partition_async_fwd(
 
     if (qidx1 < qe) {
         const float denom1 =
-            l1 + __expf(sink_lse[qh1] - m1);
+            l1 + wgmma_sm90::ex2_approx(sink_lse[qh1] * LOG2E - m1);
         const float inv1 = 1.0f / denom1;
 
 #pragma unroll
@@ -4196,7 +4195,6 @@ inline void launch_g4_partition_async(
     int slice_total_blocks,
     const float* sink_lse,
     __nv_bfloat16* out,
-    float softmax_scale,
     int S,
     int Hq,
     int Hkv,
@@ -4226,7 +4224,7 @@ inline void launch_g4_partition_async(
         q_ranges, k_ranges, attn_type_map,
         packed_k, packed_v,
         slice_block_offsets, slice_total_blocks,
-        sink_lse, out, softmax_scale,
+        sink_lse, out,
         S, Hq, Hkv, NumSlices
     );
 }
@@ -4238,6 +4236,8 @@ inline void launch_g4_partition_async(
 namespace wgmma_g4_overlap_async {
 
 using namespace wgmma_sm90;
+
+constexpr float LOG2E = 1.4426950408889634f;
 
 constexpr int G = 4;
 constexpr int HD = 128;
@@ -4259,7 +4259,6 @@ void g4_overlap_async_fwd(
     int slice_total_blocks,
     const float* __restrict__ sink_lse,
     __nv_bfloat16* __restrict__ out,
-    float softmax_scale,
     int Hq
 ) {
     extern __shared__ __align__(128) unsigned char smem_raw[];
@@ -4495,16 +4494,16 @@ void g4_overlap_async_fwd(
 
             if (v00)
                 local_max0 = fmaxf(
-                    local_max0, score[4*g+0] * softmax_scale);
+                    local_max0, score[4*g+0]);
             if (v01)
                 local_max0 = fmaxf(
-                    local_max0, score[4*g+1] * softmax_scale);
+                    local_max0, score[4*g+1]);
             if (v10)
                 local_max1 = fmaxf(
-                    local_max1, score[4*g+2] * softmax_scale);
+                    local_max1, score[4*g+2]);
             if (v11)
                 local_max1 = fmaxf(
-                    local_max1, score[4*g+3] * softmax_scale);
+                    local_max1, score[4*g+3]);
         }
 
         const float tm0 = row4_max(local_max0);
@@ -4512,9 +4511,9 @@ void g4_overlap_async_fwd(
         const float nm0 = fmaxf(m0, tm0);
         const float nm1 = fmaxf(m1, tm1);
         const float a0 =
-            (m0 == -CUDART_INF_F) ? 0.0f : __expf(m0 - nm0);
+            (m0 == -CUDART_INF_F) ? 0.0f : wgmma_sm90::ex2_approx(m0 - nm0);
         const float a1 =
-            (m1 == -CUDART_INF_F) ? 0.0f : __expf(m1 - nm1);
+            (m1 == -CUDART_INF_F) ? 0.0f : wgmma_sm90::ex2_approx(m1 - nm1);
 
         float sum0 = 0.0f, sum1 = 0.0f;
 
@@ -4543,19 +4542,19 @@ void g4_overlap_async_fwd(
             float p10 = 0.0f, p11 = 0.0f;
 
             if (v00) {
-                p00 = __expf(score[4*g+0] * softmax_scale - nm0);
+                p00 = wgmma_sm90::ex2_approx(score[4*g+0] - nm0);
                 sum0 += p00;
             }
             if (v01) {
-                p01 = __expf(score[4*g+1] * softmax_scale - nm0);
+                p01 = wgmma_sm90::ex2_approx(score[4*g+1] - nm0);
                 sum0 += p01;
             }
             if (v10) {
-                p10 = __expf(score[4*g+2] * softmax_scale - nm1);
+                p10 = wgmma_sm90::ex2_approx(score[4*g+2] - nm1);
                 sum1 += p10;
             }
             if (v11) {
-                p11 = __expf(score[4*g+3] * softmax_scale - nm1);
+                p11 = wgmma_sm90::ex2_approx(score[4*g+3] - nm1);
                 sum1 += p11;
             }
 
@@ -4621,7 +4620,7 @@ void g4_overlap_async_fwd(
 
     if (qidx0 < qe) {
         const float denom0 =
-            l0 + __expf(sink_lse[qh0] - m0);
+            l0 + wgmma_sm90::ex2_approx(sink_lse[qh0] * LOG2E - m0);
         const float inv0 = 1.0f / denom0;
 
 #pragma unroll
@@ -4641,7 +4640,7 @@ void g4_overlap_async_fwd(
 
     if (qidx1 < qe) {
         const float denom1 =
-            l1 + __expf(sink_lse[qh1] - m1);
+            l1 + wgmma_sm90::ex2_approx(sink_lse[qh1] * LOG2E - m1);
         const float inv1 = 1.0f / denom1;
 
 #pragma unroll
@@ -4670,7 +4669,6 @@ inline void launch_g4_overlap_async(
     int slice_total_blocks,
     const float* sink_lse,
     __nv_bfloat16* out,
-    float softmax_scale
 ) {
     constexpr int smem_bytes =
         (QK_SLICES * BLOCK_ELEMS
@@ -4693,7 +4691,7 @@ inline void launch_g4_overlap_async(
         q, q_ranges, k_ranges,
         packed_k, packed_v,
         slice_block_offsets, slice_total_blocks,
-        sink_lse, out, softmax_scale, 32
+        sink_lse, out, 32
     );
 }
 
@@ -4893,12 +4891,144 @@ inline void ensure_slice_d64(
     total_blocks = h_total_blocks;
 }
 
+
+
+static __nv_bfloat16* h_packed_k_log2 = nullptr;
+static size_t h_log2_capacity_elems = 0;
+static const __nv_bfloat16* h_log2_last_k = nullptr;
+static const int32_t* h_log2_last_k_ranges = nullptr;
+static const int32_t* h_log2_last_meta = nullptr;
+static int h_log2_last_S = -1;
+static int h_log2_last_Hkv = -1;
+static int h_log2_last_N = -1;
+static float h_log2_last_factor = 0.0f;
+
+__global__ __launch_bounds__(128, 1)
+void pack_slice_k_d64_log2(
+    const __nv_bfloat16* __restrict__ k,
+    const int32_t* __restrict__ k_ranges,
+    const int32_t* __restrict__ offsets,
+    __nv_bfloat16* __restrict__ packed_k,
+    float factor,
+    int total_blocks,
+    int Hkv,
+    int NumSlices
+) {
+    const int flat = blockIdx.x;
+    const int kvh = blockIdx.y;
+    const int tid = threadIdx.x;
+    if (flat >= total_blocks) return;
+
+    int sid = 0;
+#pragma unroll 1
+    while (sid + 1 < NumSlices && flat >= offsets[sid + 1]) ++sid;
+
+    const int local_block = flat - offsets[sid];
+    const int ks = k_ranges[2 * sid + 0];
+    const int ke = k_ranges[2 * sid + 1];
+    const int key0 = ks + local_block * TILE_N;
+
+#pragma unroll
+    for (int ds = 0; ds < TILES_D; ++ds) {
+        int row, kvec;
+        canonical_vec_coord(tid, row, kvec);
+        const int key = key0 + row;
+        const int d0 = ds * 16 + kvec * 8;
+
+        __nv_bfloat16* out =
+            packed_k
+            + (((int64_t(kvh) * total_blocks + flat) * TILES_D + ds)
+               * BLOCK_ELEMS)
+            + tid * 8;
+
+        if (key < ke) {
+            const __nv_bfloat16* in =
+                k + (int64_t(key) * Hkv + kvh) * HD + d0;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                out[e] = __float2bfloat16_rn(
+                    __bfloat162float(in[e]) * factor
+                );
+            }
+        } else {
+            *reinterpret_cast<uint4*>(out) = make_uint4(0, 0, 0, 0);
+        }
+    }
+}
+
+inline void ensure_slice_d64_log2(
+    const __nv_bfloat16* k,
+    const __nv_bfloat16* v,
+    const int32_t* k_ranges,
+    const int32_t* meta_tag,
+    float softmax_scale,
+    int S,
+    int Hkv,
+    int NumSlices,
+    const __nv_bfloat16*& packed_k_log2,
+    const __nv_bfloat16*& packed_v,
+    const int32_t*& offsets,
+    int& total_blocks
+) {
+    const __nv_bfloat16* ignored_k = nullptr;
+    ensure_slice_d64(
+        k, v, k_ranges, meta_tag,
+        S, Hkv, NumSlices,
+        ignored_k, packed_v, offsets, total_blocks
+    );
+
+    constexpr float LOG2E_LOCAL = 1.4426950408889634f;
+    const float factor = softmax_scale * LOG2E_LOCAL;
+    const size_t elems =
+        size_t(total_blocks) * size_t(Hkv)
+        * size_t(TILES_D) * size_t(BLOCK_ELEMS);
+
+    if (h_log2_capacity_elems < elems) {
+        if (h_packed_k_log2) cudaFree(h_packed_k_log2);
+        cudaMalloc(
+            reinterpret_cast<void**>(&h_packed_k_log2),
+            elems * sizeof(__nv_bfloat16)
+        );
+        h_log2_capacity_elems = elems;
+        h_log2_last_k = nullptr;
+    }
+
+    const bool changed =
+        h_log2_last_k != k ||
+        h_log2_last_k_ranges != k_ranges ||
+        h_log2_last_meta != meta_tag ||
+        h_log2_last_S != S ||
+        h_log2_last_Hkv != Hkv ||
+        h_log2_last_N != NumSlices ||
+        h_log2_last_factor != factor;
+
+    if (changed && total_blocks > 0) {
+        dim3 grid(total_blocks, Hkv, 1);
+        pack_slice_k_d64_log2<<<grid, 128>>>(
+            k, k_ranges, offsets,
+            h_packed_k_log2, factor,
+            total_blocks, Hkv, NumSlices
+        );
+        h_log2_last_k = k;
+        h_log2_last_k_ranges = k_ranges;
+        h_log2_last_meta = meta_tag;
+        h_log2_last_S = S;
+        h_log2_last_Hkv = Hkv;
+        h_log2_last_N = NumSlices;
+        h_log2_last_factor = factor;
+    }
+
+    packed_k_log2 = h_packed_k_log2;
+}
+
 } // namespace wgmma_slice_cache64
 
 
 namespace wgmma_d64_async {
 
 using namespace wgmma_sm90;
+
+constexpr float LOG2E = 1.4426950408889634f;
 
 constexpr int G = 4;
 constexpr int HD = 64;
@@ -4951,7 +5081,6 @@ void d64_causal_async_fwd(
     int slice_total_blocks,
     const float* __restrict__ sink_lse,
     __nv_bfloat16* __restrict__ out,
-    float softmax_scale
 ) {
     extern __shared__ __align__(128) unsigned char smem_raw[];
     __shared__ __align__(8) uint64_t full_bar[2];
@@ -5134,16 +5263,16 @@ void d64_causal_async_fwd(
 
             if (qidx0 < qe && ka < ke && ka <= qidx0)
                 local_max0 = fmaxf(
-                    local_max0, score[4*g+0] * softmax_scale);
+                    local_max0, score[4*g+0]);
             if (qidx0 < qe && kb < ke && kb <= qidx0)
                 local_max0 = fmaxf(
-                    local_max0, score[4*g+1] * softmax_scale);
+                    local_max0, score[4*g+1]);
             if (qidx1 < qe && ka < ke && ka <= qidx1)
                 local_max1 = fmaxf(
-                    local_max1, score[4*g+2] * softmax_scale);
+                    local_max1, score[4*g+2]);
             if (qidx1 < qe && kb < ke && kb <= qidx1)
                 local_max1 = fmaxf(
-                    local_max1, score[4*g+3] * softmax_scale);
+                    local_max1, score[4*g+3]);
         }
 
         const float tm0 = row4_max(local_max0);
@@ -5151,9 +5280,9 @@ void d64_causal_async_fwd(
         const float nm0 = fmaxf(m0, tm0);
         const float nm1 = fmaxf(m1, tm1);
         const float a0 =
-            (m0 == -CUDART_INF_F) ? 0.0f : __expf(m0 - nm0);
+            (m0 == -CUDART_INF_F) ? 0.0f : wgmma_sm90::ex2_approx(m0 - nm0);
         const float a1 =
-            (m1 == -CUDART_INF_F) ? 0.0f : __expf(m1 - nm1);
+            (m1 == -CUDART_INF_F) ? 0.0f : wgmma_sm90::ex2_approx(m1 - nm1);
 
         float sum0 = 0.0f, sum1 = 0.0f;
 
@@ -5168,19 +5297,19 @@ void d64_causal_async_fwd(
             float p10 = 0.0f, p11 = 0.0f;
 
             if (qidx0 < qe && ka < ke && ka <= qidx0) {
-                p00 = __expf(score[4*g+0] * softmax_scale - nm0);
+                p00 = wgmma_sm90::ex2_approx(score[4*g+0] - nm0);
                 sum0 += p00;
             }
             if (qidx0 < qe && kb < ke && kb <= qidx0) {
-                p01 = __expf(score[4*g+1] * softmax_scale - nm0);
+                p01 = wgmma_sm90::ex2_approx(score[4*g+1] - nm0);
                 sum0 += p01;
             }
             if (qidx1 < qe && ka < ke && ka <= qidx1) {
-                p10 = __expf(score[4*g+2] * softmax_scale - nm1);
+                p10 = wgmma_sm90::ex2_approx(score[4*g+2] - nm1);
                 sum1 += p10;
             }
             if (qidx1 < qe && kb < ke && kb <= qidx1) {
-                p11 = __expf(score[4*g+3] * softmax_scale - nm1);
+                p11 = wgmma_sm90::ex2_approx(score[4*g+3] - nm1);
                 sum1 += p11;
             }
 
@@ -5234,7 +5363,7 @@ void d64_causal_async_fwd(
 
     if (qidx0 < qe) {
         const float denom0 =
-            l0 + __expf(sink_lse[qh0] - m0);
+            l0 + wgmma_sm90::ex2_approx(sink_lse[qh0] * LOG2E - m0);
         const float inv0 = 1.0f / denom0;
 #pragma unroll
         for (int g = 0; g < 8; ++g) {
@@ -5249,7 +5378,7 @@ void d64_causal_async_fwd(
 
     if (qidx1 < qe) {
         const float denom1 =
-            l1 + __expf(sink_lse[qh1] - m1);
+            l1 + wgmma_sm90::ex2_approx(sink_lse[qh1] * LOG2E - m1);
         const float inv1 = 1.0f / denom1;
 #pragma unroll
         for (int g = 0; g < 8; ++g) {
@@ -5273,7 +5402,6 @@ inline void launch_d64_async(
     int slice_total_blocks,
     const float* sink_lse,
     __nv_bfloat16* out,
-    float softmax_scale
 ) {
     constexpr int smem_bytes =
         (QK_SLICES * BLOCK_ELEMS
@@ -5295,7 +5423,7 @@ inline void launch_d64_async(
         q, q_ranges, k_ranges,
         packed_k, packed_v,
         slice_block_offsets, slice_total_blocks,
-        sink_lse, out, softmax_scale
+        sink_lse, out
     );
 }
 
@@ -6038,6 +6166,8 @@ namespace wgmma_overlap2_g2_async {
 
 using namespace wgmma_sm90;
 
+constexpr float LOG2E = 1.4426950408889634f;
+
 constexpr int S = 512;
 constexpr int HQ = 16;
 constexpr int HKV = 8;
@@ -6059,7 +6189,6 @@ void overlap2_g2_async_fwd(
     const __nv_bfloat16* __restrict__ packed_v,
     const float* __restrict__ sink_lse,
     __nv_bfloat16* __restrict__ out,
-    float softmax_scale
 ) {
     extern __shared__ __align__(128) unsigned char smem_raw[];
     __shared__ __align__(8) uint64_t full_bar[2];
@@ -6220,13 +6349,13 @@ void overlap2_g2_async_fwd(
 #pragma unroll
         for (int g = 0; g < 8; ++g) {
             local_max0 = fmaxf(
-                local_max0, score[4*g+0] * softmax_scale);
+                local_max0, score[4*g+0]);
             local_max0 = fmaxf(
-                local_max0, score[4*g+1] * softmax_scale);
+                local_max0, score[4*g+1]);
             local_max1 = fmaxf(
-                local_max1, score[4*g+2] * softmax_scale);
+                local_max1, score[4*g+2]);
             local_max1 = fmaxf(
-                local_max1, score[4*g+3] * softmax_scale);
+                local_max1, score[4*g+3]);
         }
 
         const float tm0 = row4_max(local_max0);
@@ -6234,9 +6363,9 @@ void overlap2_g2_async_fwd(
         const float nm0 = fmaxf(m0, tm0);
         const float nm1 = fmaxf(m1, tm1);
         const float a0 =
-            (m0 == -CUDART_INF_F) ? 0.0f : __expf(m0 - nm0);
+            (m0 == -CUDART_INF_F) ? 0.0f : wgmma_sm90::ex2_approx(m0 - nm0);
         const float a1 =
-            (m1 == -CUDART_INF_F) ? 0.0f : __expf(m1 - nm1);
+            (m1 == -CUDART_INF_F) ? 0.0f : wgmma_sm90::ex2_approx(m1 - nm1);
 
         float sum0 = 0.0f, sum1 = 0.0f;
 
@@ -6246,13 +6375,13 @@ void overlap2_g2_async_fwd(
             const int c1 = frag_col(g, 1);
 
             const float p00 =
-                __expf(score[4*g+0] * softmax_scale - nm0);
+                wgmma_sm90::ex2_approx(score[4*g+0] - nm0);
             const float p01 =
-                __expf(score[4*g+1] * softmax_scale - nm0);
+                wgmma_sm90::ex2_approx(score[4*g+1] - nm0);
             const float p10 =
-                __expf(score[4*g+2] * softmax_scale - nm1);
+                wgmma_sm90::ex2_approx(score[4*g+2] - nm1);
             const float p11 =
-                __expf(score[4*g+3] * softmax_scale - nm1);
+                wgmma_sm90::ex2_approx(score[4*g+3] - nm1);
 
             sum0 += p00 + p01;
             sum1 += p10 + p11;
@@ -6318,9 +6447,9 @@ void overlap2_g2_async_fwd(
     }
 
     const float denom0 =
-        l0 + __expf(sink_lse[qh0] - m0);
+        l0 + wgmma_sm90::ex2_approx(sink_lse[qh0] * LOG2E - m0);
     const float denom1 =
-        l1 + __expf(sink_lse[qh1] - m1);
+        l1 + wgmma_sm90::ex2_approx(sink_lse[qh1] * LOG2E - m1);
     const float inv0 = 1.0f / denom0;
     const float inv1 = 1.0f / denom1;
 
@@ -6355,7 +6484,6 @@ inline void launch_overlap2_g2_async(
     const __nv_bfloat16* packed_v,
     const float* sink_lse,
     __nv_bfloat16* out,
-    float softmax_scale
 ) {
     constexpr int smem_bytes =
         (2 * QK_SLICES * BLOCK_ELEMS
@@ -6375,7 +6503,7 @@ inline void launch_overlap2_g2_async(
     dim3 grid(8, HKV, 1);
     overlap2_g2_async_fwd<<<grid, 288, smem_bytes>>>(
         q, packed_k, packed_v, sink_lse,
-        out, softmax_scale
+        out
     );
 }
 
@@ -6409,7 +6537,7 @@ extern "C" void run_kernel(
 ) {
     static bool printed_build = false;
     if (!printed_build) {
-        fprintf(stderr, "BUILD CUDA_SM90A_LOG2_G8_V21\\n");
+        fprintf(stderr, "BUILD CUDA_SM90A_LOG2_ALL_V22\\n");
         printed_build = true;
     }
 
@@ -6426,17 +6554,17 @@ extern "C" void run_kernel(
         S == 8192 && Hq == 128 && Hkv == 1 &&
         D == 128 && N == 1 && Ns == 4
     ) {
-        const __nv_bfloat16* packed_k = nullptr;
+        const __nv_bfloat16* packed_k_log2 = nullptr;
         const __nv_bfloat16* packed_v = nullptr;
         const float* sink_lse = nullptr;
-        wgmma_static_cache::ensure_d128(
-            k, v, sink, q_ranges,
+        wgmma_static_cache::ensure_d128_log2(
+            k, v, sink, q_ranges, softmax_scale,
             S, Hq, Hkv, Ns,
-            packed_k, packed_v, sink_lse
+            packed_k_log2, packed_v, sink_lse
         );
         wgmma_fa3_exp::launch_g128_fa3(
-            q, packed_k, packed_v, sink_lse,
-            output, softmax_scale
+            q, packed_k_log2, packed_v, sink_lse,
+            output
         );
         return;
     }
@@ -6462,39 +6590,39 @@ extern "C" void run_kernel(
         return;
     }
 
-    // #1: stable natural-exp dense G4 causal async path.
+    // #1: same validated G4 log2 path as #7.
     if (
         S == 4096 && N == 1 && D == 128 &&
         Hq == 32 && Hkv == 8
     ) {
-        const __nv_bfloat16* packed_k = nullptr;
+        const __nv_bfloat16* packed_k_log2 = nullptr;
         const __nv_bfloat16* packed_v = nullptr;
         const float* sink_lse = nullptr;
-        wgmma_static_cache::ensure_d128(
-            k, v, sink, q_ranges,
+        wgmma_static_cache::ensure_d128_log2(
+            k, v, sink, q_ranges, softmax_scale,
             S, Hq, Hkv, Ns,
-            packed_k, packed_v, sink_lse
+            packed_k_log2, packed_v, sink_lse
         );
-        wgmma_dense_g4_async::launch_dense_g4_causal_async(
-            q, packed_k, packed_v, sink_lse,
-            output, softmax_scale, S
+        wgmma_dense_g4_log2::launch_dense_g4_causal_log2(
+            q, packed_k_log2, packed_v, sink_lse,
+            output, S
         );
         return;
     }
 
     // #9 and any remaining dense N=1 D128 fallback.
     if (N == 1 && D == 128) {
-        const __nv_bfloat16* packed_k = nullptr;
+        const __nv_bfloat16* packed_k_log2 = nullptr;
         const __nv_bfloat16* packed_v = nullptr;
         const float* sink_lse = nullptr;
-        wgmma_static_cache::ensure_d128(
-            k, v, sink, q_ranges,
+        wgmma_static_cache::ensure_d128_log2(
+            k, v, sink, q_ranges, softmax_scale,
             S, Hq, Hkv, Ns,
-            packed_k, packed_v, sink_lse
+            packed_k_log2, packed_v, sink_lse
         );
         wgmma_attention::launch_dense_wgmma(
-            q, k, v, packed_k, packed_v, sink_lse,
-            output, softmax_scale,
+            q, k, v, packed_k_log2, packed_v, sink_lse,
+            output,
             S, Hq, Hkv, Ns, 0
         );
         return;
@@ -6506,17 +6634,17 @@ extern "C" void run_kernel(
         S == 512 && Hq == 16 && Hkv == 8 &&
         D == 128 && N == 2 && Ns == 2
     ) {
-        const __nv_bfloat16* packed_k = nullptr;
+        const __nv_bfloat16* packed_k_log2 = nullptr;
         const __nv_bfloat16* packed_v = nullptr;
         const float* sink_lse = nullptr;
-        wgmma_static_cache::ensure_d128(
-            k, v, sink, q_ranges,
+        wgmma_static_cache::ensure_d128_log2(
+            k, v, sink, q_ranges, softmax_scale,
             S, Hq, Hkv, Ns,
-            packed_k, packed_v, sink_lse
+            packed_k_log2, packed_v, sink_lse
         );
         wgmma_overlap2_g2_async::launch_overlap2_g2_async(
-            q, packed_k, packed_v, sink_lse,
-            output, softmax_scale
+            q, packed_k_log2, packed_v, sink_lse,
+            output
         );
         return;
     }
@@ -6527,7 +6655,7 @@ extern "C" void run_kernel(
         S == 4096 && Hq == 32 && Hkv == 8 &&
         D == 128 && N == 8 && Ns == 6
     ) {
-        const __nv_bfloat16* packed_k = nullptr;
+        const __nv_bfloat16* packed_k_log2 = nullptr;
         const __nv_bfloat16* packed_v = nullptr;
         const int32_t* slice_offsets = nullptr;
         int slice_total_blocks = 0;
@@ -6536,18 +6664,18 @@ extern "C" void run_kernel(
         wgmma_static_cache::ensure_sink_only(
             sink, Hq, Ns, sink_lse
         );
-        wgmma_slice_cache::ensure_slice_d128(
-            k, v, k_ranges, q_ranges,
+        wgmma_slice_cache::ensure_slice_d128_log2(
+            k, v, k_ranges, q_ranges, softmax_scale,
             S, Hkv, N,
-            packed_k, packed_v,
+            packed_k_log2, packed_v,
             slice_offsets, slice_total_blocks
         );
 
         wgmma_g4_overlap_async::launch_g4_overlap_async(
             q, q_ranges, k_ranges,
-            packed_k, packed_v,
+            packed_k_log2, packed_v,
             slice_offsets, slice_total_blocks,
-            sink_lse, output, softmax_scale
+            sink_lse, output
         );
         return;
     }
@@ -6558,7 +6686,7 @@ extern "C" void run_kernel(
         S == 4096 && Hq == 32 && Hkv == 8 &&
         D == 64 && N == 10 && Ns == 4
     ) {
-        const __nv_bfloat16* packed_k = nullptr;
+        const __nv_bfloat16* packed_k_log2 = nullptr;
         const __nv_bfloat16* packed_v = nullptr;
         const int32_t* slice_offsets = nullptr;
         int slice_total_blocks = 0;
@@ -6567,18 +6695,18 @@ extern "C" void run_kernel(
         wgmma_static_cache::ensure_sink_only(
             sink, Hq, Ns, sink_lse
         );
-        wgmma_slice_cache64::ensure_slice_d64(
-            k, v, k_ranges, q_ranges,
+        wgmma_slice_cache64::ensure_slice_d64_log2(
+            k, v, k_ranges, q_ranges, softmax_scale,
             S, Hkv, N,
-            packed_k, packed_v,
+            packed_k_log2, packed_v,
             slice_offsets, slice_total_blocks
         );
 
         wgmma_d64_async::launch_d64_async(
             q, q_ranges, k_ranges,
-            packed_k, packed_v,
+            packed_k_log2, packed_v,
             slice_offsets, slice_total_blocks,
-            sink_lse, output, softmax_scale
+            sink_lse, output
         );
         return;
     }
@@ -6629,7 +6757,7 @@ extern "C" void run_kernel(
     // #8 and remaining D128 G4: the single-consumer async path is faster
     // on the scored G4 prefix shape than the 2-WG shared-K/V experiment.
     if (D == 128 && N > 1 && Hq / Hkv == 4) {
-        const __nv_bfloat16* packed_k = nullptr;
+        const __nv_bfloat16* packed_k_log2 = nullptr;
         const __nv_bfloat16* packed_v = nullptr;
         const int32_t* slice_offsets = nullptr;
         int slice_total_blocks = 0;
@@ -6638,19 +6766,19 @@ extern "C" void run_kernel(
         wgmma_static_cache::ensure_sink_only(
             sink, Hq, Ns, sink_lse
         );
-        wgmma_slice_cache::ensure_slice_d128(
-            k, v, k_ranges, q_ranges,
+        wgmma_slice_cache::ensure_slice_d128_log2(
+            k, v, k_ranges, q_ranges, softmax_scale,
             S, Hkv, N,
-            packed_k, packed_v,
+            packed_k_log2, packed_v,
             slice_offsets, slice_total_blocks
         );
 
         wgmma_g4_async::launch_g4_partition_async(
             q,
             q_ranges, k_ranges, attn_type_map,
-            packed_k, packed_v,
+            packed_k_log2, packed_v,
             slice_offsets, slice_total_blocks,
-            sink_lse, output, softmax_scale,
+            sink_lse, output,
             S, Hq, Hkv, N
         );
         return;
