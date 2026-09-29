@@ -70,6 +70,12 @@ __device__ __forceinline__ void canonical_vec_coord(
     kvec = in_group >> 3;
 }
 
+__device__ __forceinline__ float ex2_approx(float x) {
+    float y;
+    asm("ex2.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
 __device__ __forceinline__ void fence_proxy_async_shared() {
     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
 }
@@ -5208,9 +5214,9 @@ void dense_g4_causal_log2_fwd(
         const float nm0 = fmaxf(m0, tm0);
         const float nm1 = fmaxf(m1, tm1);
         const float a0 =
-            (m0 == -CUDART_INF_F) ? 0.0f : __exp2f(m0 - nm0);
+            (m0 == -CUDART_INF_F) ? 0.0f : wgmma_sm90::ex2_approx(m0 - nm0);
         const float a1 =
-            (m1 == -CUDART_INF_F) ? 0.0f : __exp2f(m1 - nm1);
+            (m1 == -CUDART_INF_F) ? 0.0f : wgmma_sm90::ex2_approx(m1 - nm1);
 
         float sum0 = 0.0f, sum1 = 0.0f;
 
@@ -5223,34 +5229,34 @@ void dense_g4_causal_log2_fwd(
             float p10 = 0.0f, p11 = 0.0f;
 
             if (full_block) {
-                p00 = __exp2f(
+                p00 = wgmma_sm90::ex2_approx(
                     score[4*g+0] - nm0);
-                p01 = __exp2f(
+                p01 = wgmma_sm90::ex2_approx(
                     score[4*g+1] - nm0);
-                p10 = __exp2f(
+                p10 = wgmma_sm90::ex2_approx(
                     score[4*g+2] - nm1);
-                p11 = __exp2f(
+                p11 = wgmma_sm90::ex2_approx(
                     score[4*g+3] - nm1);
                 sum0 += p00 + p01;
                 sum1 += p10 + p11;
             } else {
                 if (key0 + c0 <= qidx0) {
-                    p00 = __exp2f(
+                    p00 = wgmma_sm90::ex2_approx(
                         score[4*g+0] - nm0);
                     sum0 += p00;
                 }
                 if (key0 + c1 <= qidx0) {
-                    p01 = __exp2f(
+                    p01 = wgmma_sm90::ex2_approx(
                         score[4*g+1] - nm0);
                     sum0 += p01;
                 }
                 if (key0 + c0 <= qidx1) {
-                    p10 = __exp2f(
+                    p10 = wgmma_sm90::ex2_approx(
                         score[4*g+2] - nm1);
                     sum1 += p10;
                 }
                 if (key0 + c1 <= qidx1) {
-                    p11 = __exp2f(
+                    p11 = wgmma_sm90::ex2_approx(
                         score[4*g+3] - nm1);
                     sum1 += p11;
                 }
@@ -5317,9 +5323,9 @@ void dense_g4_causal_log2_fwd(
     }
 
     const float denom0 =
-        l0 + __exp2f(sink_lse[qh0] * LOG2E - m0);
+        l0 + wgmma_sm90::ex2_approx(sink_lse[qh0] * LOG2E - m0);
     const float denom1 =
-        l1 + __exp2f(sink_lse[qh1] * LOG2E - m1);
+        l1 + wgmma_sm90::ex2_approx(sink_lse[qh1] * LOG2E - m1);
     const float inv0 = 1.0f / denom0;
     const float inv1 = 1.0f / denom1;
 
@@ -5757,7 +5763,7 @@ extern "C" void run_kernel(
 ) {
     static bool printed_build = false;
     if (!printed_build) {
-        fprintf(stderr, "BUILD CUDA_SM90A_LOG2_G4_V19\\n");
+        fprintf(stderr, "BUILD CUDA_SM90A_LOG2_G4_V20\\n");
         printed_build = true;
     }
 
