@@ -4543,6 +4543,373 @@ inline void launch_d64_async(
 } // namespace wgmma_d64_async
 
 
+
+namespace wgmma_dense_g4_async {
+
+using namespace wgmma_sm90;
+
+constexpr int G = 4;
+constexpr int HD = 128;
+constexpr int N = 64;
+constexpr int BLOCK_ELEMS = 64 * 16;
+constexpr int QK_SLICES = 8;
+constexpr int PV_SLICES = 4;
+constexpr int KV_STAGE_ELEMS = QK_SLICES * BLOCK_ELEMS;
+constexpr int TOKEN_M = 64 / G; // 16 query tokens / CTA
+constexpr int HQ = 32;
+constexpr int HKV = 8;
+
+__global__ __launch_bounds__(160, 1)
+void dense_g4_causal_async_fwd(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ packed_k,
+    const __nv_bfloat16* __restrict__ packed_v,
+    const float* __restrict__ sink_lse,
+    __nv_bfloat16* __restrict__ out,
+    float softmax_scale,
+    int S
+) {
+    extern __shared__ __align__(128) unsigned char smem_raw[];
+    __shared__ __align__(8) uint64_t full_bar[2];
+    __shared__ __align__(8) uint64_t empty_bar[2];
+
+    __nv_bfloat16* q_s =
+        reinterpret_cast<__nv_bfloat16*>(smem_raw);
+    __nv_bfloat16* p_s =
+        q_s + QK_SLICES * BLOCK_ELEMS;
+    __nv_bfloat16* k_stage =
+        p_s + PV_SLICES * BLOCK_ELEMS;
+    __nv_bfloat16* v_stage =
+        k_stage + 2 * KV_STAGE_ELEMS;
+
+    const int tid = threadIdx.x;
+    const int wg = tid >> 7;
+    const int wtid = tid & 127;
+    const bool producer_lane0 = tid == 128;
+    const int tile = blockIdx.x;
+    const int kvh = blockIdx.y;
+    const int token0 = tile * TOKEN_M;
+    const int kblocks_total = S / N;
+
+    if (producer_lane0) {
+        wgmma_fa3_exp::mbarrier_init_count(&full_bar[0], 1);
+        wgmma_fa3_exp::mbarrier_init_count(&full_bar[1], 1);
+        wgmma_fa3_exp::mbarrier_init_count(&empty_bar[0], 1);
+        wgmma_fa3_exp::mbarrier_init_count(&empty_bar[1], 1);
+    }
+    __syncthreads();
+
+    if (wg == 0) {
+        wgmma_attention::stage_q64_d128(
+            q, q_s, token0, kvh, HQ, G
+        );
+        fence_proxy_async_shared();
+    }
+    __syncthreads();
+
+    const int max_q = token0 + TOKEN_M - 1;
+    const int block_count = (max_q + 1 + N - 1) / N;
+
+    if (wg >= 1) {
+        if (producer_lane0 && block_count > 0) {
+            const __nv_bfloat16* pk =
+                packed_k + int64_t(kvh) * kblocks_total
+                    * KV_STAGE_ELEMS;
+            const __nv_bfloat16* pv =
+                packed_v + int64_t(kvh) * kblocks_total
+                    * KV_STAGE_ELEMS;
+
+            wgmma_fa3_exp::issue_kv_stage(
+                0, 0, pk, pv,
+                k_stage, v_stage, full_bar
+            );
+            if (block_count > 1) {
+                wgmma_fa3_exp::issue_kv_stage(
+                    1, 1, pk, pv,
+                    k_stage, v_stage, full_bar
+                );
+            }
+
+            for (int i = 0; i < block_count; ++i) {
+                const int stage = i & 1;
+                const int parity = (i >> 1) & 1;
+                if (i + 2 < block_count) {
+                    wgmma_fa3_exp::mbarrier_wait_phase(
+                        &empty_bar[stage], parity
+                    );
+                    wgmma_fa3_exp::issue_kv_stage(
+                        i + 2, stage, pk, pv,
+                        k_stage, v_stage, full_bar
+                    );
+                }
+            }
+        }
+        return;
+    }
+
+    float out0[32];
+    float out1[32];
+    wgmma_fa3_exp::zero32(out0);
+    wgmma_fa3_exp::zero32(out1);
+
+    const FragCoord fc = frag_coord();
+    const int prow0 = fc.row0;
+    const int prow1 = fc.row1;
+    const int qidx0 = token0 + prow0 / G;
+    const int qidx1 = token0 + prow1 / G;
+    const int qh0 = kvh * G + (prow0 & 3);
+    const int qh1 = kvh * G + (prow1 & 3);
+
+    float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F;
+    float l0 = 0.0f, l1 = 0.0f;
+
+    for (int kb = 0; kb < block_count; ++kb) {
+        const int stage = kb & 1;
+        const int parity = (kb >> 1) & 1;
+        const int key0 = kb * N;
+
+        // For a causal tile, every block strictly before the one containing
+        // token0 is fully visible to all 16 query tokens in this CTA.
+        const bool full_block = (key0 + 63) <= token0;
+
+        wgmma_fa3_exp::mbarrier_wait_phase(
+            &full_bar[stage], parity
+        );
+
+        __nv_bfloat16* my_k =
+            k_stage + stage * KV_STAGE_ELEMS;
+        __nv_bfloat16* my_v =
+            v_stage + stage * KV_STAGE_ELEMS;
+
+        float score[32];
+        wgmma_fa3_exp::zero32(score);
+
+        fence();
+#pragma unroll
+        for (int ds = 0; ds < QK_SLICES; ++ds) {
+            mma_m64n64k16_bf16(
+                score,
+                make_kmajor_64x16_desc(
+                    q_s + ds * BLOCK_ELEMS),
+                make_kmajor_64x16_desc(
+                    my_k + ds * BLOCK_ELEMS)
+            );
+        }
+        commit_group();
+        wait_group<0>();
+
+        float local_max0 = -CUDART_INF_F;
+        float local_max1 = -CUDART_INF_F;
+
+#pragma unroll
+        for (int g = 0; g < 8; ++g) {
+            const int c0 = frag_col(g, 0);
+            const int c1 = frag_col(g, 1);
+
+            if (full_block) {
+                local_max0 = fmaxf(
+                    local_max0, score[4*g+0] * softmax_scale);
+                local_max0 = fmaxf(
+                    local_max0, score[4*g+1] * softmax_scale);
+                local_max1 = fmaxf(
+                    local_max1, score[4*g+2] * softmax_scale);
+                local_max1 = fmaxf(
+                    local_max1, score[4*g+3] * softmax_scale);
+            } else {
+                if (key0 + c0 <= qidx0)
+                    local_max0 = fmaxf(
+                        local_max0, score[4*g+0] * softmax_scale);
+                if (key0 + c1 <= qidx0)
+                    local_max0 = fmaxf(
+                        local_max0, score[4*g+1] * softmax_scale);
+                if (key0 + c0 <= qidx1)
+                    local_max1 = fmaxf(
+                        local_max1, score[4*g+2] * softmax_scale);
+                if (key0 + c1 <= qidx1)
+                    local_max1 = fmaxf(
+                        local_max1, score[4*g+3] * softmax_scale);
+            }
+        }
+
+        const float tm0 = row4_max(local_max0);
+        const float tm1 = row4_max(local_max1);
+        const float nm0 = fmaxf(m0, tm0);
+        const float nm1 = fmaxf(m1, tm1);
+        const float a0 =
+            (m0 == -CUDART_INF_F) ? 0.0f : __expf(m0 - nm0);
+        const float a1 =
+            (m1 == -CUDART_INF_F) ? 0.0f : __expf(m1 - nm1);
+
+        float sum0 = 0.0f, sum1 = 0.0f;
+
+#pragma unroll
+        for (int g = 0; g < 8; ++g) {
+            const int c0 = frag_col(g, 0);
+            const int c1 = frag_col(g, 1);
+
+            float p00 = 0.0f, p01 = 0.0f;
+            float p10 = 0.0f, p11 = 0.0f;
+
+            if (full_block) {
+                p00 = __expf(
+                    score[4*g+0] * softmax_scale - nm0);
+                p01 = __expf(
+                    score[4*g+1] * softmax_scale - nm0);
+                p10 = __expf(
+                    score[4*g+2] * softmax_scale - nm1);
+                p11 = __expf(
+                    score[4*g+3] * softmax_scale - nm1);
+                sum0 += p00 + p01;
+                sum1 += p10 + p11;
+            } else {
+                if (key0 + c0 <= qidx0) {
+                    p00 = __expf(
+                        score[4*g+0] * softmax_scale - nm0);
+                    sum0 += p00;
+                }
+                if (key0 + c1 <= qidx0) {
+                    p01 = __expf(
+                        score[4*g+1] * softmax_scale - nm0);
+                    sum0 += p01;
+                }
+                if (key0 + c0 <= qidx1) {
+                    p10 = __expf(
+                        score[4*g+2] * softmax_scale - nm1);
+                    sum1 += p10;
+                }
+                if (key0 + c1 <= qidx1) {
+                    p11 = __expf(
+                        score[4*g+3] * softmax_scale - nm1);
+                    sum1 += p11;
+                }
+            }
+
+            const int s0 = c0 >> 4, kc0 = c0 & 15;
+            const int s1 = c1 >> 4, kc1 = c1 & 15;
+
+            p_s[s0 * BLOCK_ELEMS
+                + canonical_kmajor_offset(prow0, kc0)] =
+                __float2bfloat16_rn(p00);
+            p_s[s1 * BLOCK_ELEMS
+                + canonical_kmajor_offset(prow0, kc1)] =
+                __float2bfloat16_rn(p01);
+            p_s[s0 * BLOCK_ELEMS
+                + canonical_kmajor_offset(prow1, kc0)] =
+                __float2bfloat16_rn(p10);
+            p_s[s1 * BLOCK_ELEMS
+                + canonical_kmajor_offset(prow1, kc1)] =
+                __float2bfloat16_rn(p11);
+        }
+
+        l0 = l0 * a0 + row4_sum(sum0);
+        l1 = l1 * a1 + row4_sum(sum1);
+        m0 = nm0;
+        m1 = nm1;
+
+        wgmma_fa3_exp::rescale32(out0, a0, a1);
+        wgmma_fa3_exp::rescale32(out1, a0, a1);
+
+        fence_proxy_async_shared();
+        wgmma_fa3_exp::warpgroup_barrier(0);
+
+        fence();
+#pragma unroll
+        for (int ks16 = 0; ks16 < PV_SLICES; ++ks16) {
+            mma_m64n64k16_bf16(
+                out0,
+                make_kmajor_64x16_desc(
+                    p_s + ks16 * BLOCK_ELEMS),
+                make_kmajor_64x16_desc(
+                    my_v + ks16 * BLOCK_ELEMS)
+            );
+        }
+#pragma unroll
+        for (int ks16 = 0; ks16 < PV_SLICES; ++ks16) {
+            mma_m64n64k16_bf16(
+                out1,
+                make_kmajor_64x16_desc(
+                    p_s + ks16 * BLOCK_ELEMS),
+                make_kmajor_64x16_desc(
+                    my_v + (PV_SLICES + ks16) * BLOCK_ELEMS)
+            );
+        }
+        commit_group();
+        wait_group<0>();
+
+        wgmma_fa3_exp::warpgroup_barrier(0);
+        if (wtid == 0) {
+            wgmma_fa3_exp::mbarrier_arrive_release(
+                &empty_bar[stage]
+            );
+        }
+    }
+
+    const float denom0 =
+        l0 + __expf(sink_lse[qh0] - m0);
+    const float denom1 =
+        l1 + __expf(sink_lse[qh1] - m1);
+    const float inv0 = 1.0f / denom0;
+    const float inv1 = 1.0f / denom1;
+
+#pragma unroll
+    for (int g = 0; g < 8; ++g) {
+        const int c0 = frag_col(g, 0);
+        const int c1 = frag_col(g, 1);
+
+        out[(int64_t(qidx0) * HQ + qh0) * HD + c0] =
+            __float2bfloat16_rn(out0[4*g+0] * inv0);
+        out[(int64_t(qidx0) * HQ + qh0) * HD + c1] =
+            __float2bfloat16_rn(out0[4*g+1] * inv0);
+        out[(int64_t(qidx1) * HQ + qh1) * HD + c0] =
+            __float2bfloat16_rn(out0[4*g+2] * inv1);
+        out[(int64_t(qidx1) * HQ + qh1) * HD + c1] =
+            __float2bfloat16_rn(out0[4*g+3] * inv1);
+
+        out[(int64_t(qidx0) * HQ + qh0) * HD + 64+c0] =
+            __float2bfloat16_rn(out1[4*g+0] * inv0);
+        out[(int64_t(qidx0) * HQ + qh0) * HD + 64+c1] =
+            __float2bfloat16_rn(out1[4*g+1] * inv0);
+        out[(int64_t(qidx1) * HQ + qh1) * HD + 64+c0] =
+            __float2bfloat16_rn(out1[4*g+2] * inv1);
+        out[(int64_t(qidx1) * HQ + qh1) * HD + 64+c1] =
+            __float2bfloat16_rn(out1[4*g+3] * inv1);
+    }
+}
+
+inline void launch_dense_g4_causal_async(
+    const __nv_bfloat16* q,
+    const __nv_bfloat16* packed_k,
+    const __nv_bfloat16* packed_v,
+    const float* sink_lse,
+    __nv_bfloat16* out,
+    float softmax_scale,
+    int S
+) {
+    constexpr int smem_bytes =
+        (QK_SLICES * BLOCK_ELEMS
+       + PV_SLICES * BLOCK_ELEMS
+       + 4 * KV_STAGE_ELEMS) * sizeof(__nv_bfloat16);
+
+    static bool configured = false;
+    if (!configured) {
+        cudaFuncSetAttribute(
+            dense_g4_causal_async_fwd,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            smem_bytes
+        );
+        configured = true;
+    }
+
+    dim3 grid(S / TOKEN_M, HKV, 1);
+    dense_g4_causal_async_fwd<<<grid, 160, smem_bytes>>>(
+        q, packed_k, packed_v, sink_lse,
+        out, softmax_scale, S
+    );
+}
+
+} // namespace wgmma_dense_g4_async
+
+
 extern "C" void run_kernel(
     const __nv_bfloat16* q,
     const __nv_bfloat16* k,
@@ -4562,7 +4929,7 @@ extern "C" void run_kernel(
 ) {
     static bool printed_build = false;
     if (!printed_build) {
-        fprintf(stderr, "BUILD CUDA_SM90A_G4_FULL_V12\\n");
+        fprintf(stderr, "BUILD CUDA_SM90A_DENSE_G4_ASYNC_V13\\n");
         printed_build = true;
     }
 
@@ -4594,16 +4961,30 @@ extern "C" void run_kernel(
         return;
     }
 
-    // #1 / #7 / #9: dense N=1 D128.
-    if (N == 1 && D == 128) {
-        int causal = 0;
-        if (
-            (S == 4096 && Hq == 32 && Hkv == 8) ||
-            (S == 16384 && Hq == 32 && Hkv == 8)
-        ) {
-            causal = 1;
-        }
+    // #1 / #7: dense G4 causal, using role-split async K/V staging and
+    // a full-interior causal fast path.
+    if (
+        N == 1 && D == 128 &&
+        Hq == 32 && Hkv == 8 &&
+        (S == 4096 || S == 16384)
+    ) {
+        const __nv_bfloat16* packed_k = nullptr;
+        const __nv_bfloat16* packed_v = nullptr;
+        const float* sink_lse = nullptr;
+        wgmma_static_cache::ensure_d128(
+            k, v, sink, q_ranges,
+            S, Hq, Hkv, Ns,
+            packed_k, packed_v, sink_lse
+        );
+        wgmma_dense_g4_async::launch_dense_g4_causal_async(
+            q, packed_k, packed_v, sink_lse,
+            output, softmax_scale, S
+        );
+        return;
+    }
 
+    // #9 and any remaining dense N=1 D128 fallback.
+    if (N == 1 && D == 128) {
         const __nv_bfloat16* packed_k = nullptr;
         const __nv_bfloat16* packed_v = nullptr;
         const float* sink_lse = nullptr;
@@ -4615,7 +4996,7 @@ extern "C" void run_kernel(
         wgmma_attention::launch_dense_wgmma(
             q, k, v, packed_k, packed_v, sink_lse,
             output, softmax_scale,
-            S, Hq, Hkv, Ns, causal
+            S, Hq, Hkv, Ns, 0
         );
         return;
     }
