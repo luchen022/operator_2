@@ -5729,7 +5729,7 @@ extern "C" void run_kernel(
 ) {
     static bool printed_build = false;
     if (!printed_build) {
-        fprintf(stderr, "BUILD CUDA_SM90A_PREFIX_G4_2WG_V15\\n");
+        fprintf(stderr, "BUILD CUDA_SM90A_GENERAL_BASELINE_V16\\n");
         printed_build = true;
     }
 
@@ -5926,39 +5926,8 @@ extern "C" void run_kernel(
         return;
     }
 
-    // #8: exact prefix-FULL G4 path.  Two consumer warpgroups cover
-    // 32 query tokens / CTA and share one async K/V stream.
-    if (
-        S == 4096 && Hq == 8 && Hkv == 2 &&
-        D == 128 && N == 7 && Ns == 4
-    ) {
-        const __nv_bfloat16* packed_k = nullptr;
-        const __nv_bfloat16* packed_v = nullptr;
-        const int32_t* slice_offsets = nullptr;
-        int slice_total_blocks = 0;
-        const float* sink_lse = nullptr;
-
-        wgmma_static_cache::ensure_sink_only(
-            sink, Hq, Ns, sink_lse
-        );
-        wgmma_slice_cache::ensure_slice_d128(
-            k, v, k_ranges, q_ranges,
-            S, Hkv, N,
-            packed_k, packed_v,
-            slice_offsets, slice_total_blocks
-        );
-
-        wgmma_prefix_g4_2wg::launch_prefix_g4_2wg(
-            q, q_ranges, k_ranges,
-            packed_k, packed_v,
-            slice_offsets, slice_total_blocks,
-            sink_lse, output, softmax_scale,
-            Hq, Hkv, N
-        );
-        return;
-    }
-
-    // Remaining D128 G4 fallback.
+    // #8 and remaining D128 G4: the single-consumer async path is faster
+    // on the scored G4 prefix shape than the 2-WG shared-K/V experiment.
     if (D == 128 && N > 1 && Hq / Hkv == 4) {
         const __nv_bfloat16* packed_k = nullptr;
         const __nv_bfloat16* packed_v = nullptr;
