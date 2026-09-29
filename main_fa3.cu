@@ -4388,24 +4388,26 @@ constexpr int TX_BYTES =
     K8_BLOCK_BYTES + V_BLOCK_ELEMS * 2 + 64 * 4;
 constexpr float LOG2E = 1.4426950408889634f;
 
-template <int G>
 __device__ __forceinline__ void stage_q8(
     const uint8_t* __restrict__ q8,
     uint8_t* __restrict__ q_s,
     int q0,
     int qe,
     int kvh,
-    int Hq
+    int Hq,
+    int G
 ) {
     const int tid = threadIdx.x & 127;
+    const int g_shift = (G == 8) ? 3 : 2;
+    const int g_mask = G - 1;
 
 #pragma unroll
     for (int ds = 0; ds < K8_TILES; ++ds) {
         int prow, kvec;
         canonical_fp8_vec_coord(tid, prow, kvec);
 
-        const int tok = q0 + prow / G;
-        const int qh = kvh * G + (prow % G);
+        const int tok = q0 + prow >> g_shift;
+        const int qh = kvh * G + (prow & g_mask);
         const int d0 = ds * 32 + kvec * 16;
 
         uint8_t* dst =
@@ -4458,7 +4460,6 @@ __device__ __forceinline__ void issue_stage(
     );
 }
 
-template <int G>
 __global__ __launch_bounds__(160, 1)
 void partition_fp8_qk_fwd(
     const uint8_t* __restrict__ q8,
@@ -4476,9 +4477,12 @@ void partition_fp8_qk_fwd(
     int S,
     int Hq,
     int Hkv,
-    int NumSlices
+    int NumSlices,
+    int G
 ) {
-    constexpr int TOKEN_M = 64 / G;
+    const int g_shift = (G == 8) ? 3 : 2;
+    const int g_mask = G - 1;
+    const int TOKEN_M = 64 >> g_shift;
 
     extern __shared__ __align__(128) unsigned char smem_raw[];
     __shared__ __align__(8) uint64_t full_bar[2];
@@ -4603,7 +4607,7 @@ void partition_fp8_qk_fwd(
     const int block_count = kb_end - kb_begin;
 
     if (wg == 0) {
-        stage_q8<G>(q8, q_s, q0, qe, kvh, Hq);
+        stage_q8(q8, q_s, q0, qe, kvh, Hq, G);
         fence_proxy_async_shared();
     }
     __syncthreads();
@@ -4661,10 +4665,10 @@ void partition_fp8_qk_fwd(
     const FragCoord fc = frag_coord();
     const int prow0 = fc.row0;
     const int prow1 = fc.row1;
-    const int qidx0 = q0 + prow0 / G;
-    const int qidx1 = q0 + prow1 / G;
-    const int qh0 = kvh * G + (prow0 % G);
-    const int qh1 = kvh * G + (prow1 % G);
+    const int qidx0 = q0 + prow0 >> g_shift;
+    const int qidx1 = q0 + prow1 >> g_shift;
+    const int qh0 = kvh * G + (prow0 & g_mask);
+    const int qh1 = kvh * G + (prow1 & g_mask);
 
     const float qs0 = (qidx0 < qe)
         ? qscale[int64_t(qidx0) * Hq + qh0]
@@ -4942,7 +4946,6 @@ void partition_fp8_qk_fwd(
     }
 }
 
-template <int G>
 inline void launch(
     const uint8_t* q8,
     const float* qscale,
@@ -4964,25 +4967,27 @@ inline void launch(
     static bool configured = false;
     if (!configured) {
         cudaFuncSetAttribute(
-            partition_fp8_qk_fwd<G>,
+            partition_fp8_qk_fwd,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             SMEM_BYTES
         );
         configured = true;
     }
 
-    constexpr int TOKEN_M = 64 / G;
+    const int G = Hq / Hkv;
+    const int g_shift = (G == 8) ? 3 : 2;
+    const int TOKEN_M = 64 >> g_shift;
     const int grid_x =
         (S + TOKEN_M - 1) / TOKEN_M + NumSlices;
 
     dim3 grid(grid_x, Hkv, 1);
-    partition_fp8_qk_fwd<G><<<grid, 160, SMEM_BYTES>>>(
+    partition_fp8_qk_fwd<<<grid, 160, SMEM_BYTES>>>(
         q8, qscale,
         q_ranges, k_ranges, attn_type_map,
         packed_k8, packed_kscale, packed_v,
         slice_block_offsets, slice_total_blocks,
         sink_lse, out,
-        S, Hq, Hkv, NumSlices
+        S, Hq, Hkv, NumSlices, G
     );
 }
 
@@ -5008,7 +5013,7 @@ extern "C" void run_kernel(
 ) {
     static bool printed_build = false;
     if (!printed_build) {
-        fprintf(stderr, "BUILD CUDA_SM90A_FP8_QK_V29\\n");
+        fprintf(stderr, "BUILD CUDA_SM90A_FP8_RUNTIME_G_V30\\n");
         printed_build = true;
     }
 
@@ -5078,7 +5083,7 @@ extern "C" void run_kernel(
             q, S, Hq, q8, qscale
         );
 
-        wgmma_fp8_qk::launch<4>(
+        wgmma_fp8_qk::launch(
             q8, qscale,
             q_ranges, k_ranges, attn_type_map,
             packed_k8, packed_kscale, packed_v,
@@ -5235,7 +5240,7 @@ extern "C" void run_kernel(
             q, S, Hq, q8, qscale
         );
 
-        wgmma_fp8_qk::launch<8>(
+        wgmma_fp8_qk::launch(
             q8, qscale,
             q_ranges, k_ranges, attn_type_map,
             packed_k8, packed_kscale, packed_v,
@@ -5279,7 +5284,7 @@ extern "C" void run_kernel(
             q, S, Hq, q8, qscale
         );
 
-        wgmma_fp8_qk::launch<4>(
+        wgmma_fp8_qk::launch(
             q8, qscale,
             q_ranges, k_ranges, attn_type_map,
             packed_k8, packed_kscale, packed_v,
