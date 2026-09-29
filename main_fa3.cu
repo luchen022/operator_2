@@ -2861,7 +2861,7 @@ void g8_partition_log2_fwd(
         wgmma_fa3_exp::rescale32(out1, a0, a1);
 
         fence_proxy_async_shared();
-        wgmma_fa3_exp::warpgroup_barrier(0);
+        wgmma_fa3_exp::warpgroup_barrier(wg);
 
         fence();
 #pragma unroll
@@ -2887,7 +2887,7 @@ void g8_partition_log2_fwd(
         commit_group();
         wait_group<0>();
 
-        wgmma_fa3_exp::warpgroup_barrier(0);
+        wgmma_fa3_exp::warpgroup_barrier(wg);
         if (wtid == 0) {
             wgmma_fa3_exp::mbarrier_arrive_release(
                 &empty_bar[stage]
