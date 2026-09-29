@@ -2495,8 +2495,6 @@ constexpr int BLOCK_ELEMS = 64 * 16;
 constexpr int QK_SLICES = 8;
 constexpr int PV_SLICES = 4;
 constexpr int KV_STAGE_ELEMS = QK_SLICES * BLOCK_ELEMS;
-constexpr int KV_STAGE_BYTES = KV_STAGE_ELEMS * sizeof(__nv_bfloat16);
-constexpr int TX_BYTES = 2 * KV_STAGE_BYTES;
 constexpr int TOKEN_M = 64 / G; // 8 query tokens / CTA
 
 __global__ __launch_bounds__(160, 1)
