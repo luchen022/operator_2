@@ -4673,12 +4673,12 @@ void partition_fp8_qk_fwd(
     const int qh0 = kvh * G + (prow0 & g_mask);
     const int qh1 = kvh * G + (prow1 & g_mask);
 
-    const float qs0 = (qidx0 < qe)
-        ? qscale[int64_t(qidx0) * Hq + qh0]
-        : 0.0f;
-    const float qs1 = (qidx1 < qe)
-        ? qscale[int64_t(qidx1) * Hq + qh1]
-        : 0.0f;
+    const int64_t qsb0 = (int64_t(qidx0) * Hq + qh0) * 2;
+    const int64_t qsb1 = (int64_t(qidx1) * Hq + qh1) * 2;
+    const float qs00 = (qidx0 < qe) ? qscale[qsb0 + 0] : 0.0f;
+    const float qs01 = (qidx0 < qe) ? qscale[qsb0 + 1] : 0.0f;
+    const float qs10 = (qidx1 < qe) ? qscale[qsb1 + 0] : 0.0f;
+    const float qs11 = (qidx1 < qe) ? qscale[qsb1 + 1] : 0.0f;
 
     float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F;
     float l0 = 0.0f, l1 = 0.0f;
@@ -4726,34 +4726,42 @@ void partition_fp8_qk_fwd(
             scale_stage + stage * 128;
 
         float score[32];
+        float part[32];
         wgmma_fa3_exp::zero32(score);
 
-        fence();
 #pragma unroll
-        for (int ds = 0; ds < K8_TILES; ++ds) {
-            mma_m64n64k32_e4m3(
-                score,
-                make_kmajor_64x32_e4m3_desc(
-                    q_s + ds * K8_TILE_BYTES),
-                make_kmajor_64x32_e4m3_desc(
-                    my_k + ds * K8_TILE_BYTES)
-            );
-        }
-        commit_group();
-        wait_group<0>();
-
-        // Restore per-token Q/K scales and softmax_scale*log2(e).
+        for (int sg = 0; sg < 2; ++sg) {
+            wgmma_fa3_exp::zero32(part);
+            fence();
 #pragma unroll
-        for (int g = 0; g < 8; ++g) {
-            const int c0 = frag_col(g, 0);
-            const int c1 = frag_col(g, 1);
-            const float sk0 = my_ks[c0];
-            const float sk1 = my_ks[c1];
+            for (int j = 0; j < 2; ++j) {
+                const int ds = sg * 2 + j;
+                mma_m64n64k32_e4m3(
+                    part,
+                    make_kmajor_64x32_e4m3_desc(
+                        q_s + ds * K8_TILE_BYTES),
+                    make_kmajor_64x32_e4m3_desc(
+                        my_k + ds * K8_TILE_BYTES)
+                );
+            }
+            commit_group();
+            wait_group<0>();
 
-            score[4*g+0] *= qs0 * sk0;
-            score[4*g+1] *= qs0 * sk1;
-            score[4*g+2] *= qs1 * sk0;
-            score[4*g+3] *= qs1 * sk1;
+            const float qsg0 = (sg == 0) ? qs00 : qs01;
+            const float qsg1 = (sg == 0) ? qs10 : qs11;
+
+#pragma unroll
+            for (int g = 0; g < 8; ++g) {
+                const int c0 = frag_col(g, 0);
+                const int c1 = frag_col(g, 1);
+                const float sk0 = my_ks[c0 * 2 + sg];
+                const float sk1 = my_ks[c1 * 2 + sg];
+
+                score[4*g+0] += part[4*g+0] * qsg0 * sk0;
+                score[4*g+1] += part[4*g+1] * qsg0 * sk1;
+                score[4*g+2] += part[4*g+2] * qsg1 * sk0;
+                score[4*g+3] += part[4*g+3] * qsg1 * sk1;
+            }
         }
 
         float local_max0 = -CUDART_INF_F;
@@ -5016,7 +5024,7 @@ extern "C" void run_kernel(
 ) {
     static bool printed_build = false;
     if (!printed_build) {
-        fprintf(stderr, "BUILD CUDA_SM90A_FP8_INDEX_FIX_V31\\n");
+        fprintf(stderr, "BUILD CUDA_SM90A_FP8_GROUP64_V32\\n");
         printed_build = true;
     }
 
