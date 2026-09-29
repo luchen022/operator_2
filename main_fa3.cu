@@ -3137,10 +3137,8 @@ void g4_partition_async_fwd(
 
     const int q0 = meta[1];
     const int qe = meta[2];
-    const int qs = meta[3];
     const int ks = meta[4];
     const int ke = meta[5];
-    const int typ = meta[6];
     const int sid = meta[7];
     const int kb_begin = meta[8];
     const int kb_end = meta[9];
@@ -3217,6 +3215,7 @@ void g4_partition_async_fwd(
         const int parity = (i >> 1) & 1;
         const int kb = kb_begin + i;
         const int key0 = ks + kb * N;
+        const bool full_block = (key0 + 63) < ke;
 
         wgmma_fa3_exp::mbarrier_wait_phase(
             &full_bar[stage], parity
@@ -3252,22 +3251,29 @@ void g4_partition_async_fwd(
             const int c0 = frag_col(g, 0);
             const int c1 = frag_col(g, 1);
 
-            if (wgmma_partition::mask_visible(
-                    typ, qidx0, key0+c0, qs, qe, ks, ke))
+            if (full_block) {
                 local_max0 = fmaxf(
                     local_max0, score[4*g+0] * softmax_scale);
-            if (wgmma_partition::mask_visible(
-                    typ, qidx0, key0+c1, qs, qe, ks, ke))
                 local_max0 = fmaxf(
                     local_max0, score[4*g+1] * softmax_scale);
-            if (wgmma_partition::mask_visible(
-                    typ, qidx1, key0+c0, qs, qe, ks, ke))
                 local_max1 = fmaxf(
                     local_max1, score[4*g+2] * softmax_scale);
-            if (wgmma_partition::mask_visible(
-                    typ, qidx1, key0+c1, qs, qe, ks, ke))
                 local_max1 = fmaxf(
                     local_max1, score[4*g+3] * softmax_scale);
+            } else {
+                if (key0 + c0 < ke) {
+                    local_max0 = fmaxf(
+                        local_max0, score[4*g+0] * softmax_scale);
+                    local_max1 = fmaxf(
+                        local_max1, score[4*g+2] * softmax_scale);
+                }
+                if (key0 + c1 < ke) {
+                    local_max0 = fmaxf(
+                        local_max0, score[4*g+1] * softmax_scale);
+                    local_max1 = fmaxf(
+                        local_max1, score[4*g+3] * softmax_scale);
+                }
+            }
         }
 
         const float tm0 = row4_max(local_max0);
@@ -3289,29 +3295,34 @@ void g4_partition_async_fwd(
             float p00 = 0.0f, p01 = 0.0f;
             float p10 = 0.0f, p11 = 0.0f;
 
-            if (wgmma_partition::mask_visible(
-                    typ, qidx0, key0+c0, qs, qe, ks, ke)) {
+            if (full_block) {
                 p00 = __expf(
                     score[4*g+0] * softmax_scale - nm0);
-                sum0 += p00;
-            }
-            if (wgmma_partition::mask_visible(
-                    typ, qidx0, key0+c1, qs, qe, ks, ke)) {
                 p01 = __expf(
                     score[4*g+1] * softmax_scale - nm0);
-                sum0 += p01;
-            }
-            if (wgmma_partition::mask_visible(
-                    typ, qidx1, key0+c0, qs, qe, ks, ke)) {
                 p10 = __expf(
                     score[4*g+2] * softmax_scale - nm1);
-                sum1 += p10;
-            }
-            if (wgmma_partition::mask_visible(
-                    typ, qidx1, key0+c1, qs, qe, ks, ke)) {
                 p11 = __expf(
                     score[4*g+3] * softmax_scale - nm1);
-                sum1 += p11;
+                sum0 += p00 + p01;
+                sum1 += p10 + p11;
+            } else {
+                if (key0 + c0 < ke) {
+                    p00 = __expf(
+                        score[4*g+0] * softmax_scale - nm0);
+                    p10 = __expf(
+                        score[4*g+2] * softmax_scale - nm1);
+                    sum0 += p00;
+                    sum1 += p10;
+                }
+                if (key0 + c1 < ke) {
+                    p01 = __expf(
+                        score[4*g+1] * softmax_scale - nm0);
+                    p11 = __expf(
+                        score[4*g+3] * softmax_scale - nm1);
+                    sum0 += p01;
+                    sum1 += p11;
+                }
             }
 
             const int s0 = c0 >> 4, kc0 = c0 & 15;
@@ -4551,7 +4562,7 @@ extern "C" void run_kernel(
 ) {
     static bool printed_build = false;
     if (!printed_build) {
-        fprintf(stderr, "BUILD CUDA_SM90A_G8_INTERIOR_V11\\n");
+        fprintf(stderr, "BUILD CUDA_SM90A_G4_FULL_V12\\n");
         printed_build = true;
     }
 
