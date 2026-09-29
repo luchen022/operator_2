@@ -4910,6 +4910,355 @@ inline void launch_dense_g4_causal_async(
 } // namespace wgmma_dense_g4_async
 
 
+
+namespace wgmma_overlap2_g2_async {
+
+using namespace wgmma_sm90;
+
+constexpr int S = 512;
+constexpr int HQ = 16;
+constexpr int HKV = 8;
+constexpr int G = 2;
+constexpr int HD = 128;
+constexpr int N = 64;
+constexpr int BLOCK_ELEMS = 64 * 16;
+constexpr int QK_SLICES = 8;
+constexpr int PV_SLICES = 4;
+constexpr int KV_STAGE_ELEMS = QK_SLICES * BLOCK_ELEMS;
+constexpr int TOKEN_TILE = 64;
+constexpr int TOKENS_PER_WG = 32;
+constexpr int KBLOCKS_TOTAL = S / N;
+
+__global__ __launch_bounds__(288, 1)
+void overlap2_g2_async_fwd(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ packed_k,
+    const __nv_bfloat16* __restrict__ packed_v,
+    const float* __restrict__ sink_lse,
+    __nv_bfloat16* __restrict__ out,
+    float softmax_scale
+) {
+    extern __shared__ __align__(128) unsigned char smem_raw[];
+    __shared__ __align__(8) uint64_t full_bar[2];
+    __shared__ __align__(8) uint64_t empty_bar[2];
+
+    // 2 consumer WGs:
+    // Q  = 2 * 16 KiB
+    // P  = 2 *  8 KiB
+    // K/V double buffers = 32 + 32 KiB
+    // total = 112 KiB.
+    __nv_bfloat16* q_s =
+        reinterpret_cast<__nv_bfloat16*>(smem_raw);
+    __nv_bfloat16* p_s =
+        q_s + 2 * QK_SLICES * BLOCK_ELEMS;
+    __nv_bfloat16* k_stage =
+        p_s + 2 * PV_SLICES * BLOCK_ELEMS;
+    __nv_bfloat16* v_stage =
+        k_stage + 2 * KV_STAGE_ELEMS;
+
+    const int tid = threadIdx.x;
+    const int wg = tid >> 7;      // 0/1 consumer, 2 producer warp
+    const int wtid = tid & 127;
+    const bool producer_lane0 = tid == 256;
+    const int tile = blockIdx.x;  // 0..7, each exactly 64 tokens
+    const int kvh = blockIdx.y;
+    const int token_tile0 = tile * TOKEN_TILE;
+
+    if (producer_lane0) {
+        wgmma_fa3_exp::mbarrier_init_count(&full_bar[0], 1);
+        wgmma_fa3_exp::mbarrier_init_count(&full_bar[1], 1);
+        wgmma_fa3_exp::mbarrier_init_count(&empty_bar[0], 2);
+        wgmma_fa3_exp::mbarrier_init_count(&empty_bar[1], 2);
+    }
+    __syncthreads();
+
+    if (wg < 2) {
+        const int wg_token0 = token_tile0 + wg * TOKENS_PER_WG;
+        __nv_bfloat16* my_q =
+            q_s + wg * QK_SLICES * BLOCK_ELEMS;
+
+#pragma unroll
+        for (int ds = 0; ds < QK_SLICES; ++ds) {
+            int prow, kvec;
+            canonical_vec_coord(wtid, prow, kvec);
+            const int tok = wg_token0 + (prow >> 1);
+            const int qh = kvh * G + (prow & 1);
+            const int d0 = ds * 16 + kvec * 8;
+
+            const __nv_bfloat16* srcq =
+                q + (int64_t(tok) * HQ + qh) * HD + d0;
+            __nv_bfloat16* dst =
+                my_q + ds * BLOCK_ELEMS + wtid * 8;
+
+            *reinterpret_cast<uint4*>(dst) =
+                *reinterpret_cast<const uint4*>(srcq);
+        }
+        fence_proxy_async_shared();
+    }
+    __syncthreads();
+
+    // Exact FULL-overlap geometry from testcase #5.
+    const int first_kb = (tile < 4) ? 0 : 4;
+    const int block_count = (tile >= 2 && tile < 4) ? 8 : 4;
+
+    // Hard role split: producer never reaches WGMMA.
+    if (wg >= 2) {
+        if (producer_lane0) {
+            const __nv_bfloat16* pk =
+                packed_k + int64_t(kvh) * KBLOCKS_TOTAL
+                    * KV_STAGE_ELEMS;
+            const __nv_bfloat16* pv =
+                packed_v + int64_t(kvh) * KBLOCKS_TOTAL
+                    * KV_STAGE_ELEMS;
+
+            wgmma_fa3_exp::issue_kv_stage(
+                first_kb, 0, pk, pv,
+                k_stage, v_stage, full_bar
+            );
+            if (block_count > 1) {
+                wgmma_fa3_exp::issue_kv_stage(
+                    first_kb + 1, 1, pk, pv,
+                    k_stage, v_stage, full_bar
+                );
+            }
+
+            for (int i = 0; i < block_count; ++i) {
+                const int stage = i & 1;
+                const int parity = (i >> 1) & 1;
+                if (i + 2 < block_count) {
+                    wgmma_fa3_exp::mbarrier_wait_phase(
+                        &empty_bar[stage], parity
+                    );
+                    wgmma_fa3_exp::issue_kv_stage(
+                        first_kb + i + 2, stage, pk, pv,
+                        k_stage, v_stage, full_bar
+                    );
+                }
+            }
+        }
+        return;
+    }
+
+    __nv_bfloat16* my_q =
+        q_s + wg * QK_SLICES * BLOCK_ELEMS;
+    __nv_bfloat16* my_p =
+        p_s + wg * PV_SLICES * BLOCK_ELEMS;
+
+    float out0[32];
+    float out1[32];
+    wgmma_fa3_exp::zero32(out0);
+    wgmma_fa3_exp::zero32(out1);
+
+    const FragCoord fc = frag_coord();
+    const int prow0 = fc.row0;
+    const int prow1 = fc.row1;
+    const int wg_token0 = token_tile0 + wg * TOKENS_PER_WG;
+    const int qidx0 = wg_token0 + (prow0 >> 1);
+    const int qidx1 = wg_token0 + (prow1 >> 1);
+    const int qh0 = kvh * G + (prow0 & 1);
+    const int qh1 = kvh * G + (prow1 & 1);
+
+    float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F;
+    float l0 = 0.0f, l1 = 0.0f;
+
+    for (int i = 0; i < block_count; ++i) {
+        const int stage = i & 1;
+        const int parity = (i >> 1) & 1;
+
+        wgmma_fa3_exp::mbarrier_wait_phase(
+            &full_bar[stage], parity
+        );
+
+        __nv_bfloat16* my_k =
+            k_stage + stage * KV_STAGE_ELEMS;
+        __nv_bfloat16* my_v =
+            v_stage + stage * KV_STAGE_ELEMS;
+
+        float score[32];
+        wgmma_fa3_exp::zero32(score);
+
+        fence();
+#pragma unroll
+        for (int ds = 0; ds < QK_SLICES; ++ds) {
+            mma_m64n64k16_bf16(
+                score,
+                make_kmajor_64x16_desc(
+                    my_q + ds * BLOCK_ELEMS),
+                make_kmajor_64x16_desc(
+                    my_k + ds * BLOCK_ELEMS)
+            );
+        }
+        commit_group();
+        wait_group<0>();
+
+        float local_max0 = -CUDART_INF_F;
+        float local_max1 = -CUDART_INF_F;
+
+#pragma unroll
+        for (int g = 0; g < 8; ++g) {
+            local_max0 = fmaxf(
+                local_max0, score[4*g+0] * softmax_scale);
+            local_max0 = fmaxf(
+                local_max0, score[4*g+1] * softmax_scale);
+            local_max1 = fmaxf(
+                local_max1, score[4*g+2] * softmax_scale);
+            local_max1 = fmaxf(
+                local_max1, score[4*g+3] * softmax_scale);
+        }
+
+        const float tm0 = row4_max(local_max0);
+        const float tm1 = row4_max(local_max1);
+        const float nm0 = fmaxf(m0, tm0);
+        const float nm1 = fmaxf(m1, tm1);
+        const float a0 =
+            (m0 == -CUDART_INF_F) ? 0.0f : __expf(m0 - nm0);
+        const float a1 =
+            (m1 == -CUDART_INF_F) ? 0.0f : __expf(m1 - nm1);
+
+        float sum0 = 0.0f, sum1 = 0.0f;
+
+#pragma unroll
+        for (int g = 0; g < 8; ++g) {
+            const int c0 = frag_col(g, 0);
+            const int c1 = frag_col(g, 1);
+
+            const float p00 =
+                __expf(score[4*g+0] * softmax_scale - nm0);
+            const float p01 =
+                __expf(score[4*g+1] * softmax_scale - nm0);
+            const float p10 =
+                __expf(score[4*g+2] * softmax_scale - nm1);
+            const float p11 =
+                __expf(score[4*g+3] * softmax_scale - nm1);
+
+            sum0 += p00 + p01;
+            sum1 += p10 + p11;
+
+            const int s0 = c0 >> 4, kc0 = c0 & 15;
+            const int s1 = c1 >> 4, kc1 = c1 & 15;
+
+            my_p[s0 * BLOCK_ELEMS
+                + canonical_kmajor_offset(prow0, kc0)] =
+                __float2bfloat16_rn(p00);
+            my_p[s1 * BLOCK_ELEMS
+                + canonical_kmajor_offset(prow0, kc1)] =
+                __float2bfloat16_rn(p01);
+            my_p[s0 * BLOCK_ELEMS
+                + canonical_kmajor_offset(prow1, kc0)] =
+                __float2bfloat16_rn(p10);
+            my_p[s1 * BLOCK_ELEMS
+                + canonical_kmajor_offset(prow1, kc1)] =
+                __float2bfloat16_rn(p11);
+        }
+
+        l0 = l0 * a0 + row4_sum(sum0);
+        l1 = l1 * a1 + row4_sum(sum1);
+        m0 = nm0;
+        m1 = nm1;
+
+        wgmma_fa3_exp::rescale32(out0, a0, a1);
+        wgmma_fa3_exp::rescale32(out1, a0, a1);
+
+        fence_proxy_async_shared();
+        wgmma_fa3_exp::warpgroup_barrier(wg);
+
+        fence();
+#pragma unroll
+        for (int ks16 = 0; ks16 < PV_SLICES; ++ks16) {
+            mma_m64n64k16_bf16(
+                out0,
+                make_kmajor_64x16_desc(
+                    my_p + ks16 * BLOCK_ELEMS),
+                make_kmajor_64x16_desc(
+                    my_v + ks16 * BLOCK_ELEMS)
+            );
+        }
+#pragma unroll
+        for (int ks16 = 0; ks16 < PV_SLICES; ++ks16) {
+            mma_m64n64k16_bf16(
+                out1,
+                make_kmajor_64x16_desc(
+                    my_p + ks16 * BLOCK_ELEMS),
+                make_kmajor_64x16_desc(
+                    my_v + (PV_SLICES + ks16) * BLOCK_ELEMS)
+            );
+        }
+        commit_group();
+        wait_group<0>();
+
+        wgmma_fa3_exp::warpgroup_barrier(wg);
+        if (wtid == 0) {
+            wgmma_fa3_exp::mbarrier_arrive_release(
+                &empty_bar[stage]
+            );
+        }
+    }
+
+    const float denom0 =
+        l0 + __expf(sink_lse[qh0] - m0);
+    const float denom1 =
+        l1 + __expf(sink_lse[qh1] - m1);
+    const float inv0 = 1.0f / denom0;
+    const float inv1 = 1.0f / denom1;
+
+#pragma unroll
+    for (int g = 0; g < 8; ++g) {
+        const int c0 = frag_col(g, 0);
+        const int c1 = frag_col(g, 1);
+
+        out[(int64_t(qidx0) * HQ + qh0) * HD + c0] =
+            __float2bfloat16_rn(out0[4*g+0] * inv0);
+        out[(int64_t(qidx0) * HQ + qh0) * HD + c1] =
+            __float2bfloat16_rn(out0[4*g+1] * inv0);
+        out[(int64_t(qidx1) * HQ + qh1) * HD + c0] =
+            __float2bfloat16_rn(out0[4*g+2] * inv1);
+        out[(int64_t(qidx1) * HQ + qh1) * HD + c1] =
+            __float2bfloat16_rn(out0[4*g+3] * inv1);
+
+        out[(int64_t(qidx0) * HQ + qh0) * HD + 64+c0] =
+            __float2bfloat16_rn(out1[4*g+0] * inv0);
+        out[(int64_t(qidx0) * HQ + qh0) * HD + 64+c1] =
+            __float2bfloat16_rn(out1[4*g+1] * inv0);
+        out[(int64_t(qidx1) * HQ + qh1) * HD + 64+c0] =
+            __float2bfloat16_rn(out1[4*g+2] * inv1);
+        out[(int64_t(qidx1) * HQ + qh1) * HD + 64+c1] =
+            __float2bfloat16_rn(out1[4*g+3] * inv1);
+    }
+}
+
+inline void launch_overlap2_g2_async(
+    const __nv_bfloat16* q,
+    const __nv_bfloat16* packed_k,
+    const __nv_bfloat16* packed_v,
+    const float* sink_lse,
+    __nv_bfloat16* out,
+    float softmax_scale
+) {
+    constexpr int smem_bytes =
+        (2 * QK_SLICES * BLOCK_ELEMS
+       + 2 * PV_SLICES * BLOCK_ELEMS
+       + 4 * KV_STAGE_ELEMS) * sizeof(__nv_bfloat16);
+
+    static bool configured = false;
+    if (!configured) {
+        cudaFuncSetAttribute(
+            overlap2_g2_async_fwd,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            smem_bytes
+        );
+        configured = true;
+    }
+
+    dim3 grid(8, HKV, 1);
+    overlap2_g2_async_fwd<<<grid, 288, smem_bytes>>>(
+        q, packed_k, packed_v, sink_lse,
+        out, softmax_scale
+    );
+}
+
+} // namespace wgmma_overlap2_g2_async
+
+
 extern "C" void run_kernel(
     const __nv_bfloat16* q,
     const __nv_bfloat16* k,
@@ -4929,7 +5278,7 @@ extern "C" void run_kernel(
 ) {
     static bool printed_build = false;
     if (!printed_build) {
-        fprintf(stderr, "BUILD CUDA_SM90A_DENSE_G4_ASYNC_V13\\n");
+        fprintf(stderr, "BUILD CUDA_SM90A_G2_OVERLAP_V14\\n");
         printed_build = true;
     }
 
@@ -5001,7 +5350,8 @@ extern "C" void run_kernel(
         return;
     }
 
-    // #5 exact overlap2: collapse into three disjoint effective regions.
+    // #5 exact G2 FULL overlap.  One CTA covers 64 tokens = 128 packed
+    // Q rows across two consumer warpgroups, sharing one async K/V stream.
     if (
         S == 512 && Hq == 16 && Hkv == 8 &&
         D == 128 && N == 2 && Ns == 2
@@ -5014,13 +5364,9 @@ extern "C" void run_kernel(
             S, Hq, Hkv, Ns,
             packed_k, packed_v, sink_lse
         );
-        wgmma_partition::launch_partition_wgmma<128>(
-            q, k, v,
-            q_ranges, k_ranges, attn_type_map,
-            sink, packed_k, packed_v, sink_lse,
-            output, softmax_scale,
-            S, Hq, Hkv, Ns, N,
-            1
+        wgmma_overlap2_g2_async::launch_overlap2_g2_async(
+            q, packed_k, packed_v, sink_lse,
+            output, softmax_scale
         );
         return;
     }
