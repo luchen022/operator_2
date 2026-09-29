@@ -1726,9 +1726,23 @@ static void dump_diag_once(
     float softmax_scale,
     int S, int Hq, int Hkv, int D, int N, int Ns
 ) {
-    static bool dumped = false;
-    if (dumped) return;
-    dumped = true;
+    struct SeenSig {
+        int S, Hq, Hkv, D, N, Ns;
+        const int32_t* qptr;
+    };
+    static SeenSig seen[32];
+    static int seen_count = 0;
+
+    for (int i = 0; i < seen_count; ++i) {
+        if (seen[i].S == S && seen[i].Hq == Hq && seen[i].Hkv == Hkv &&
+            seen[i].D == D && seen[i].N == N && seen[i].Ns == Ns &&
+            seen[i].qptr == q_ranges) {
+            return;
+        }
+    }
+    if (seen_count < 32) {
+        seen[seen_count++] = {S, Hq, Hkv, D, N, Ns, q_ranges};
+    }
 
     int32_t hq[20] = {0};
     int32_t hk[20] = {0};
