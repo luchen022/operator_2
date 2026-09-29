@@ -4382,23 +4382,40 @@ namespace wgmma_fp8_qk {
 using namespace wgmma_sm90;
 
 constexpr int HD = 128;
-constexpr int N = 64;
 constexpr int K8_TILE_BYTES = 2048;
-constexpr int K8_TILES = 4;
-constexpr int K8_BLOCK_BYTES = 8192;
+constexpr int K8_TILES = 3;                         // D[0:96]
+constexpr int K8_BLOCK_BYTES = K8_TILES * K8_TILE_BYTES;
 constexpr int P_BLOCK_ELEMS = 64 * 16;
 constexpr int PV_SLICES = 4;
-constexpr int V_BLOCK_ELEMS = 8 * P_BLOCK_ELEMS; // 8192 BF16
-constexpr int Q8_BYTES = 8192;
+constexpr int V_BLOCK_ELEMS = 8 * P_BLOCK_ELEMS;   // 8192 BF16
+
+constexpr int Q8_BYTES = K8_BLOCK_BYTES;            // 6144 B
+constexpr int QTAIL_TILES = 2;                      // D[96:128]
+constexpr int QTAIL_ELEMS = QTAIL_TILES * P_BLOCK_ELEMS;
+constexpr int QTAIL_BYTES = QTAIL_ELEMS * 2;        // 4096 B
 constexpr int P_BYTES = PV_SLICES * P_BLOCK_ELEMS * 2;
+
 constexpr int K8_DOUBLE_BYTES = 2 * K8_BLOCK_BYTES;
+constexpr int KLOG2_FULL_TILES = 8;
+constexpr int KLOG2_FULL_BLOCK_ELEMS =
+    KLOG2_FULL_TILES * P_BLOCK_ELEMS;
+constexpr int KLOG2_TAIL_OFFSET = 6 * P_BLOCK_ELEMS;
+constexpr int KLOG2_TAIL_ELEMS = 2 * P_BLOCK_ELEMS;
+constexpr int KLOG2_TAIL_BYTES = KLOG2_TAIL_ELEMS * 2;
+constexpr int KLOG2_DOUBLE_BYTES = 2 * KLOG2_TAIL_BYTES;
+
 constexpr int V_DOUBLE_BYTES = 2 * V_BLOCK_ELEMS * 2;
-constexpr int SCALE_DOUBLE_BYTES = 2 * 128 * 4;
+constexpr int KSCALE_PER_BLOCK = 64 * 3;
+constexpr int SCALE_DOUBLE_BYTES = 2 * KSCALE_PER_BLOCK * 4;
+
 constexpr int SMEM_BYTES =
-    Q8_BYTES + P_BYTES + K8_DOUBLE_BYTES
+    Q8_BYTES + QTAIL_BYTES + P_BYTES
+    + K8_DOUBLE_BYTES + KLOG2_DOUBLE_BYTES
     + V_DOUBLE_BYTES + SCALE_DOUBLE_BYTES;
+
 constexpr int TX_BYTES =
-    K8_BLOCK_BYTES + V_BLOCK_ELEMS * 2 + 128 * 4;
+    K8_BLOCK_BYTES + KLOG2_TAIL_BYTES
+    + V_BLOCK_ELEMS * 2 + KSCALE_PER_BLOCK * 4;
 constexpr float LOG2E = 1.4426950408889634f;
 
 __device__ __forceinline__ void stage_q8(
@@ -4438,13 +4455,53 @@ __device__ __forceinline__ void stage_q8(
     }
 }
 
+
+__device__ __forceinline__ void stage_q_tail_bf16(
+    const __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ q_tail,
+    int q0,
+    int qe,
+    int kvh,
+    int Hq,
+    int G
+) {
+    const int tid = threadIdx.x & 127;
+    const int g_shift = (G == 8) ? 3 : 2;
+    const int g_mask = G - 1;
+
+#pragma unroll
+    for (int ds = 0; ds < QTAIL_TILES; ++ds) {
+        int prow, kvec;
+        canonical_vec_coord(tid, prow, kvec);
+
+        const int tok = q0 + (prow >> g_shift);
+        const int qh = kvh * G + (prow & g_mask);
+        const int d0 = 96 + ds * 16 + kvec * 8;
+
+        __nv_bfloat16* dst =
+            q_tail + ds * P_BLOCK_ELEMS + tid * 8;
+
+        if (tok < qe) {
+            const __nv_bfloat16* src =
+                q + (int64_t(tok) * Hq + qh) * HD + d0;
+            *reinterpret_cast<uint4*>(dst) =
+                *reinterpret_cast<const uint4*>(src);
+        } else {
+            *reinterpret_cast<uint4*>(dst) =
+                make_uint4(0, 0, 0, 0);
+        }
+    }
+}
+
 __device__ __forceinline__ void issue_stage(
     int kb,
     int stage,
     const uint8_t* __restrict__ packed_k8,
+    const __nv_bfloat16* __restrict__ packed_k_log2,
     const __nv_bfloat16* __restrict__ packed_v,
     const float* __restrict__ packed_kscale,
-    uint8_t* __restrict__ k_stage,
+    uint8_t* __restrict__ k8_stage,
+    __nv_bfloat16* __restrict__ klog2_stage,
     __nv_bfloat16* __restrict__ v_stage,
     float* __restrict__ scale_stage,
     uint64_t* bar
@@ -4454,9 +4511,17 @@ __device__ __forceinline__ void issue_stage(
     );
 
     wgmma_fa3_exp::cp_async_bulk_g2s(
-        k_stage + stage * K8_BLOCK_BYTES,
+        k8_stage + stage * K8_BLOCK_BYTES,
         packed_k8 + int64_t(kb) * K8_BLOCK_BYTES,
         K8_BLOCK_BYTES,
+        bar + stage
+    );
+    wgmma_fa3_exp::cp_async_bulk_g2s(
+        klog2_stage + stage * KLOG2_TAIL_ELEMS,
+        packed_k_log2
+            + int64_t(kb) * KLOG2_FULL_BLOCK_ELEMS
+            + KLOG2_TAIL_OFFSET,
+        KLOG2_TAIL_BYTES,
         bar + stage
     );
     wgmma_fa3_exp::cp_async_bulk_g2s(
@@ -4466,15 +4531,16 @@ __device__ __forceinline__ void issue_stage(
         bar + stage
     );
     wgmma_fa3_exp::cp_async_bulk_g2s(
-        scale_stage + stage * 128,
-        packed_kscale + int64_t(kb) * 128,
-        128 * sizeof(float),
+        scale_stage + stage * KSCALE_PER_BLOCK,
+        packed_kscale + int64_t(kb) * KSCALE_PER_BLOCK,
+        KSCALE_PER_BLOCK * sizeof(float),
         bar + stage
     );
 }
 
 __global__ __launch_bounds__(160, 1)
 void partition_fp8_qk_fwd(
+    const __nv_bfloat16* __restrict__ q,
     const uint8_t* __restrict__ q8,
     const float* __restrict__ qscale,
     const int32_t* __restrict__ q_ranges,
@@ -4482,6 +4548,7 @@ void partition_fp8_qk_fwd(
     const int32_t* __restrict__ attn_type_map,
     const uint8_t* __restrict__ packed_k8,
     const float* __restrict__ packed_kscale,
+    const __nv_bfloat16* __restrict__ packed_k_log2,
     const __nv_bfloat16* __restrict__ packed_v,
     const int32_t* __restrict__ slice_block_offsets,
     int slice_total_blocks,
@@ -4503,18 +4570,29 @@ void partition_fp8_qk_fwd(
     __shared__ int meta[10];
 
     uint8_t* q_s = smem_raw;
-    __nv_bfloat16* p_s =
+    __nv_bfloat16* q_tail =
         reinterpret_cast<__nv_bfloat16*>(smem_raw + Q8_BYTES);
-    uint8_t* k_stage =
-        smem_raw + Q8_BYTES + P_BYTES;
+    __nv_bfloat16* p_s =
+        reinterpret_cast<__nv_bfloat16*>(
+            smem_raw + Q8_BYTES + QTAIL_BYTES
+        );
+    uint8_t* k8_stage =
+        smem_raw + Q8_BYTES + QTAIL_BYTES + P_BYTES;
+    __nv_bfloat16* klog2_stage =
+        reinterpret_cast<__nv_bfloat16*>(
+            smem_raw + Q8_BYTES + QTAIL_BYTES + P_BYTES
+            + K8_DOUBLE_BYTES
+        );
     __nv_bfloat16* v_stage =
         reinterpret_cast<__nv_bfloat16*>(
-            smem_raw + Q8_BYTES + P_BYTES + K8_DOUBLE_BYTES
+            smem_raw + Q8_BYTES + QTAIL_BYTES + P_BYTES
+            + K8_DOUBLE_BYTES + KLOG2_DOUBLE_BYTES
         );
     float* scale_stage =
         reinterpret_cast<float*>(
-            smem_raw + Q8_BYTES + P_BYTES
-            + K8_DOUBLE_BYTES + V_DOUBLE_BYTES
+            smem_raw + Q8_BYTES + QTAIL_BYTES + P_BYTES
+            + K8_DOUBLE_BYTES + KLOG2_DOUBLE_BYTES
+            + V_DOUBLE_BYTES
         );
 
     const int tid = threadIdx.x;
@@ -4621,6 +4699,7 @@ void partition_fp8_qk_fwd(
 
     if (wg == 0) {
         stage_q8(q8, q_s, q0, qe, kvh, Hq, G);
+        stage_q_tail_bf16(q, q_tail, q0, qe, kvh, Hq, G);
         fence_proxy_async_shared();
     }
     __syncthreads();
@@ -4629,27 +4708,25 @@ void partition_fp8_qk_fwd(
         if (producer_lane0 && block_count > 0) {
             const int slice_base = slice_block_offsets[sid];
 
-            const uint8_t* pk =
-                packed_k8
-                + (int64_t(kvh) * slice_total_blocks + slice_base)
-                  * K8_BLOCK_BYTES;
+            const int64_t base =
+                int64_t(kvh) * slice_total_blocks + slice_base;
+            const uint8_t* pk8 =
+                packed_k8 + base * K8_BLOCK_BYTES;
+            const __nv_bfloat16* pklog2 =
+                packed_k_log2 + base * KLOG2_FULL_BLOCK_ELEMS;
             const __nv_bfloat16* pv =
-                packed_v
-                + (int64_t(kvh) * slice_total_blocks + slice_base)
-                  * V_BLOCK_ELEMS;
+                packed_v + base * V_BLOCK_ELEMS;
             const float* ps =
-                packed_kscale
-                + (int64_t(kvh) * slice_total_blocks + slice_base)
-                  * 128;
+                packed_kscale + base * KSCALE_PER_BLOCK;
 
             issue_stage(
-                kb_begin, 0, pk, pv, ps,
-                k_stage, v_stage, scale_stage, full_bar
+                kb_begin, 0, pk8, pklog2, pv, ps,
+                k8_stage, klog2_stage, v_stage, scale_stage, full_bar
             );
             if (block_count > 1) {
                 issue_stage(
-                    kb_begin + 1, 1, pk, pv, ps,
-                    k_stage, v_stage, scale_stage, full_bar
+                    kb_begin + 1, 1, pk8, pklog2, pv, ps,
+                    k8_stage, klog2_stage, v_stage, scale_stage, full_bar
                 );
             }
 
@@ -4661,8 +4738,8 @@ void partition_fp8_qk_fwd(
                         &empty_bar[stage], parity
                     );
                     issue_stage(
-                        kb_begin + i + 2, stage, pk, pv, ps,
-                        k_stage, v_stage, scale_stage, full_bar
+                        kb_begin + i + 2, stage, pk8, pklog2, pv, ps,
+                        k8_stage, klog2_stage, v_stage, scale_stage, full_bar
                     );
                 }
             }
@@ -4683,12 +4760,18 @@ void partition_fp8_qk_fwd(
     const int qh0 = kvh * G + (prow0 & g_mask);
     const int qh1 = kvh * G + (prow1 & g_mask);
 
-    const int64_t qsb0 = (int64_t(qidx0) * Hq + qh0) * 2;
-    const int64_t qsb1 = (int64_t(qidx1) * Hq + qh1) * 2;
-    const float qs00 = (qidx0 < qe) ? qscale[qsb0 + 0] : 0.0f;
-    const float qs01 = (qidx0 < qe) ? qscale[qsb0 + 1] : 0.0f;
-    const float qs10 = (qidx1 < qe) ? qscale[qsb1 + 0] : 0.0f;
-    const float qs11 = (qidx1 < qe) ? qscale[qsb1 + 1] : 0.0f;
+    const int64_t qsb0 = (int64_t(qidx0) * Hq + qh0) * 3;
+    const int64_t qsb1 = (int64_t(qidx1) * Hq + qh1) * 3;
+    float qsg0[3] = {0.0f, 0.0f, 0.0f};
+    float qsg1[3] = {0.0f, 0.0f, 0.0f};
+    if (qidx0 < qe) {
+#pragma unroll
+        for (int sg = 0; sg < 3; ++sg) qsg0[sg] = qscale[qsb0 + sg];
+    }
+    if (qidx1 < qe) {
+#pragma unroll
+        for (int sg = 0; sg < 3; ++sg) qsg1[sg] = qscale[qsb1 + sg];
+    }
 
     float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F;
     float l0 = 0.0f, l1 = 0.0f;
@@ -4728,51 +4811,64 @@ void partition_fp8_qk_fwd(
             &full_bar[stage], parity
         );
 
-        uint8_t* my_k =
-            k_stage + stage * K8_BLOCK_BYTES;
+        uint8_t* my_k8 =
+            k8_stage + stage * K8_BLOCK_BYTES;
+        __nv_bfloat16* my_klog2 =
+            klog2_stage + stage * KLOG2_TAIL_ELEMS;
         __nv_bfloat16* my_v =
             v_stage + stage * V_BLOCK_ELEMS;
         float* my_ks =
-            scale_stage + stage * 128;
+            scale_stage + stage * KSCALE_PER_BLOCK;
 
         float score[32];
         float part[32];
         wgmma_fa3_exp::zero32(score);
 
+        // D[0:96]: three independent FP8 k32 dot products.
 #pragma unroll
-        for (int sg = 0; sg < 2; ++sg) {
+        for (int ds = 0; ds < K8_TILES; ++ds) {
             wgmma_fa3_exp::zero32(part);
             fence();
-#pragma unroll
-            for (int j = 0; j < 2; ++j) {
-                const int ds = sg * 2 + j;
-                mma_m64n64k32_e4m3(
-                    part,
-                    make_kmajor_64x32_e4m3_desc(
-                        q_s + ds * K8_TILE_BYTES),
-                    make_kmajor_64x32_e4m3_desc(
-                        my_k + ds * K8_TILE_BYTES)
-                );
-            }
+            mma_m64n64k32_e4m3(
+                part,
+                make_kmajor_64x32_e4m3_desc(
+                    q_s + ds * K8_TILE_BYTES),
+                make_kmajor_64x32_e4m3_desc(
+                    my_k8 + ds * K8_TILE_BYTES)
+            );
             commit_group();
             wait_group<0>();
-
-            const float qsg0 = (sg == 0) ? qs00 : qs01;
-            const float qsg1 = (sg == 0) ? qs10 : qs11;
 
 #pragma unroll
             for (int g = 0; g < 8; ++g) {
                 const int c0 = frag_col(g, 0);
                 const int c1 = frag_col(g, 1);
-                const float sk0 = my_ks[c0 * 2 + sg];
-                const float sk1 = my_ks[c1 * 2 + sg];
+                const float sk0 = my_ks[c0 * 3 + ds];
+                const float sk1 = my_ks[c1 * 3 + ds];
 
-                score[4*g+0] += part[4*g+0] * qsg0 * sk0;
-                score[4*g+1] += part[4*g+1] * qsg0 * sk1;
-                score[4*g+2] += part[4*g+2] * qsg1 * sk0;
-                score[4*g+3] += part[4*g+3] * qsg1 * sk1;
+                score[4*g+0] += part[4*g+0] * qsg0[ds] * sk0;
+                score[4*g+1] += part[4*g+1] * qsg0[ds] * sk1;
+                score[4*g+2] += part[4*g+2] * qsg1[ds] * sk0;
+                score[4*g+3] += part[4*g+3] * qsg1[ds] * sk1;
             }
         }
+
+        // D[96:128]: exact BF16 Q against warmup pre-scaled BF16 K.
+        // packed_k_log2 already contains softmax_scale * log2(e), so these
+        // two WGMMA operations accumulate directly into log2-domain score.
+        fence();
+#pragma unroll
+        for (int ds = 0; ds < QTAIL_TILES; ++ds) {
+            mma_m64n64k16_bf16(
+                score,
+                make_kmajor_64x16_desc(
+                    q_tail + ds * P_BLOCK_ELEMS),
+                make_kmajor_64x16_desc(
+                    my_klog2 + ds * P_BLOCK_ELEMS)
+            );
+        }
+        commit_group();
+        wait_group<0>();
 
         float local_max0 = -CUDART_INF_F;
         float local_max1 = -CUDART_INF_F;
@@ -4968,6 +5064,7 @@ void partition_fp8_qk_fwd(
 }
 
 inline void launch(
+    const __nv_bfloat16* q,
     const uint8_t* q8,
     const float* qscale,
     const int32_t* q_ranges,
@@ -4975,6 +5072,7 @@ inline void launch(
     const int32_t* attn_type_map,
     const uint8_t* packed_k8,
     const float* packed_kscale,
+    const __nv_bfloat16* packed_k_log2,
     const __nv_bfloat16* packed_v,
     const int32_t* slice_block_offsets,
     int slice_total_blocks,
@@ -5003,9 +5101,9 @@ inline void launch(
 
     dim3 grid(grid_x, Hkv, 1);
     partition_fp8_qk_fwd<<<grid, 160, SMEM_BYTES>>>(
-        q8, qscale,
+        q, q8, qscale,
         q_ranges, k_ranges, attn_type_map,
-        packed_k8, packed_kscale, packed_v,
+        packed_k8, packed_kscale, packed_k_log2, packed_v,
         slice_block_offsets, slice_total_blocks,
         sink_lse, out,
         S, Hq, Hkv, NumSlices, G
