@@ -3560,18 +3560,20 @@ void g4_overlap_async_fwd(
                 packed_v + int64_t(kvh) * slice_total_blocks
                     * KV_STAGE_ELEMS;
 
-            auto abs_block = [&](int i) {
-                if (i < extra_blocks) return extra_base + i;
-                return local_base + (i - extra_blocks);
-            };
-
+            const int block0 =
+                (0 < extra_blocks) ? extra_base : local_base;
             wgmma_fa3_exp::issue_kv_stage(
-                abs_block(0), 0, pk, pv,
+                block0, 0, pk, pv,
                 k_stage, v_stage, full_bar
             );
+
             if (block_count > 1) {
+                const int j = 1;
+                const int block1 = (j < extra_blocks)
+                    ? (extra_base + j)
+                    : (local_base + j - extra_blocks);
                 wgmma_fa3_exp::issue_kv_stage(
-                    abs_block(1), 1, pk, pv,
+                    block1, 1, pk, pv,
                     k_stage, v_stage, full_bar
                 );
             }
@@ -3580,11 +3582,15 @@ void g4_overlap_async_fwd(
                 const int stage = i & 1;
                 const int parity = (i >> 1) & 1;
                 if (i + 2 < block_count) {
+                    const int j = i + 2;
+                    const int next_block = (j < extra_blocks)
+                        ? (extra_base + j)
+                        : (local_base + j - extra_blocks);
                     wgmma_fa3_exp::mbarrier_wait_phase(
                         &empty_bar[stage], parity
                     );
                     wgmma_fa3_exp::issue_kv_stage(
-                        abs_block(i + 2), stage, pk, pv,
+                        next_block, stage, pk, pv,
                         k_stage, v_stage, full_bar
                     );
                 }
