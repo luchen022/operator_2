@@ -4406,7 +4406,7 @@ __device__ __forceinline__ void stage_q8(
         int prow, kvec;
         canonical_fp8_vec_coord(tid, prow, kvec);
 
-        const int tok = q0 + prow >> g_shift;
+        const int tok = q0 + (prow >> g_shift);
         const int qh = kvh * G + (prow & g_mask);
         const int d0 = ds * 32 + kvec * 16;
 
@@ -4665,8 +4665,8 @@ void partition_fp8_qk_fwd(
     const FragCoord fc = frag_coord();
     const int prow0 = fc.row0;
     const int prow1 = fc.row1;
-    const int qidx0 = q0 + prow0 >> g_shift;
-    const int qidx1 = q0 + prow1 >> g_shift;
+    const int qidx0 = q0 + (prow0 >> g_shift);
+    const int qidx1 = q0 + (prow1 >> g_shift);
     const int qh0 = kvh * G + (prow0 & g_mask);
     const int qh1 = kvh * G + (prow1 & g_mask);
 
@@ -5013,7 +5013,7 @@ extern "C" void run_kernel(
 ) {
     static bool printed_build = false;
     if (!printed_build) {
-        fprintf(stderr, "BUILD CUDA_SM90A_FP8_RUNTIME_G_V30\\n");
+        fprintf(stderr, "BUILD CUDA_SM90A_FP8_INDEX_FIX_V31\\n");
         printed_build = true;
     }
 
