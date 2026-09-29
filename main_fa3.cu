@@ -2911,7 +2911,6 @@ inline bool launch_scored_g8_slices(
         const int q1[7] = {585,1170,1755,2340,2925,3510,4096};
         const int ke[7] = {585,1170,1755,2340,2925,3510,4096};
         const int base[7] = {0,10,29,57,94,140,195};
-#pragma unroll
         for (int i = 0; i < 7; ++i) {
             launch_one_slice(q, packed_k, packed_v, slice_total_blocks,
                 sink_lse, out, Hq, Hkv,
@@ -2925,7 +2924,6 @@ inline bool launch_scored_g8_slices(
         const int q0[10] = {0,2928,3128,3768,6680,7872,8040,8136,8160,8184};
         const int q1[10] = {2928,3128,3768,6680,7872,8040,8136,8160,8184,8192};
         const int base[10] = {0,46,50,60,106,125,128,130,131,132};
-#pragma unroll
         for (int i = 0; i < 10; ++i) {
             launch_one_slice(q, packed_k, packed_v, slice_total_blocks,
                 sink_lse, out, Hq, Hkv,
@@ -2950,6 +2948,8 @@ inline bool launch_scored_g8_slices(
 
 
 
+
+} // namespace wgmma_g8_log2
 
 namespace wgmma_g4_async {
 
@@ -5571,14 +5571,14 @@ extern "C" void run_kernel(
             return;
         }
 
-        // Unknown G8 shape: keep the generic packed-slice fallback correct.
+        // Unknown G8 shape: use the original generic path.
         wgmma_partition::launch_partition_wgmma<128>(
             q, k, v,
             q_ranges, k_ranges, attn_type_map,
-            sink, packed_k_log2, packed_v, sink_lse,
-            output, 1.0f / LOG2E,
+            sink, nullptr, nullptr, nullptr,
+            output, softmax_scale,
             S, Hq, Hkv, Ns, N,
-            0, slice_offsets, slice_total_blocks
+            0
         );
         return;
     }
