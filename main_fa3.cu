@@ -208,7 +208,7 @@ __device__ __forceinline__ void canonical_fp8_vec_coord(
 __device__ __forceinline__ uint16_t cvt_e4m3x2(float a, float b) {
     uint16_t out;
     asm volatile(
-        "cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;\n"
+        "cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;\n"
         : "=h"(out) : "f"(a), "f"(b)
     );
     return out;
@@ -5008,7 +5008,7 @@ extern "C" void run_kernel(
 ) {
     static bool printed_build = false;
     if (!printed_build) {
-        fprintf(stderr, "BUILD CUDA_SM90A_FP8_QK_V28\\n");
+        fprintf(stderr, "BUILD CUDA_SM90A_FP8_QK_V29\\n");
         printed_build = true;
     }
 
