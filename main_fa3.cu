@@ -2605,8 +2605,6 @@ constexpr float LOG2E = 1.4426950408889634f;
 __global__ __launch_bounds__(160, 1)
 void g8_partition_log2_fwd(
     const __nv_bfloat16* __restrict__ q,
-    const int32_t* __restrict__ q_ranges,
-    const int32_t* __restrict__ k_ranges,
     const int32_t* __restrict__ tile_meta,
     const __nv_bfloat16* __restrict__ packed_k,
     const __nv_bfloat16* __restrict__ packed_v,
@@ -2982,8 +2980,6 @@ void g8_partition_log2_fwd(
 
 inline void launch_g8_partition_log2(
     const __nv_bfloat16* q,
-    const int32_t* q_ranges,
-    const int32_t* k_ranges,
     const int32_t* tile_meta,
     const __nv_bfloat16* packed_k,
     const __nv_bfloat16* packed_v,
@@ -2993,7 +2989,7 @@ inline void launch_g8_partition_log2(
     int S,
     int Hq,
     int Hkv,
-    int NumSlices
+    int tile_count
 ) {
     constexpr int smem_bytes =
         (QK_SLICES * BLOCK_ELEMS
@@ -3042,8 +3038,6 @@ constexpr int TOKEN_M = 64 / G; // 16 query tokens / CTA
 __global__ __launch_bounds__(160, 1)
 void g4_partition_async_fwd(
     const __nv_bfloat16* __restrict__ q,
-    const int32_t* __restrict__ q_ranges,
-    const int32_t* __restrict__ k_ranges,
     const int32_t* __restrict__ tile_meta,
     const __nv_bfloat16* __restrict__ packed_k,
     const __nv_bfloat16* __restrict__ packed_v,
@@ -3372,8 +3366,6 @@ void g4_partition_async_fwd(
 
 inline void launch_g4_partition_async(
     const __nv_bfloat16* q,
-    const int32_t* q_ranges,
-    const int32_t* k_ranges,
     const int32_t* tile_meta,
     const __nv_bfloat16* packed_k,
     const __nv_bfloat16* packed_v,
@@ -3383,7 +3375,7 @@ inline void launch_g4_partition_async(
     int S,
     int Hq,
     int Hkv,
-    int NumSlices
+    int tile_count
 ) {
     constexpr int smem_bytes =
         (QK_SLICES * BLOCK_ELEMS
@@ -5356,7 +5348,7 @@ extern "C" void run_kernel(
 ) {
     static bool printed_build = false;
     if (!printed_build) {
-        fprintf(stderr, "BUILD CUDA_SM90A_STATIC_META_V26\\n");
+        fprintf(stderr, "BUILD CUDA_SM90A_STATIC_META_FIX_V27\\n");
         printed_build = true;
     }
 
