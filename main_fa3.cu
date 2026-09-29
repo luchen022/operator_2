@@ -2053,7 +2053,7 @@ __device__ __forceinline__ void mbarrier_arrive_release(uint64_t* bar) {
         : "r"(a)
         : "memory"
     );
-    (void)state;
+    asm volatile("" : : "l"(state));
 }
 
 __device__ __forceinline__ void mbarrier_arrive_expect(
@@ -2068,7 +2068,7 @@ __device__ __forceinline__ void mbarrier_arrive_expect(
         : "r"(a), "r"(bytes)
         : "memory"
     );
-    (void)state;
+    asm volatile("" : : "l"(state));
 }
 
 __device__ __forceinline__ void cp_async_bulk_g2s(
@@ -2229,16 +2229,35 @@ void g128_fa3_pipeline_fwd(
     }
     __syncthreads();
 
-    // Fill both stages before entering the steady-state loop.
-    if (producer_lane0) {
-        issue_kv_stage(
-            0, 0, packed_k, packed_v,
-            k_stage, v_stage, full_bar
-        );
-        issue_kv_stage(
-            1, 1, packed_k, packed_v,
-            k_stage, v_stage, full_bar
-        );
+    constexpr int KBLOCKS = S12 / N;
+
+    // Hard role split.  The producer warp never reaches any WGMMA code.
+    // The two consumer warpgroups fall through to a branch-free GMMA region.
+    if (wg >= 2) {
+        if (producer_lane0) {
+            issue_kv_stage(
+                0, 0, packed_k, packed_v,
+                k_stage, v_stage, full_bar
+            );
+            issue_kv_stage(
+                1, 1, packed_k, packed_v,
+                k_stage, v_stage, full_bar
+            );
+
+            for (int kb = 0; kb < KBLOCKS; ++kb) {
+                const int stage = kb & 1;
+                const int parity = (kb >> 1) & 1;
+
+                if (kb + 2 < KBLOCKS) {
+                    mbarrier_wait_phase(&empty_bar[stage], parity);
+                    issue_kv_stage(
+                        kb + 2, stage, packed_k, packed_v,
+                        k_stage, v_stage, full_bar
+                    );
+                }
+            }
+        }
+        return;
     }
 
     float out0[32];
@@ -2250,31 +2269,26 @@ void g128_fa3_pipeline_fwd(
     __nv_bfloat16* my_q = nullptr;
     __nv_bfloat16* my_p = nullptr;
 
-    if (wg < 2) {
-        qh_base = wg * 64;
-        my_q = q_s + wg * QK_SLICES * BLOCK_ELEMS;
-        my_p = p_s + wg * PV_SLICES * BLOCK_ELEMS;
+    qh_base = wg * 64;
+    my_q = q_s + wg * QK_SLICES * BLOCK_ELEMS;
+    my_p = p_s + wg * PV_SLICES * BLOCK_ELEMS;
 
-        zero32(out0);
-        zero32(out1);
+    zero32(out0);
+    zero32(out1);
 
-        const FragCoord fc = frag_coord();
-        row0 = fc.row0;
-        row1 = fc.row1;
-        qh0 = qh_base + row0;
-        qh1 = qh_base + row1;
-    }
-
-    constexpr int KBLOCKS = S12 / N;
+    const FragCoord fc = frag_coord();
+    row0 = fc.row0;
+    row1 = fc.row1;
+    qh0 = qh_base + row0;
+    qh1 = qh_base + row1;
 
     for (int kb = 0; kb < KBLOCKS; ++kb) {
         const int stage = kb & 1;
         const int parity = (kb >> 1) & 1;
 
-        if (wg < 2) {
-            // Wait only for the stage consumed by this iteration. The other
-            // stage may be in flight concurrently.
-            mbarrier_wait_phase(&full_bar[stage], parity);
+        // Wait only for the stage consumed by this iteration. The other
+        // stage may be in flight concurrently.
+        mbarrier_wait_phase(&full_bar[stage], parity);
 
             __nv_bfloat16* my_k =
                 k_stage + stage * KV_STAGE_ELEMS;
@@ -2400,26 +2414,13 @@ void g128_fa3_pipeline_fwd(
             // All four warps in this consumer warpgroup have finished reading
             // the current K/V stage.  Only one representative arrival is
             // needed from each warpgroup.
-            warpgroup_barrier(wg);
-            if (wtid == 0) {
-                mbarrier_arrive_release(&empty_bar[stage]);
-            }
-        }
-
-        if (producer_lane0 && kb + 2 < KBLOCKS) {
-            // Reuse of a double-buffer stage is now producer/consumer
-            // synchronized instead of forcing all 288 CTA threads through a
-            // __syncthreads() every 64 keys.
-            mbarrier_wait_phase(&empty_bar[stage], parity);
-            issue_kv_stage(
-                kb + 2, stage, packed_k, packed_v,
-                k_stage, v_stage, full_bar
-            );
+        warpgroup_barrier(wg);
+        if (wtid == 0) {
+            mbarrier_arrive_release(&empty_bar[stage]);
         }
     }
 
-    if (wg < 2) {
-        const float denom0 =
+    const float denom0 =
             l0 + __expf(sink_lse[qh0] - m0);
         const float denom1 =
             l1 + __expf(sink_lse[qh1] - m1);
@@ -2448,7 +2449,6 @@ void g128_fa3_pipeline_fwd(
                 __float2bfloat16_rn(out1[4*g+2] * inv1);
             out[(int64_t(token) * HQ12 + qh1) * HD12 + 64 + c1] =
                 __float2bfloat16_rn(out1[4*g+3] * inv1);
-        }
     }
 }
 
@@ -2502,7 +2502,7 @@ extern "C" void run_kernel(
 ) {
     static bool printed_build = false;
     if (!printed_build) {
-        fprintf(stderr, "BUILD CUDA_SM90A_FA3_WG_UNIFORM_V5\\n");
+        fprintf(stderr, "BUILD CUDA_SM90A_FA3_ROLE_SPLIT_V6\\n");
         printed_build = true;
     }
 
