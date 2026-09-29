@@ -5132,7 +5132,7 @@ extern "C" void run_kernel(
 ) {
     static bool printed_build = false;
     if (!printed_build) {
-        fprintf(stderr, "BUILD CUDA_SM90A_HYBRID_PREP_V33\\n");
+        fprintf(stderr, "BUILD CUDA_SM90A_HYBRID_FP8_BF16_V33\\n");
         printed_build = true;
     }
 
@@ -5171,7 +5171,7 @@ extern "C" void run_kernel(
         Hq == 32 && Hkv == 8 &&
         (S == 4096 || S == 16384)
     ) {
-        const __nv_bfloat16* ignored_k = nullptr;
+        const __nv_bfloat16* packed_k_log2 = nullptr;
         const __nv_bfloat16* packed_v = nullptr;
         const int32_t* slice_offsets = nullptr;
         int slice_total_blocks = 0;
@@ -5180,10 +5180,10 @@ extern "C" void run_kernel(
         wgmma_static_cache::ensure_sink_only(
             sink, Hq, Ns, sink_lse
         );
-        wgmma_slice_cache::ensure_slice_d128(
-            k, v, k_ranges, q_ranges,
+        wgmma_slice_cache::ensure_slice_d128_log2(
+            k, v, k_ranges, q_ranges, softmax_scale,
             S, Hkv, N,
-            ignored_k, packed_v,
+            packed_k_log2, packed_v,
             slice_offsets, slice_total_blocks
         );
 
@@ -5203,9 +5203,9 @@ extern "C" void run_kernel(
         );
 
         wgmma_fp8_qk::launch(
-            q8, qscale,
+            q, q8, qscale,
             q_ranges, k_ranges, attn_type_map,
-            packed_k8, packed_kscale, packed_v,
+            packed_k8, packed_kscale, packed_k_log2, packed_v,
             slice_offsets, slice_total_blocks,
             sink_lse, output,
             S, Hq, Hkv, N
@@ -5328,7 +5328,7 @@ extern "C" void run_kernel(
 
     // #2 / #3 / #6 / #11: shared QK-only FP8 path.
     if (D == 128 && N > 1 && Hq / Hkv == 8) {
-        const __nv_bfloat16* ignored_k = nullptr;
+        const __nv_bfloat16* packed_k_log2 = nullptr;
         const __nv_bfloat16* packed_v = nullptr;
         const int32_t* slice_offsets = nullptr;
         int slice_total_blocks = 0;
@@ -5337,10 +5337,10 @@ extern "C" void run_kernel(
         wgmma_static_cache::ensure_sink_only(
             sink, Hq, Ns, sink_lse
         );
-        wgmma_slice_cache::ensure_slice_d128(
-            k, v, k_ranges, q_ranges,
+        wgmma_slice_cache::ensure_slice_d128_log2(
+            k, v, k_ranges, q_ranges, softmax_scale,
             S, Hkv, N,
-            ignored_k, packed_v,
+            packed_k_log2, packed_v,
             slice_offsets, slice_total_blocks
         );
 
@@ -5360,9 +5360,9 @@ extern "C" void run_kernel(
         );
 
         wgmma_fp8_qk::launch(
-            q8, qscale,
+            q, q8, qscale,
             q_ranges, k_ranges, attn_type_map,
-            packed_k8, packed_kscale, packed_v,
+            packed_k8, packed_kscale, packed_k_log2, packed_v,
             slice_offsets, slice_total_blocks,
             sink_lse, output,
             S, Hq, Hkv, N
@@ -5372,7 +5372,7 @@ extern "C" void run_kernel(
 
     // #8 and remaining D128 G4: shared QK-only FP8 path.
     if (D == 128 && N > 1 && Hq / Hkv == 4) {
-        const __nv_bfloat16* ignored_k = nullptr;
+        const __nv_bfloat16* packed_k_log2 = nullptr;
         const __nv_bfloat16* packed_v = nullptr;
         const int32_t* slice_offsets = nullptr;
         int slice_total_blocks = 0;
@@ -5381,10 +5381,10 @@ extern "C" void run_kernel(
         wgmma_static_cache::ensure_sink_only(
             sink, Hq, Ns, sink_lse
         );
-        wgmma_slice_cache::ensure_slice_d128(
-            k, v, k_ranges, q_ranges,
+        wgmma_slice_cache::ensure_slice_d128_log2(
+            k, v, k_ranges, q_ranges, softmax_scale,
             S, Hkv, N,
-            ignored_k, packed_v,
+            packed_k_log2, packed_v,
             slice_offsets, slice_total_blocks
         );
 
@@ -5404,9 +5404,9 @@ extern "C" void run_kernel(
         );
 
         wgmma_fp8_qk::launch(
-            q8, qscale,
+            q, q8, qscale,
             q_ranges, k_ranges, attn_type_map,
-            packed_k8, packed_kscale, packed_v,
+            packed_k8, packed_kscale, packed_k_log2, packed_v,
             slice_offsets, slice_total_blocks,
             sink_lse, output,
             S, Hq, Hkv, N
