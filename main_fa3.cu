@@ -2454,11 +2454,10 @@ constexpr int BLOCK_ELEMS = 64 * 16;
 constexpr int QK_SLICES = 8;
 constexpr int PV_SLICES = 4;
 constexpr int KV_STAGE_ELEMS = QK_SLICES * BLOCK_ELEMS;
-constexpr int WG_TOKEN_M = 64 / G;   // 8 query tokens / consumer WG
-constexpr int TOKEN_M = 2 * WG_TOKEN_M; // 16 query tokens / CTA
+constexpr int TOKEN_M = 64 / G; // 8 query tokens / CTA
 constexpr float LOG2E = 1.4426950408889634f;
 
-__global__ __launch_bounds__(288, 1)
+__global__ __launch_bounds__(160, 1)
 void g8_partition_log2_fwd(
     const __nv_bfloat16* __restrict__ q,
     const int32_t* __restrict__ q_ranges,
@@ -2480,20 +2479,19 @@ void g8_partition_log2_fwd(
     __shared__ __align__(8) uint64_t empty_bar[2];
     __shared__ int meta[10];
 
-    // Two consumer WGs have private Q/P tiles; K/V stages are shared.
     __nv_bfloat16* q_s =
         reinterpret_cast<__nv_bfloat16*>(smem_raw);
     __nv_bfloat16* p_s =
-        q_s + 2 * QK_SLICES * BLOCK_ELEMS;
+        q_s + QK_SLICES * BLOCK_ELEMS;
     __nv_bfloat16* k_stage =
-        p_s + 2 * PV_SLICES * BLOCK_ELEMS;
+        p_s + PV_SLICES * BLOCK_ELEMS;
     __nv_bfloat16* v_stage =
         k_stage + 2 * KV_STAGE_ELEMS;
 
     const int tid = threadIdx.x;
-    const int wg = tid >> 7;  // wg0/wg1 consumers; wg2 contains producer warp
+    const int wg = tid >> 7;  // wg0 consumer; wg1 contains producer warp
     const int wtid = tid & 127;
-    const bool producer_lane0 = tid == 256;
+    const bool producer_lane0 = tid == 128;
     const int kvh = blockIdx.y;
 
     if (tid == 0) {
@@ -2574,9 +2572,8 @@ void g8_partition_log2_fwd(
     if (producer_lane0) {
         wgmma_fa3_exp::mbarrier_init_count(&full_bar[0], 1);
         wgmma_fa3_exp::mbarrier_init_count(&full_bar[1], 1);
-        // Both consumer WGs must finish reading a stage before refill.
-        wgmma_fa3_exp::mbarrier_init_count(&empty_bar[0], 2);
-        wgmma_fa3_exp::mbarrier_init_count(&empty_bar[1], 2);
+        wgmma_fa3_exp::mbarrier_init_count(&empty_bar[0], 1);
+        wgmma_fa3_exp::mbarrier_init_count(&empty_bar[1], 1);
     }
     __syncthreads();
 
@@ -2593,38 +2590,17 @@ void g8_partition_log2_fwd(
     const int kb_end = meta[9];
     const int block_count = kb_end - kb_begin;
 
-    // Each consumer stages its own 64 packed Q rows = 8 tokens x G8.
-    if (wg < 2) {
-        const int qbase = q0 + wg * WG_TOKEN_M;
-        __nv_bfloat16* my_q =
-            q_s + wg * QK_SLICES * BLOCK_ELEMS;
-
-#pragma unroll
-        for (int ds = 0; ds < QK_SLICES; ++ds) {
-            int prow, kvec;
-            canonical_vec_coord(wtid, prow, kvec);
-            const int tok = qbase + prow / G;
-            const int qh = kvh * G + (prow & 7);
-            const int d0 = ds * 16 + kvec * 8;
-
-            __nv_bfloat16* dst =
-                my_q + ds * BLOCK_ELEMS + wtid * 8;
-            if (tok < qe) {
-                const __nv_bfloat16* src =
-                    q + (int64_t(tok) * Hq + qh) * HD + d0;
-                *reinterpret_cast<uint4*>(dst) =
-                    *reinterpret_cast<const uint4*>(src);
-            } else {
-                *reinterpret_cast<uint4*>(dst) =
-                    make_uint4(0, 0, 0, 0);
-            }
-        }
+    if (wg == 0) {
+        wgmma_partition::stage_q<HD>(
+            q, q_s, q0, qe, kvh, Hq, G
+        );
         fence_proxy_async_shared();
     }
     __syncthreads();
 
-    // Hard role split: producer warp never reaches any WGMMA instruction.
-    if (wg >= 2) {
+    // Producer warp exits before the GMMA region, exactly like the #12
+    // role-split kernel that removed ptxas C7520.
+    if (wg >= 1) {
         if (producer_lane0 && block_count > 0) {
             const int slice_base = slice_block_offsets[sid];
             const __nv_bfloat16* pk =
@@ -2669,18 +2645,11 @@ void g8_partition_log2_fwd(
     wgmma_fa3_exp::zero32(out0);
     wgmma_fa3_exp::zero32(out1);
 
-    const int cwg = wg;
-    const int qbase = q0 + cwg * WG_TOKEN_M;
-    __nv_bfloat16* my_q =
-        q_s + cwg * QK_SLICES * BLOCK_ELEMS;
-    __nv_bfloat16* my_p =
-        p_s + cwg * PV_SLICES * BLOCK_ELEMS;
-
     const FragCoord fc = frag_coord();
     const int prow0 = fc.row0;
     const int prow1 = fc.row1;
-    const int qidx0 = qbase + prow0 / G;
-    const int qidx1 = qbase + prow1 / G;
+    const int qidx0 = q0 + prow0 / G;
+    const int qidx1 = q0 + prow1 / G;
     const int qh0 = kvh * G + (prow0 & 7);
     const int qh1 = kvh * G + (prow1 & 7);
 
@@ -2689,9 +2658,9 @@ void g8_partition_log2_fwd(
 
     // CTA-uniform visibility bounds.  Most scored tiles are fully visible:
     // only the first/last mask frontier needs elementwise checks.
-    const int tile_q_first = qbase;
+    const int tile_q_first = q0;
     const int tile_q_last =
-        ((qbase + WG_TOKEN_M) < qe ? (qbase + WG_TOKEN_M) : qe) - 1;
+        ((q0 + TOKEN_M) < qe ? (q0 + TOKEN_M) : qe) - 1;
     const int r_min_tile = tile_q_first - qs;
     const int r_max_tile = tile_q_last - qs;
     const int delta = (ke - ks) - (qe - qs);
@@ -2737,7 +2706,7 @@ void g8_partition_log2_fwd(
             mma_m64n64k16_bf16(
                 score,
                 make_kmajor_64x16_desc(
-                    my_q + ds * BLOCK_ELEMS),
+                    q_s + ds * BLOCK_ELEMS),
                 make_kmajor_64x16_desc(
                     my_k + ds * BLOCK_ELEMS)
             );
@@ -2838,16 +2807,16 @@ void g8_partition_log2_fwd(
             const int s0 = c0 >> 4, kc0 = c0 & 15;
             const int s1 = c1 >> 4, kc1 = c1 & 15;
 
-            my_p[s0 * BLOCK_ELEMS
+            p_s[s0 * BLOCK_ELEMS
                 + canonical_kmajor_offset(prow0, kc0)] =
                 __float2bfloat16_rn(p00);
-            my_p[s1 * BLOCK_ELEMS
+            p_s[s1 * BLOCK_ELEMS
                 + canonical_kmajor_offset(prow0, kc1)] =
                 __float2bfloat16_rn(p01);
-            my_p[s0 * BLOCK_ELEMS
+            p_s[s0 * BLOCK_ELEMS
                 + canonical_kmajor_offset(prow1, kc0)] =
                 __float2bfloat16_rn(p10);
-            my_p[s1 * BLOCK_ELEMS
+            p_s[s1 * BLOCK_ELEMS
                 + canonical_kmajor_offset(prow1, kc1)] =
                 __float2bfloat16_rn(p11);
         }
@@ -2861,7 +2830,7 @@ void g8_partition_log2_fwd(
         wgmma_fa3_exp::rescale32(out1, a0, a1);
 
         fence_proxy_async_shared();
-        wgmma_fa3_exp::warpgroup_barrier(wg);
+        wgmma_fa3_exp::warpgroup_barrier(0);
 
         fence();
 #pragma unroll
@@ -2869,7 +2838,7 @@ void g8_partition_log2_fwd(
             mma_m64n64k16_bf16(
                 out0,
                 make_kmajor_64x16_desc(
-                    my_p + ks16 * BLOCK_ELEMS),
+                    p_s + ks16 * BLOCK_ELEMS),
                 make_kmajor_64x16_desc(
                     my_v + ks16 * BLOCK_ELEMS)
             );
@@ -2879,7 +2848,7 @@ void g8_partition_log2_fwd(
             mma_m64n64k16_bf16(
                 out1,
                 make_kmajor_64x16_desc(
-                    my_p + ks16 * BLOCK_ELEMS),
+                    p_s + ks16 * BLOCK_ELEMS),
                 make_kmajor_64x16_desc(
                     my_v + (PV_SLICES + ks16) * BLOCK_ELEMS)
             );
@@ -2887,7 +2856,7 @@ void g8_partition_log2_fwd(
         commit_group();
         wait_group<0>();
 
-        wgmma_fa3_exp::warpgroup_barrier(wg);
+        wgmma_fa3_exp::warpgroup_barrier(0);
         if (wtid == 0) {
             wgmma_fa3_exp::mbarrier_arrive_release(
                 &empty_bar[stage]
@@ -2953,8 +2922,8 @@ inline void launch_g8_partition_log2(
     int NumSlices
 ) {
     constexpr int smem_bytes =
-        (2 * QK_SLICES * BLOCK_ELEMS
-       + 2 * PV_SLICES * BLOCK_ELEMS
+        (QK_SLICES * BLOCK_ELEMS
+       + PV_SLICES * BLOCK_ELEMS
        + 4 * KV_STAGE_ELEMS) * sizeof(__nv_bfloat16);
 
     static bool configured = false;
@@ -2971,7 +2940,7 @@ inline void launch_g8_partition_log2(
         (S + TOKEN_M - 1) / TOKEN_M + NumSlices;
 
     dim3 grid(grid_x, Hkv, 1);
-    g8_partition_log2_fwd<<<grid, 288, smem_bytes>>>(
+    g8_partition_log2_fwd<<<grid, 160, smem_bytes>>>(
         q,
         q_ranges, k_ranges, attn_type_map,
         packed_k, packed_v,
@@ -5392,7 +5361,7 @@ extern "C" void run_kernel(
 ) {
     static bool printed_build = false;
     if (!printed_build) {
-        fprintf(stderr, "BUILD CUDA_SM90A_G8_2WG_REUSE_V35\\n");
+        fprintf(stderr, "BUILD CUDA_SM90A_RESTORED_V36\\n");
         printed_build = true;
     }
 
