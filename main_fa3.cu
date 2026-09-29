@@ -4510,10 +4510,14 @@ void g4_overlap_async_fwd(
         const float tm1 = row4_max(local_max1);
         const float nm0 = fmaxf(m0, tm0);
         const float nm1 = fmaxf(m1, tm1);
+        const float a0_raw =
+            wgmma_sm90::ex2_approx(m0 - nm0);
+        const float a1_raw =
+            wgmma_sm90::ex2_approx(m1 - nm1);
         const float a0 =
-            (m0 == -CUDART_INF_F) ? 0.0f : wgmma_sm90::ex2_approx(m0 - nm0);
+            (m0 == -CUDART_INF_F) ? 0.0f : a0_raw;
         const float a1 =
-            (m1 == -CUDART_INF_F) ? 0.0f : wgmma_sm90::ex2_approx(m1 - nm1);
+            (m1 == -CUDART_INF_F) ? 0.0f : a1_raw;
 
         float sum0 = 0.0f, sum1 = 0.0f;
 
@@ -4538,25 +4542,22 @@ void g4_overlap_async_fwd(
                 ? (key_b < ke)
                 : (key_b < ke && key_b <= qidx1);
 
-            float p00 = 0.0f, p01 = 0.0f;
-            float p10 = 0.0f, p11 = 0.0f;
+            const float e00 =
+                wgmma_sm90::ex2_approx(score[4*g+0] - nm0);
+            const float e01 =
+                wgmma_sm90::ex2_approx(score[4*g+1] - nm0);
+            const float e10 =
+                wgmma_sm90::ex2_approx(score[4*g+2] - nm1);
+            const float e11 =
+                wgmma_sm90::ex2_approx(score[4*g+3] - nm1);
 
-            if (v00) {
-                p00 = wgmma_sm90::ex2_approx(score[4*g+0] - nm0);
-                sum0 += p00;
-            }
-            if (v01) {
-                p01 = wgmma_sm90::ex2_approx(score[4*g+1] - nm0);
-                sum0 += p01;
-            }
-            if (v10) {
-                p10 = wgmma_sm90::ex2_approx(score[4*g+2] - nm1);
-                sum1 += p10;
-            }
-            if (v11) {
-                p11 = wgmma_sm90::ex2_approx(score[4*g+3] - nm1);
-                sum1 += p11;
-            }
+            const float p00 = v00 ? e00 : 0.0f;
+            const float p01 = v01 ? e01 : 0.0f;
+            const float p10 = v10 ? e10 : 0.0f;
+            const float p11 = v11 ? e11 : 0.0f;
+
+            sum0 += p00 + p01;
+            sum1 += p10 + p11;
 
             const int s0 = c0 >> 4, kc0 = c0 & 15;
             const int s1 = c1 >> 4, kc1 = c1 & 15;
@@ -5279,10 +5280,14 @@ void d64_causal_async_fwd(
         const float tm1 = row4_max(local_max1);
         const float nm0 = fmaxf(m0, tm0);
         const float nm1 = fmaxf(m1, tm1);
+        const float a0_raw =
+            wgmma_sm90::ex2_approx(m0 - nm0);
+        const float a1_raw =
+            wgmma_sm90::ex2_approx(m1 - nm1);
         const float a0 =
-            (m0 == -CUDART_INF_F) ? 0.0f : wgmma_sm90::ex2_approx(m0 - nm0);
+            (m0 == -CUDART_INF_F) ? 0.0f : a0_raw;
         const float a1 =
-            (m1 == -CUDART_INF_F) ? 0.0f : wgmma_sm90::ex2_approx(m1 - nm1);
+            (m1 == -CUDART_INF_F) ? 0.0f : a1_raw;
 
         float sum0 = 0.0f, sum1 = 0.0f;
 
@@ -5293,25 +5298,31 @@ void d64_causal_async_fwd(
             const int ka = key0 + c0;
             const int kb = key0 + c1;
 
-            float p00 = 0.0f, p01 = 0.0f;
-            float p10 = 0.0f, p11 = 0.0f;
+            const bool v00 =
+                qidx0 < qe && ka < ke && ka <= qidx0;
+            const bool v01 =
+                qidx0 < qe && kb < ke && kb <= qidx0;
+            const bool v10 =
+                qidx1 < qe && ka < ke && ka <= qidx1;
+            const bool v11 =
+                qidx1 < qe && kb < ke && kb <= qidx1;
 
-            if (qidx0 < qe && ka < ke && ka <= qidx0) {
-                p00 = wgmma_sm90::ex2_approx(score[4*g+0] - nm0);
-                sum0 += p00;
-            }
-            if (qidx0 < qe && kb < ke && kb <= qidx0) {
-                p01 = wgmma_sm90::ex2_approx(score[4*g+1] - nm0);
-                sum0 += p01;
-            }
-            if (qidx1 < qe && ka < ke && ka <= qidx1) {
-                p10 = wgmma_sm90::ex2_approx(score[4*g+2] - nm1);
-                sum1 += p10;
-            }
-            if (qidx1 < qe && kb < ke && kb <= qidx1) {
-                p11 = wgmma_sm90::ex2_approx(score[4*g+3] - nm1);
-                sum1 += p11;
-            }
+            const float e00 =
+                wgmma_sm90::ex2_approx(score[4*g+0] - nm0);
+            const float e01 =
+                wgmma_sm90::ex2_approx(score[4*g+1] - nm0);
+            const float e10 =
+                wgmma_sm90::ex2_approx(score[4*g+2] - nm1);
+            const float e11 =
+                wgmma_sm90::ex2_approx(score[4*g+3] - nm1);
+
+            const float p00 = v00 ? e00 : 0.0f;
+            const float p01 = v01 ? e01 : 0.0f;
+            const float p10 = v10 ? e10 : 0.0f;
+            const float p11 = v11 ? e11 : 0.0f;
+
+            sum0 += p00 + p01;
+            sum1 += p10 + p11;
 
             const int s0 = c0 >> 4, kc0 = c0 & 15;
             const int s1 = c1 >> 4, kc1 = c1 & 15;
