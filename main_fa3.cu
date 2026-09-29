@@ -3156,8 +3156,8 @@ void g4_partition_async_fwd(
     const int prow1 = fc.row1;
     const int qidx0 = q0 + prow0 / G;
     const int qidx1 = q0 + prow1 / G;
-    const int qh0 = kvh * G + (prow0 & 7);
-    const int qh1 = kvh * G + (prow1 & 7);
+    const int qh0 = kvh * G + (prow0 & 3);
+    const int qh1 = kvh * G + (prow1 & 3);
 
     float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F;
     float l0 = 0.0f, l1 = 0.0f;
