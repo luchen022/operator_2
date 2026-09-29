@@ -2372,10 +2372,6 @@ void g128_fa3_pipeline_fwd(
                         my_v + ks * BLOCK_ELEMS)
                 );
             }
-            commit_group();
-            wait_group<0>();
-
-            fence();
 #pragma unroll
             for (int ks = 0; ks < PV_SLICES; ++ks) {
                 mma_m64n64k16_bf16(
@@ -2486,7 +2482,7 @@ extern "C" void run_kernel(
 ) {
     static bool printed_build = false;
     if (!printed_build) {
-        fprintf(stderr, "BUILD CUDA_SM90A_FA3_EXP_V1\\n");
+        fprintf(stderr, "BUILD CUDA_SM90A_FA3_EXP_V2\\n");
         printed_build = true;
     }
 
