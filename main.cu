@@ -1424,6 +1424,463 @@ inline void launch_partition_wgmma(
 } // namespace wgmma_partition
 
 
+
+namespace wgmma_partition_g8x2 {
+
+using namespace wgmma_sm90;
+
+constexpr int G8 = 8;
+constexpr int M = 64;
+constexpr int N = 64;
+constexpr int BLOCK_ELEMS = 64 * 16;
+constexpr int QK_SLICES = 8;
+constexpr int PV_SLICES = 4;
+constexpr int TOKEN_M = 16;  // 128 packed rows / G8
+
+__device__ __forceinline__ void zero32(float (&x)[32]) {
+#pragma unroll
+    for (int i = 0; i < 32; ++i) x[i] = 0.0f;
+}
+
+__device__ __forceinline__ void rescale32(
+    float (&x)[32], float a0, float a1
+) {
+#pragma unroll
+    for (int g = 0; g < 8; ++g) {
+        x[4*g+0] *= a0;
+        x[4*g+1] *= a0;
+        x[4*g+2] *= a1;
+        x[4*g+3] *= a1;
+    }
+}
+
+__device__ __forceinline__ void local_vec_coord(
+    int vec_id, int& row, int& kvec
+) {
+    const int group = vec_id >> 4;
+    const int in_group = vec_id & 15;
+    row = group * 8 + (in_group & 7);
+    kvec = in_group >> 3;
+}
+
+__global__ __launch_bounds__(256, 1)
+void partition_g8x2_wgmma_fwd(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v,
+    const int32_t* __restrict__ q_ranges,
+    const int32_t* __restrict__ k_ranges,
+    const int32_t* __restrict__ attn_type_map,
+    const __nv_bfloat16* __restrict__ packed_k,
+    const __nv_bfloat16* __restrict__ packed_v,
+    const float* __restrict__ sink_lse,
+    __nv_bfloat16* __restrict__ out,
+    float softmax_scale,
+    int S,
+    int Hq,
+    int Hkv,
+    int NumSlices
+) {
+    extern __shared__ __align__(128) unsigned char smem_raw[];
+    __nv_bfloat16* q_s = reinterpret_cast<__nv_bfloat16*>(smem_raw);
+    __nv_bfloat16* p_s = q_s + 2 * QK_SLICES * BLOCK_ELEMS;
+    __nv_bfloat16* kv_s = p_s + 2 * PV_SLICES * BLOCK_ELEMS;
+
+    __shared__ int meta[7];
+
+    const int wg = threadIdx.x >> 7;
+    const int wtid = threadIdx.x & 127;
+    const int kvh = blockIdx.y;
+
+    if (threadIdx.x == 0) {
+        const int pid = blockIdx.x;
+        int prefix = 0;
+        int hit = 0;
+        int q0 = 0, qe = 0, qs = 0, ks = 0, ke = 0, typ = 0;
+
+        for (int s = 0; s < NumSlices; ++s) {
+            const int sqs = q_ranges[2*s + 0];
+            const int sqe = q_ranges[2*s + 1];
+            const int sks = k_ranges[2*s + 0];
+            const int ske = k_ranges[2*s + 1];
+            const int st = attn_type_map[s];
+            const int nt = (sqe - sqs + TOKEN_M - 1) / TOKEN_M;
+
+            if (!hit && pid >= prefix && pid < prefix + nt) {
+                q0 = sqs + (pid - prefix) * TOKEN_M;
+                qe = sqe;
+                qs = sqs;
+                ks = sks;
+                ke = ske;
+                typ = st;
+                hit = 1;
+            }
+            prefix += nt;
+        }
+
+        meta[0] = hit;
+        meta[1] = q0;
+        meta[2] = qe;
+        meta[3] = qs;
+        meta[4] = ks;
+        meta[5] = ke;
+        meta[6] = typ;
+    }
+    __syncthreads();
+
+    if (!meta[0]) return;
+
+    const int q0 = meta[1];
+    const int qe = meta[2];
+    const int qs = meta[3];
+    const int ks = meta[4];
+    const int ke = meta[5];
+    const int typ = meta[6];
+
+    __nv_bfloat16* my_q = q_s + wg * QK_SLICES * BLOCK_ELEMS;
+    __nv_bfloat16* my_p = p_s + wg * PV_SLICES * BLOCK_ELEMS;
+
+    // Each warpgroup stages 64 packed rows = 8 tokens x 8 Q heads.
+#pragma unroll
+    for (int ds = 0; ds < QK_SLICES; ++ds) {
+        int prow, kvec;
+        local_vec_coord(wtid, prow, kvec);
+
+        const int packed_row = wg * 64 + prow;
+        const int tok = q0 + packed_row / G8;
+        const int qh = kvh * G8 + (packed_row & 7);
+        const int d0 = ds * 16 + kvec * 8;
+
+        __nv_bfloat16* dst =
+            my_q + ds * BLOCK_ELEMS + wtid * 8;
+
+        if (tok < qe) {
+            const __nv_bfloat16* srcq =
+                q + (int64_t(tok) * Hq + qh) * 128 + d0;
+            *reinterpret_cast<uint4*>(dst) =
+                *reinterpret_cast<const uint4*>(srcq);
+        } else {
+            *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+        }
+    }
+
+    fence_proxy_async_shared();
+    __syncthreads();
+
+    float out0[32], out1[32];
+    zero32(out0);
+    zero32(out1);
+
+    const FragCoord fc = frag_coord();
+    const int packed0 = wg * 64 + fc.row0;
+    const int packed1 = wg * 64 + fc.row1;
+
+    const int qidx0 = q0 + packed0 / G8;
+    const int qidx1 = q0 + packed1 / G8;
+    const int qh0 = kvh * G8 + (packed0 & 7);
+    const int qh1 = kvh * G8 + (packed1 & 7);
+
+    float m0 = -CUDART_INF_F;
+    float m1 = -CUDART_INF_F;
+    float l0 = 0.0f;
+    float l1 = 0.0f;
+
+    const int k_blocks = (ke - ks + N - 1) / N;
+    int kb_begin = 0;
+    int kb_end = k_blocks;
+
+    const int q_first = (q0 > qs) ? q0 : qs;
+    const int q_clip_end = ((q0 + TOKEN_M) < qe) ? (q0 + TOKEN_M) : qe;
+    const int q_last = q_clip_end - 1;
+
+    if (q_first > q_last) {
+        kb_end = 0;
+    } else {
+        const int Lq = qe - qs;
+        const int Lk = ke - ks;
+
+        if (typ == 2 || typ == 3) {
+            const int r_min = q_first - qs;
+            kb_begin = r_min / N;
+            if (kb_begin < 0) kb_begin = 0;
+            if (kb_begin > k_blocks) kb_begin = k_blocks;
+        }
+
+        if (typ == 1 || typ == 3) {
+            const int r_max = q_last - qs;
+            const int max_u = r_max + (Lk - Lq);
+            if (max_u < 0) {
+                kb_end = 0;
+            } else {
+                kb_end = (max_u + 1 + N - 1) / N;
+                if (kb_end > k_blocks) kb_end = k_blocks;
+            }
+        }
+
+        if (kb_begin > kb_end) kb_begin = kb_end;
+    }
+
+    for (int kb = kb_begin; kb < kb_end; ++kb) {
+        const int key0 = ks + kb * N;
+
+        // Stage K once for both warpgroups.
+        if (wg == 0) {
+            if (packed_k != nullptr && ((key0 & 63) == 0)) {
+                wgmma_partition::stage_k_packed_d128(
+                    packed_k, kv_s, key0, kvh, S
+                );
+            } else {
+                wgmma_partition::stage_k<128>(
+                    k, kv_s, key0, ke, kvh, Hkv
+                );
+            }
+        }
+
+        fence_proxy_async_shared();
+        __syncthreads();
+
+        float score[32];
+        zero32(score);
+
+        fence();
+#pragma unroll
+        for (int ds = 0; ds < QK_SLICES; ++ds) {
+            mma_m64n64k16_bf16(
+                score,
+                make_kmajor_64x16_desc(my_q + ds * BLOCK_ELEMS),
+                make_kmajor_64x16_desc(kv_s + ds * BLOCK_ELEMS)
+            );
+        }
+        commit_group();
+        wait_group<0>();
+
+        float local_max0 = -CUDART_INF_F;
+        float local_max1 = -CUDART_INF_F;
+
+#pragma unroll
+        for (int g = 0; g < 8; ++g) {
+            const int c0 = frag_col(g, 0);
+            const int c1 = frag_col(g, 1);
+
+            if (wgmma_partition::mask_visible(
+                    typ, qidx0, key0 + c0, qs, qe, ks, ke))
+                local_max0 = fmaxf(
+                    local_max0, score[4*g+0] * softmax_scale);
+            if (wgmma_partition::mask_visible(
+                    typ, qidx0, key0 + c1, qs, qe, ks, ke))
+                local_max0 = fmaxf(
+                    local_max0, score[4*g+1] * softmax_scale);
+            if (wgmma_partition::mask_visible(
+                    typ, qidx1, key0 + c0, qs, qe, ks, ke))
+                local_max1 = fmaxf(
+                    local_max1, score[4*g+2] * softmax_scale);
+            if (wgmma_partition::mask_visible(
+                    typ, qidx1, key0 + c1, qs, qe, ks, ke))
+                local_max1 = fmaxf(
+                    local_max1, score[4*g+3] * softmax_scale);
+        }
+
+        const float tm0 = row4_max(local_max0);
+        const float tm1 = row4_max(local_max1);
+        const float nm0 = fmaxf(m0, tm0);
+        const float nm1 = fmaxf(m1, tm1);
+
+        const float a0 =
+            (m0 == -CUDART_INF_F) ? 0.0f : __expf(m0 - nm0);
+        const float a1 =
+            (m1 == -CUDART_INF_F) ? 0.0f : __expf(m1 - nm1);
+
+        float sum0 = 0.0f;
+        float sum1 = 0.0f;
+
+#pragma unroll
+        for (int g = 0; g < 8; ++g) {
+            const int c0 = frag_col(g, 0);
+            const int c1 = frag_col(g, 1);
+
+            float p00 = 0.0f, p01 = 0.0f, p10 = 0.0f, p11 = 0.0f;
+
+            if (wgmma_partition::mask_visible(
+                    typ, qidx0, key0 + c0, qs, qe, ks, ke)) {
+                p00 = __expf(score[4*g+0] * softmax_scale - nm0);
+                sum0 += p00;
+            }
+            if (wgmma_partition::mask_visible(
+                    typ, qidx0, key0 + c1, qs, qe, ks, ke)) {
+                p01 = __expf(score[4*g+1] * softmax_scale - nm0);
+                sum0 += p01;
+            }
+            if (wgmma_partition::mask_visible(
+                    typ, qidx1, key0 + c0, qs, qe, ks, ke)) {
+                p10 = __expf(score[4*g+2] * softmax_scale - nm1);
+                sum1 += p10;
+            }
+            if (wgmma_partition::mask_visible(
+                    typ, qidx1, key0 + c1, qs, qe, ks, ke)) {
+                p11 = __expf(score[4*g+3] * softmax_scale - nm1);
+                sum1 += p11;
+            }
+
+            const int s0 = c0 >> 4;
+            const int s1 = c1 >> 4;
+            const int kc0 = c0 & 15;
+            const int kc1 = c1 & 15;
+
+            my_p[s0 * BLOCK_ELEMS
+                 + canonical_kmajor_offset(fc.row0, kc0)] =
+                __float2bfloat16_rn(p00);
+            my_p[s1 * BLOCK_ELEMS
+                 + canonical_kmajor_offset(fc.row0, kc1)] =
+                __float2bfloat16_rn(p01);
+            my_p[s0 * BLOCK_ELEMS
+                 + canonical_kmajor_offset(fc.row1, kc0)] =
+                __float2bfloat16_rn(p10);
+            my_p[s1 * BLOCK_ELEMS
+                 + canonical_kmajor_offset(fc.row1, kc1)] =
+                __float2bfloat16_rn(p11);
+        }
+
+        l0 = l0 * a0 + row4_sum(sum0);
+        l1 = l1 * a1 + row4_sum(sum1);
+        m0 = nm0;
+        m1 = nm1;
+
+        rescale32(out0, a0, a1);
+        rescale32(out1, a0, a1);
+
+        fence_proxy_async_shared();
+        __syncthreads();
+
+        // Stage V^T once for both warpgroups.
+        if (wg == 0) {
+            if (packed_v != nullptr && ((key0 & 63) == 0)) {
+                wgmma_partition::stage_v_packed_d128(
+                    packed_v, kv_s, key0, kvh, S
+                );
+            } else {
+                wgmma_partition::stage_vt<128>(
+                    v, kv_s, key0, ke, kvh, Hkv
+                );
+            }
+        }
+
+        fence_proxy_async_shared();
+        __syncthreads();
+
+        fence();
+#pragma unroll
+        for (int ks16 = 0; ks16 < PV_SLICES; ++ks16) {
+            mma_m64n64k16_bf16(
+                out0,
+                make_kmajor_64x16_desc(my_p + ks16 * BLOCK_ELEMS),
+                make_kmajor_64x16_desc(kv_s + ks16 * BLOCK_ELEMS)
+            );
+        }
+        commit_group();
+        wait_group<0>();
+
+        fence();
+#pragma unroll
+        for (int ks16 = 0; ks16 < PV_SLICES; ++ks16) {
+            mma_m64n64k16_bf16(
+                out1,
+                make_kmajor_64x16_desc(my_p + ks16 * BLOCK_ELEMS),
+                make_kmajor_64x16_desc(
+                    kv_s + (PV_SLICES + ks16) * BLOCK_ELEMS)
+            );
+        }
+        commit_group();
+        wait_group<0>();
+
+        __syncthreads();
+    }
+
+    if (qidx0 < qe) {
+        const float denom0 = l0 + __expf(sink_lse[qh0] - m0);
+        const float inv0 = 1.0f / denom0;
+
+#pragma unroll
+        for (int g = 0; g < 8; ++g) {
+            const int c0 = frag_col(g, 0);
+            const int c1 = frag_col(g, 1);
+            out[(int64_t(qidx0) * Hq + qh0) * 128 + c0] =
+                __float2bfloat16_rn(out0[4*g+0] * inv0);
+            out[(int64_t(qidx0) * Hq + qh0) * 128 + c1] =
+                __float2bfloat16_rn(out0[4*g+1] * inv0);
+            out[(int64_t(qidx0) * Hq + qh0) * 128 + 64 + c0] =
+                __float2bfloat16_rn(out1[4*g+0] * inv0);
+            out[(int64_t(qidx0) * Hq + qh0) * 128 + 64 + c1] =
+                __float2bfloat16_rn(out1[4*g+1] * inv0);
+        }
+    }
+
+    if (qidx1 < qe) {
+        const float denom1 = l1 + __expf(sink_lse[qh1] - m1);
+        const float inv1 = 1.0f / denom1;
+
+#pragma unroll
+        for (int g = 0; g < 8; ++g) {
+            const int c0 = frag_col(g, 0);
+            const int c1 = frag_col(g, 1);
+            out[(int64_t(qidx1) * Hq + qh1) * 128 + c0] =
+                __float2bfloat16_rn(out0[4*g+2] * inv1);
+            out[(int64_t(qidx1) * Hq + qh1) * 128 + c1] =
+                __float2bfloat16_rn(out0[4*g+3] * inv1);
+            out[(int64_t(qidx1) * Hq + qh1) * 128 + 64 + c0] =
+                __float2bfloat16_rn(out1[4*g+2] * inv1);
+            out[(int64_t(qidx1) * Hq + qh1) * 128 + 64 + c1] =
+                __float2bfloat16_rn(out1[4*g+3] * inv1);
+        }
+    }
+}
+
+inline void launch_partition_g8x2(
+    const __nv_bfloat16* q,
+    const __nv_bfloat16* k,
+    const __nv_bfloat16* v,
+    const int32_t* q_ranges,
+    const int32_t* k_ranges,
+    const int32_t* attn_type_map,
+    const __nv_bfloat16* packed_k,
+    const __nv_bfloat16* packed_v,
+    const float* sink_lse,
+    __nv_bfloat16* out,
+    float softmax_scale,
+    int S,
+    int Hq,
+    int Hkv,
+    int NumSlices
+) {
+    constexpr int smem_bytes =
+        (2 * QK_SLICES * BLOCK_ELEMS
+       + 2 * PV_SLICES * BLOCK_ELEMS
+       +     QK_SLICES * BLOCK_ELEMS) * sizeof(__nv_bfloat16);
+
+    static bool configured = false;
+    if (!configured) {
+        cudaFuncSetAttribute(
+            partition_g8x2_wgmma_fwd,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            smem_bytes
+        );
+        configured = true;
+    }
+
+    const int grid_x = (S + TOKEN_M - 1) / TOKEN_M + NumSlices;
+    dim3 grid(grid_x, Hkv, 1);
+
+    partition_g8x2_wgmma_fwd<<<grid, 256, smem_bytes>>>(
+        q, k, v,
+        q_ranges, k_ranges, attn_type_map,
+        packed_k, packed_v, sink_lse,
+        out, softmax_scale,
+        S, Hq, Hkv, NumSlices
+    );
+}
+
+} // namespace wgmma_partition_g8x2
+
+
 namespace wgmma_g128 {
 
 using namespace wgmma_sm90;
@@ -1737,7 +2194,7 @@ extern "C" void run_kernel(
 ) {
     static bool printed_build = false;
     if (!printed_build) {
-        fprintf(stderr, "BUILD CUDA_SM90A_WGMMA_MASK_FRONTIER_V5\\n");
+        fprintf(stderr, "BUILD CUDA_SM90A_WGMMA_G8X2_V6\\n");
         printed_build = true;
     }
 
@@ -1858,6 +2315,26 @@ extern "C" void run_kernel(
     }
 
     // #2 / #3 / #6 / #8 / #11.
+    if (D == 128 && N > 1 && Hq / Hkv == 8) {
+        const __nv_bfloat16* packed_k = nullptr;
+        const __nv_bfloat16* packed_v = nullptr;
+        const float* sink_lse = nullptr;
+        wgmma_static_cache::ensure_d128(
+            k, v, sink, q_ranges,
+            S, Hq, Hkv, Ns,
+            packed_k, packed_v, sink_lse
+        );
+        wgmma_partition_g8x2::launch_partition_g8x2(
+            q, k, v,
+            q_ranges, k_ranges, attn_type_map,
+            packed_k, packed_v, sink_lse,
+            output, softmax_scale,
+            S, Hq, Hkv, N
+        );
+        return;
+    }
+
+    // Remaining multi-slice D128 cases (currently #8).
     const __nv_bfloat16* packed_k = nullptr;
     const __nv_bfloat16* packed_v = nullptr;
     const float* sink_lse = nullptr;
