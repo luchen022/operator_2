@@ -1393,16 +1393,18 @@ void quantize_q_e4m3_rows(
         fmaxf(fabsf(x2), fabsf(x3))
     );
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
+    for (int off = 8; off > 0; off >>= 1) {
         amax = fmaxf(
             amax,
             __shfl_xor_sync(0xffffffffu, amax, off)
         );
     }
 
+    const int sg = lane >> 4;
     const float scale = fmaxf(amax / FP8_MAX, 1.0e-8f);
     const float inv = 1.0f / scale;
-    if (lane == 0) qscale[row] = scale;
+    if ((lane & 15) == 0)
+        qscale[int64_t(row) * 2 + sg] = scale;
 
     uint16_t p0 = cvt_e4m3x2(x0 * inv, x1 * inv);
     uint16_t p1 = cvt_e4m3x2(x2 * inv, x3 * inv);
@@ -1430,7 +1432,7 @@ inline void quantize_q(
         );
         cudaMalloc(
             reinterpret_cast<void**>(&h_qscale),
-            rows * sizeof(float)
+            rows * 2 * sizeof(float)
         );
         h_q_rows_cap = rows;
     }
@@ -1494,7 +1496,7 @@ void pack_slice_k_e4m3(
         fmaxf(fabsf(x2), fabsf(x3))
     );
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
+    for (int off = 8; off > 0; off >>= 1) {
         amax = fmaxf(
             amax,
             __shfl_xor_sync(0xffffffffu, amax, off)
@@ -1506,9 +1508,10 @@ void pack_slice_k_e4m3(
         : 1.0f;
     const float inv = valid ? (1.0f / scale) : 0.0f;
 
-    if (lane == 0) {
+    const int sg = lane >> 4;
+    if ((lane & 15) == 0) {
         packed_scale_log2[
-            (int64_t(kvh) * total_blocks + flat) * 64 + row
+            ((int64_t(kvh) * total_blocks + flat) * 64 + row) * 2 + sg
         ] = valid ? (scale * factor) : 0.0f;
     }
 
@@ -1548,7 +1551,7 @@ inline void ensure_slice_k8(
     const size_t bytes =
         size_t(total_blocks) * size_t(Hkv) * K8_BLOCK_BYTES;
     const size_t scales =
-        size_t(total_blocks) * size_t(Hkv) * 64;
+        size_t(total_blocks) * size_t(Hkv) * 64 * 2;
 
     if (h_k8_bytes_cap < bytes) {
         if (h_k8) cudaFree(h_k8);
@@ -4380,12 +4383,12 @@ constexpr int Q8_BYTES = 8192;
 constexpr int P_BYTES = PV_SLICES * P_BLOCK_ELEMS * 2;
 constexpr int K8_DOUBLE_BYTES = 2 * K8_BLOCK_BYTES;
 constexpr int V_DOUBLE_BYTES = 2 * V_BLOCK_ELEMS * 2;
-constexpr int SCALE_DOUBLE_BYTES = 2 * 64 * 4;
+constexpr int SCALE_DOUBLE_BYTES = 2 * 128 * 4;
 constexpr int SMEM_BYTES =
     Q8_BYTES + P_BYTES + K8_DOUBLE_BYTES
     + V_DOUBLE_BYTES + SCALE_DOUBLE_BYTES;
 constexpr int TX_BYTES =
-    K8_BLOCK_BYTES + V_BLOCK_ELEMS * 2 + 64 * 4;
+    K8_BLOCK_BYTES + V_BLOCK_ELEMS * 2 + 128 * 4;
 constexpr float LOG2E = 1.4426950408889634f;
 
 __device__ __forceinline__ void stage_q8(
@@ -4453,9 +4456,9 @@ __device__ __forceinline__ void issue_stage(
         bar + stage
     );
     wgmma_fa3_exp::cp_async_bulk_g2s(
-        scale_stage + stage * 64,
-        packed_kscale + int64_t(kb) * 64,
-        64 * sizeof(float),
+        scale_stage + stage * 128,
+        packed_kscale + int64_t(kb) * 128,
+        128 * sizeof(float),
         bar + stage
     );
 }
@@ -4627,7 +4630,7 @@ void partition_fp8_qk_fwd(
             const float* ps =
                 packed_kscale
                 + (int64_t(kvh) * slice_total_blocks + slice_base)
-                  * 64;
+                  * 128;
 
             issue_stage(
                 kb_begin, 0, pk, pv, ps,
@@ -4720,7 +4723,7 @@ void partition_fp8_qk_fwd(
         __nv_bfloat16* my_v =
             v_stage + stage * V_BLOCK_ELEMS;
         float* my_ks =
-            scale_stage + stage * 64;
+            scale_stage + stage * 128;
 
         float score[32];
         wgmma_fa3_exp::zero32(score);
