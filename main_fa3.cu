@@ -3554,10 +3554,14 @@ void g8_partition_log2_fwd(
         const float tm1 = row4_max(local_max1);
         const float nm0 = fmaxf(m0, tm0);
         const float nm1 = fmaxf(m1, tm1);
+        const float a0_raw =
+            wgmma_sm90::ex2_approx(m0 - nm0);
+        const float a1_raw =
+            wgmma_sm90::ex2_approx(m1 - nm1);
         const float a0 =
-            (m0 == -CUDART_INF_F) ? 0.0f : wgmma_sm90::ex2_approx(m0 - nm0);
+            (m0 == -CUDART_INF_F) ? 0.0f : a0_raw;
         const float a1 =
-            (m1 == -CUDART_INF_F) ? 0.0f : wgmma_sm90::ex2_approx(m1 - nm1);
+            (m1 == -CUDART_INF_F) ? 0.0f : a1_raw;
 
         float sum0 = 0.0f, sum1 = 0.0f;
 
@@ -3566,46 +3570,38 @@ void g8_partition_log2_fwd(
             const int c0 = frag_col(g, 0);
             const int c1 = frag_col(g, 1);
 
-            float p00 = 0.0f, p01 = 0.0f;
-            float p10 = 0.0f, p11 = 0.0f;
+            const float e00 =
+                wgmma_sm90::ex2_approx(score[4*g+0] - nm0);
+            const float e01 =
+                wgmma_sm90::ex2_approx(score[4*g+1] - nm0);
+            const float e10 =
+                wgmma_sm90::ex2_approx(score[4*g+2] - nm1);
+            const float e11 =
+                wgmma_sm90::ex2_approx(score[4*g+3] - nm1);
 
+            float p00, p01, p10, p11;
             if (full_block) {
-                p00 = wgmma_sm90::ex2_approx(
-                    score[4*g+0] - nm0);
-                p01 = wgmma_sm90::ex2_approx(
-                    score[4*g+1] - nm0);
-                p10 = wgmma_sm90::ex2_approx(
-                    score[4*g+2] - nm1);
-                p11 = wgmma_sm90::ex2_approx(
-                    score[4*g+3] - nm1);
-                sum0 += p00 + p01;
-                sum1 += p10 + p11;
+                p00 = e00;
+                p01 = e01;
+                p10 = e10;
+                p11 = e11;
             } else {
-                if (wgmma_partition::mask_visible(
-                        typ, qidx0, key0+c0, qs, qe, ks, ke)) {
-                    p00 = wgmma_sm90::ex2_approx(
-                        score[4*g+0] - nm0);
-                    sum0 += p00;
-                }
-                if (wgmma_partition::mask_visible(
-                        typ, qidx0, key0+c1, qs, qe, ks, ke)) {
-                    p01 = wgmma_sm90::ex2_approx(
-                        score[4*g+1] - nm0);
-                    sum0 += p01;
-                }
-                if (wgmma_partition::mask_visible(
-                        typ, qidx1, key0+c0, qs, qe, ks, ke)) {
-                    p10 = wgmma_sm90::ex2_approx(
-                        score[4*g+2] - nm1);
-                    sum1 += p10;
-                }
-                if (wgmma_partition::mask_visible(
-                        typ, qidx1, key0+c1, qs, qe, ks, ke)) {
-                    p11 = wgmma_sm90::ex2_approx(
-                        score[4*g+3] - nm1);
-                    sum1 += p11;
-                }
+                const bool v00 = wgmma_partition::mask_visible(
+                    typ, qidx0, key0+c0, qs, qe, ks, ke);
+                const bool v01 = wgmma_partition::mask_visible(
+                    typ, qidx0, key0+c1, qs, qe, ks, ke);
+                const bool v10 = wgmma_partition::mask_visible(
+                    typ, qidx1, key0+c0, qs, qe, ks, ke);
+                const bool v11 = wgmma_partition::mask_visible(
+                    typ, qidx1, key0+c1, qs, qe, ks, ke);
+                p00 = v00 ? e00 : 0.0f;
+                p01 = v01 ? e01 : 0.0f;
+                p10 = v10 ? e10 : 0.0f;
+                p11 = v11 ? e11 : 0.0f;
             }
+
+            sum0 += p00 + p01;
+            sum1 += p10 + p11;
 
             const int s0 = c0 >> 4, kc0 = c0 & 15;
             const int s1 = c1 >> 4, kc1 = c1 & 15;
@@ -4038,10 +4034,14 @@ void g4_partition_async_fwd(
         const float tm1 = row4_max(local_max1);
         const float nm0 = fmaxf(m0, tm0);
         const float nm1 = fmaxf(m1, tm1);
+        const float a0_raw =
+            wgmma_sm90::ex2_approx(m0 - nm0);
+        const float a1_raw =
+            wgmma_sm90::ex2_approx(m1 - nm1);
         const float a0 =
-            (m0 == -CUDART_INF_F) ? 0.0f : wgmma_sm90::ex2_approx(m0 - nm0);
+            (m0 == -CUDART_INF_F) ? 0.0f : a0_raw;
         const float a1 =
-            (m1 == -CUDART_INF_F) ? 0.0f : wgmma_sm90::ex2_approx(m1 - nm1);
+            (m1 == -CUDART_INF_F) ? 0.0f : a1_raw;
 
         float sum0 = 0.0f, sum1 = 0.0f;
 
@@ -4050,38 +4050,24 @@ void g4_partition_async_fwd(
             const int c0 = frag_col(g, 0);
             const int c1 = frag_col(g, 1);
 
-            float p00 = 0.0f, p01 = 0.0f;
-            float p10 = 0.0f, p11 = 0.0f;
+            const float e00 =
+                wgmma_sm90::ex2_approx(score[4*g+0] - nm0);
+            const float e01 =
+                wgmma_sm90::ex2_approx(score[4*g+1] - nm0);
+            const float e10 =
+                wgmma_sm90::ex2_approx(score[4*g+2] - nm1);
+            const float e11 =
+                wgmma_sm90::ex2_approx(score[4*g+3] - nm1);
 
-            if (full_block) {
-                p00 = wgmma_sm90::ex2_approx(
-                    score[4*g+0] - nm0);
-                p01 = wgmma_sm90::ex2_approx(
-                    score[4*g+1] - nm0);
-                p10 = wgmma_sm90::ex2_approx(
-                    score[4*g+2] - nm1);
-                p11 = wgmma_sm90::ex2_approx(
-                    score[4*g+3] - nm1);
-                sum0 += p00 + p01;
-                sum1 += p10 + p11;
-            } else {
-                if (key0 + c0 < ke) {
-                    p00 = wgmma_sm90::ex2_approx(
-                        score[4*g+0] - nm0);
-                    p10 = wgmma_sm90::ex2_approx(
-                        score[4*g+2] - nm1);
-                    sum0 += p00;
-                    sum1 += p10;
-                }
-                if (key0 + c1 < ke) {
-                    p01 = wgmma_sm90::ex2_approx(
-                        score[4*g+1] - nm0);
-                    p11 = wgmma_sm90::ex2_approx(
-                        score[4*g+3] - nm1);
-                    sum0 += p01;
-                    sum1 += p11;
-                }
-            }
+            const bool v0 = full_block || (key0 + c0 < ke);
+            const bool v1 = full_block || (key0 + c1 < ke);
+            const float p00 = v0 ? e00 : 0.0f;
+            const float p01 = v1 ? e01 : 0.0f;
+            const float p10 = v0 ? e10 : 0.0f;
+            const float p11 = v1 ? e11 : 0.0f;
+
+            sum0 += p00 + p01;
+            sum1 += p10 + p11;
 
             const int s0 = c0 >> 4, kc0 = c0 & 15;
             const int s1 = c1 >> 4, kc1 = c1 & 15;
@@ -5998,10 +5984,14 @@ void dense_g4_causal_log2_fwd(
         const float tm1 = row4_max(local_max1);
         const float nm0 = fmaxf(m0, tm0);
         const float nm1 = fmaxf(m1, tm1);
+        const float a0_raw =
+            wgmma_sm90::ex2_approx(m0 - nm0);
+        const float a1_raw =
+            wgmma_sm90::ex2_approx(m1 - nm1);
         const float a0 =
-            (m0 == -CUDART_INF_F) ? 0.0f : wgmma_sm90::ex2_approx(m0 - nm0);
+            (m0 == -CUDART_INF_F) ? 0.0f : a0_raw;
         const float a1 =
-            (m1 == -CUDART_INF_F) ? 0.0f : wgmma_sm90::ex2_approx(m1 - nm1);
+            (m1 == -CUDART_INF_F) ? 0.0f : a1_raw;
 
         float sum0 = 0.0f, sum1 = 0.0f;
 
@@ -6010,42 +6000,27 @@ void dense_g4_causal_log2_fwd(
             const int c0 = frag_col(g, 0);
             const int c1 = frag_col(g, 1);
 
-            float p00 = 0.0f, p01 = 0.0f;
-            float p10 = 0.0f, p11 = 0.0f;
+            const float e00 =
+                wgmma_sm90::ex2_approx(score[4*g+0] - nm0);
+            const float e01 =
+                wgmma_sm90::ex2_approx(score[4*g+1] - nm0);
+            const float e10 =
+                wgmma_sm90::ex2_approx(score[4*g+2] - nm1);
+            const float e11 =
+                wgmma_sm90::ex2_approx(score[4*g+3] - nm1);
 
-            if (full_block) {
-                p00 = wgmma_sm90::ex2_approx(
-                    score[4*g+0] - nm0);
-                p01 = wgmma_sm90::ex2_approx(
-                    score[4*g+1] - nm0);
-                p10 = wgmma_sm90::ex2_approx(
-                    score[4*g+2] - nm1);
-                p11 = wgmma_sm90::ex2_approx(
-                    score[4*g+3] - nm1);
-                sum0 += p00 + p01;
-                sum1 += p10 + p11;
-            } else {
-                if (key0 + c0 <= qidx0) {
-                    p00 = wgmma_sm90::ex2_approx(
-                        score[4*g+0] - nm0);
-                    sum0 += p00;
-                }
-                if (key0 + c1 <= qidx0) {
-                    p01 = wgmma_sm90::ex2_approx(
-                        score[4*g+1] - nm0);
-                    sum0 += p01;
-                }
-                if (key0 + c0 <= qidx1) {
-                    p10 = wgmma_sm90::ex2_approx(
-                        score[4*g+2] - nm1);
-                    sum1 += p10;
-                }
-                if (key0 + c1 <= qidx1) {
-                    p11 = wgmma_sm90::ex2_approx(
-                        score[4*g+3] - nm1);
-                    sum1 += p11;
-                }
-            }
+            const bool v00 = full_block || (key0 + c0 <= qidx0);
+            const bool v01 = full_block || (key0 + c1 <= qidx0);
+            const bool v10 = full_block || (key0 + c0 <= qidx1);
+            const bool v11 = full_block || (key0 + c1 <= qidx1);
+
+            const float p00 = v00 ? e00 : 0.0f;
+            const float p01 = v01 ? e01 : 0.0f;
+            const float p10 = v10 ? e10 : 0.0f;
+            const float p11 = v11 ? e11 : 0.0f;
+
+            sum0 += p00 + p01;
+            sum1 += p10 + p11;
 
             const int s0 = c0 >> 4, kc0 = c0 & 15;
             const int s1 = c1 >> 4, kc1 = c1 & 15;
@@ -6548,7 +6523,7 @@ extern "C" void run_kernel(
 ) {
     static bool printed_build = false;
     if (!printed_build) {
-        fprintf(stderr, "BUILD CUDA_SM90A_BESTOF_BRANCHLESS_V23\\n");
+        fprintf(stderr, "BUILD CUDA_SM90A_BRANCHLESS_ALL_V24\\n");
         printed_build = true;
     }
 
